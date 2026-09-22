@@ -1,0 +1,109 @@
+# =============================================================================
+# 流程节点配置：新增/删除/改向节点即可调整协作流程（无需改代码）
+#   kind: task -> 由 role 指定的 Agent 执行；gate -> 按 criteria 表达式判定
+#   transitions: pass/fail -> 下一个节点 id（end/halt 为终止节点）
+# =============================================================================
+flow:
+  entry: intake
+  max_steps: 40
+  terminal: ["end", "halt"]
+
+  nodes:
+    # ---------- 1. 产品 Agent：需求评估 ----------
+    intake:
+      title: "需求评估与拆解"
+      role: product
+      kind: task
+      iterable: false
+      inputs: ["requirement_source"]
+      outputs: ["requirement_spec"]
+      transitions: { pass: solution, fail: halt }
+      retry: { max_attempts: 1 }
+
+    # ---------- 2. 研发 Agent：技术方案设计（选型 + 方案评估 + 实现计划） ----------
+    solution:
+      title: "技术方案设计"
+      role: developer
+      kind: task
+      iterable: false
+      inputs: ["requirement_spec"]
+      outputs: ["solution_design"]
+      transitions: { pass: implement, fail: halt }
+
+    # ---------- 3. 研发 Agent：编码实现 ----------
+    implement:
+      title: "编码实现"
+      role: developer
+      kind: task
+      iterable: true                     # 可被审查驳回/验收驳回重新进入
+      inputs: ["requirement_spec", "solution_design", "review_report", "bug_reports", "acceptance_gate"]
+      outputs: ["code_manifest", "implementation_summary"]
+      transitions: { pass: review, fail: review }
+
+    # ---------- 4. 评审 Agent：代码审查（不通过则退回研发） ----------
+    review:
+      title: "代码审查"
+      role: reviewer
+      kind: task
+      iterable: true
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary"]
+      outputs: ["review_report"]
+      transitions: { pass: test, fail: implement }
+
+    # ---------- 5. 测试 Agent：业务测试（功能/异常/边界） ----------
+    test:
+      title: "业务测试"
+      role: tester
+      kind: task
+      iterable: true
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report"]
+      outputs: ["test_report", "bug_reports"]
+      transitions: { pass: acceptance, fail: optimize }
+
+    # ---------- 6. 研发 Agent：缺陷修复与优化（修复后重新测试） ----------
+    optimize:
+      title: "缺陷修复与方案优化"
+      role: developer
+      kind: task
+      iterable: true
+      inputs: ["requirement_spec", "code_manifest", "test_report", "bug_reports", "review_report", "acceptance_gate"]
+      outputs: ["fix_summary", "fix_test_report", "code_manifest"]
+      transitions: { pass: test, fail: test }
+
+    # ---------- 7. 验收门禁：证据式判定，不通过退回上一步优化 ----------
+    acceptance:
+      title: "验收门禁"
+      role: reviewer
+      kind: gate
+      iterable: true
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports"]
+      outputs: ["acceptance_opinion", "acceptance_gate"]
+      gate:
+        criteria:
+          - id: "用例全部通过"
+            expr: "test_report.summary.failed == 0"
+          - id: "功能点覆盖完整"
+            expr: "test_report.coverage.functional.rate >= 1.0"
+          - id: "异常用例覆盖"
+            expr: "test_report.coverage.exception.rate >= 1.0"
+          - id: "边界用例覆盖"
+            expr: "test_report.coverage.boundary.rate >= 1.0"
+          - id: "阻塞性问题清零"
+            expr: "review_report.blocking == 0"
+          - id: "无未关闭缺陷"
+            expr: "bug_reports.open == 0"
+          - id: "方案选型结论完整"
+            expr: "solution_design.evaluation.selected != ''"
+          - id: "待澄清问题均已闭环"
+            expr: "test_report.negotiation.open == 0"
+      transitions: { pass: report, fail: optimize }
+
+    # ---------- 8. 报告 Agent：证据统计 + 验收报告 ----------
+    report:
+      title: "证据统计与验收报告"
+      role: reporter
+      kind: task
+      iterable: false
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "acceptance_gate"]
+      outputs: ["acceptance_report", "evidence_index"]
+      transitions: { pass: end, fail: end }

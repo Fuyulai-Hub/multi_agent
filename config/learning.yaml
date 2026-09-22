@@ -1,0 +1,76 @@
+# =============================================================================
+# 自学习配置：事件日志 -> 经验提炼 -> 分级经验库 -> 分层注入 Prompt
+# =============================================================================
+learning:
+  enabled: true
+
+  storage:
+    experience: "knowledge/experience.jsonl"   # 跨运行持久化的经验库
+    metrics: "knowledge/metrics.jsonl"         # 每次运行的效果指标（用于对比学习收益）
+
+  # 三级经验库：L3 全局 / L2 项目域 / L1 本次运行即时
+  tiers:
+    L3:
+      name: "全局通用经验"
+      scope: "global"
+      enabled: true
+      max_items: 3
+      min_confidence: 0.55
+      budget_tokens: 420
+      weight: 1.0
+    L2:
+      name: "项目与领域经验"
+      scope: "project"
+      enabled: true
+      max_items: 3
+      min_confidence: 0.45
+      budget_tokens: 360
+      weight: 1.25
+    L1:
+      name: "本次运行即时经验"
+      scope: "run"
+      enabled: true
+      max_items: 2
+      min_confidence: 0.0
+      budget_tokens: 260
+      weight: 1.5
+
+  # 经验检索打分权重（相关性/置信度/使用频次/新鲜度）
+  scoring:
+    relevance: 0.45
+    confidence: 0.25
+    usage: 0.15
+    recency: 0.15
+
+  # 从事件日志提炼经验的触发点与规则
+  extraction:
+    extractor: "rules"                 # 规则化提炼器（基于事件日志模式）
+    triggers:
+      - review_rejected
+      - bug_found
+      - bug_fixed
+      - test_failed
+      - acceptance_rejected
+      - negotiation_closed
+      - run_end
+    min_evidence: 1
+    dedupe: true
+    confidence_step: 0.1               # 同一经验再次出现时置信度增量
+
+  # 经验晋级：被复用的次数达到阈值后向更高层级晋升
+  promotion:
+    L1_to_L2: 1
+    L2_to_L3: 2
+
+  # 注入策略：分层拼接进 Prompt，受 token 预算与去重约束
+  injection:
+    enabled: true
+    dedupe_lessons: true
+    max_total_tokens: 1000
+    header: "经验注入（{tier} {name}，命中 {count} 条）"
+    footer: "以上经验来自历史事件日志，请优先采纳高置信度条目，并避免重复昨日之误。"
+
+  # 经验反馈：注入后若该经验被实际采纳（Provider 消费其 action_key），提升置信度
+  feedback:
+    reward_on_effect: 0.05
+    penalize_on_ignore: 0.0

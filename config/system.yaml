@@ -1,0 +1,46 @@
+# =============================================================================
+# 多 Agent 任务协作系统 —— 全局入口配置
+# 通过 --config / --profile 可切换整套配置，实现“配置驱动”的运行形态
+# =============================================================================
+system:
+  name: "配置驱动多 Agent 任务协作系统"
+  version: "1.0.0"
+  description: >-
+    Leader 统一调度的流水线架构：产品(需求评估) → 研发(方案设计/编码) → 评审(代码审查)
+    → 测试(业务测试/bug) → 研发(缺陷修复) → 验收(门禁) → 报告(证据与验收报告)
+  workspace: "workspace"          # 运行产物根目录（相对项目根，可被 CLI --workspace 覆盖）
+  default_profile: null           # 可设为 strict / lean 等 profiles 下的配置
+  requirement_encoding: "utf-8"
+
+# LLM 提供方：offline 为内置确定性 Provider（无 Key 也能端到端跑通），
+# openai_compatible 走标准 /chat/completions 接口处理任意需求
+llm:
+  provider: "openai_compatible"
+  model: "glm-5.3-flash"
+  base_url: "https://open.bigmodel.cn/api/paas/v4"
+  api_key_env: "OPENAI_API_KEY"
+  temperature: 0.2
+  max_tokens: 8000            # glm-5.3-flash 为推理模型，思考链会消耗 token 预算
+  timeout: 120
+  offline:
+    package_name: "order_pricing"        # 交付包名（技术约束中声明的 import 名）
+    inject_first_pass_defect: true       # 首轮实现注入真实缺陷，用于演示 bug→修复→回归闭环
+    defect_ops: ["calc_shipping"]        # 需要注入缺陷的功能点算子
+    strip_first_pass_docstrings: true    # 首轮草稿缺少文档字符串，用于演示代码审查回退
+    consult_defaults: true               # 允许研发在协商中给出契约化答复
+
+runtime:
+  python: "python"
+  sandbox_timeout: 180            # 单次沙箱执行超时（秒）
+  save_prompts: true              # 落盘每次 Prompt（含分层经验注入证据）
+  max_steps: 40                   # 单次运行最大状态推进步数（防死循环）
+  run_id_format: "%Y%m%d-%H%M%S"
+  fail_fast: false
+  verbose: true
+
+files:
+  flow: "flow.yaml"
+  collaboration: "collaboration.yaml"
+  learning: "learning.yaml"
+  roles_dir: "roles"
+  profiles_dir: "profiles"

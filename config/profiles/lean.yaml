@@ -1,0 +1,29 @@
+# 精简流程 Profile：关闭“代码审查”节点、收敛验收门禁、降低回退次数，
+# 用于演示流程节点与协作规则的配置化裁剪（Loader 会自动重接流转边）。
+flow:
+  nodes:
+    review:
+      skip: true                 # 节点被裁剪，implement 的 pass 分支自动改接到 test
+    acceptance:
+      gate:
+        criteria:
+          - id: "用例全部通过"
+            expr: "test_report.summary.failed == 0"
+          - id: "功能点覆盖完整"
+            expr: "test_report.coverage.functional.rate >= 1.0"
+          - id: "无未关闭缺陷"
+            expr: "bug_reports.open == 0"
+
+collaboration:
+  rollback:
+    test:
+      max_attempts: 2
+    acceptance:
+      max_attempts: 1
+
+learning:
+  injection:
+    max_total_tokens: 600
+
+system:
+  name: "配置驱动多 Agent 任务协作系统（精简流程）"

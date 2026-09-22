@@ -1,0 +1,67 @@
+# =============================================================================
+# 协作规则配置：感知关系 / 广播矩阵 / 协商 / 回退策略 / 升级策略
+# =============================================================================
+collaboration:
+  rule_set: "标准流水线协作规则 v1"
+
+  # 每个角色动手前必须“感知”的上游产物（黑板读取 + 通讯摘要）
+  perception:
+    product: ["requirement_source"]
+    developer: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "acceptance_gate"]
+    reviewer: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "bug_reports", "test_report"]
+    tester: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "review_report", "bug_reports"]
+    reporter: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "fix_summary", "fix_test_report", "acceptance_gate"]
+
+  # 关键事件广播矩阵：让相关 Agent 感知“其他人已完成的工作”
+  broadcast:
+    requirement_ready:   ["developer", "reviewer", "tester", "reporter"]
+    design_ready:        ["product", "reviewer", "tester", "reporter"]
+    implementation_ready: ["reviewer", "tester", "reporter"]
+    review_rejected:     ["developer", "tester", "reporter"]
+    review_passed:       ["tester", "reporter"]
+    test_failed:         ["developer", "reviewer", "reporter"]
+    test_passed:         ["reviewer", "reporter"]
+    bug_found:           ["developer", "reviewer", "reporter"]
+    bug_fixed:           ["tester", "reviewer", "reporter"]
+    acceptance_rejected: ["developer", "tester", "reviewer"]
+    acceptance_passed:   ["developer", "tester", "reviewer", "reporter"]
+    rollback:            ["developer", "reviewer", "tester", "reporter"]
+
+  # Agent 间协商：测试发现需求歧义 -> 向研发发起澄清 -> 结论作为验收证据
+  negotiation:
+    enabled: true
+    max_rounds: 2
+    requester_role: tester
+    responder_role: developer
+    trigger: "ambiguity"
+    require_closure: true          # 未闭环的歧义将阻塞验收（见 acceptance 门禁）
+
+  # 回退策略：某个节点判定不通过时退回目标 + 最大次数
+  rollback:
+    review:
+      target: implement
+      max_attempts: 3
+      reason: "代码审查未通过，退回研发修复阻塞问题"
+    test:
+      target: optimize
+      max_attempts: 3
+      reason: "业务测试失败，退回研发进行缺陷修复"
+    acceptance:
+      target: optimize
+      max_attempts: 2
+      reason: "验收门禁未通过，退回上一步优化后重新测试"
+
+  # 回退次数耗尽后的升级策略：fail_run_and_report（继续出报告并标注不通过）/ abort
+  escalation:
+    on_exhausted: "fail_run_and_report"
+    notify: ["reporter", "reviewer"]
+
+  # Agent 返回状态到流程分支（pass/fail）的归一化
+  status_aliases:
+    pass: ["pass", "success", "ok", "approved", "done"]
+    fail: ["fail", "failure", "reject", "rejected", "error", "blocked"]
+
+  guards:
+    require_declared_artifacts: true     # 节点必须产出其声明的产物
+    forbid_self_loop: true               # 禁止节点直接转移到自身（回退须走回退策略）
+    max_total_rollbacks: 8               # 全局回退上限（兜底防死循环）

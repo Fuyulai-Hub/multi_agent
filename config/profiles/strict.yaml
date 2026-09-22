@@ -1,0 +1,49 @@
+# 严格流程 Profile：在方案设计与编码之间插入“技术方案评审”节点，
+# 用于演示“流程节点可通过配置增删改向”。
+flow:
+  nodes:
+    solution:
+      transitions: { pass: solution_review, fail: halt }
+    solution_review:
+      title: "技术方案评审"
+      role: reviewer
+      kind: task
+      iterable: true
+      inputs: ["requirement_spec", "solution_design"]
+      outputs: ["design_review"]
+      transitions: { pass: implement, fail: solution }
+    implement:
+      inputs: ["requirement_spec", "solution_design", "design_review", "review_report", "bug_reports", "acceptance_gate"]
+    acceptance:
+      gate:
+        criteria:
+          - id: "用例全部通过"
+            expr: "test_report.summary.failed == 0"
+          - id: "功能点覆盖完整"
+            expr: "test_report.coverage.functional.rate >= 1.0"
+          - id: "异常用例覆盖"
+            expr: "test_report.coverage.exception.rate >= 1.0"
+          - id: "边界用例覆盖"
+            expr: "test_report.coverage.boundary.rate >= 1.0"
+          - id: "阻塞性问题清零"
+            expr: "review_report.blocking == 0"
+          - id: "方案评审通过"
+            expr: "design_review.verdict == 'pass'"
+          - id: "无未关闭缺陷"
+            expr: "bug_reports.open == 0"
+          - id: "方案选型结论完整"
+            expr: "solution_design.evaluation.selected != ''"
+
+collaboration:
+  rollback:
+    solution_review:
+      target: solution
+      max_attempts: 2
+      reason: "技术方案评审未通过，退回研发完善方案"
+    review:
+      max_attempts: 4
+    acceptance:
+      max_attempts: 3
+
+system:
+  name: "配置驱动多 Agent 任务协作系统（严格流程）"

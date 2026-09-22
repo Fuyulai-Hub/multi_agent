@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多 Agent 协作系统 · 运行面板</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">MΛS</span>
+      <div>
+        <h1>多 Agent 协作系统</h1>
+        <p>产品 → 研发 → 评审 → 测试 → 验收 → 报告 · 自学习闭环</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-view="runs">运行流水线</button>
+      <button class="tab" data-view="experience">经验库</button>
+      <button class="tab" data-view="learning">自学习报告</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- 运行视图 -->
+    <section id="view-runs" class="view active">
+      <!-- 对话入口：输入文字需求，发起一次流水线 -->
+      <div class="composer">
+        <div class="composer-head">
+          <span class="composer-title">发起新需求</span>
+          <div class="composer-controls">
+            <label class="control">
+              <span class="control-label">模型</span>
+              <select id="llm-provider">
+                <option value="offline">offline · 内置确定性（无需 Key）</option>
+                <option value="openai_compatible">openai_compatible · 真实 LLM</option>
+              </select>
+            </label>
+            <label class="control" id="model-control" hidden>
+              <span class="control-label">模型名</span>
+              <input id="llm-model" type="text" list="model-presets" placeholder="如 glm-5.3-flash">
+              <datalist id="model-presets"></datalist>
+            </label>
+            <button id="save-llm" class="ghost-btn" title="把当前模型/Provider 写回 config/system.yaml，作为以后运行的默认值">设为默认</button>
+            <label class="control">
+              <span class="control-label">流程</span>
+              <select id="new-profile">
+                <option value="">默认</option>
+                <option value="strict">strict（含方案评审）</option>
+                <option value="lean">lean（裁剪代码审查）</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <textarea id="new-requirement" rows="9"
+          placeholder="输入你的需求……&#10;&#10;离线 Provider 需使用结构化 Markdown（点下方「载入示例模板」查看格式）；&#10;选择 openai_compatible 真实 LLM 后可直接输入任意自然语言。"></textarea>
+        <div class="composer-bar">
+          <button id="load-example" class="ghost-btn">载入示例模板</button>
+          <span id="composer-status" class="composer-status"></span>
+          <button id="start-run" class="primary">发起流水线（Ctrl+Enter）</button>
+        </div>
+      </div>
+      <div class="runs-grid">
+        <aside class="run-list">
+          <div class="panel-title">
+            <h2>运行记录</h2>
+            <button id="refresh-runs" class="ghost" title="刷新">⟳</button>
+          </div>
+          <ul id="runs"></ul>
+        </aside>
+        <section class="run-detail" id="run-detail">
+          <div class="empty">请选择左侧的运行记录，或在上方输入新需求</div>
+        </section>
+      </div>
+    </section>
+
+    <!-- 经验库视图 -->
+    <section id="view-experience" class="view">
+      <div class="panel-title">
+        <h2>分级经验库</h2>
+        <div class="filters" id="tier-filters">
+          <button class="chip active" data-tier="all">全部</button>
+          <button class="chip" data-tier="L1">L1 即时</button>
+          <button class="chip" data-tier="L2">L2 项目</button>
+          <button class="chip" data-tier="L3">L3 全局</button>
+        </div>
+      </div>
+      <div id="experience-stats" class="stats-row"></div>
+      <div id="experience-list" class="exp-list"></div>
+    </section>
+
+    <!-- 自学习报告视图 -->
+    <section id="view-learning" class="view">
+      <div class="panel-title"><h2>自学习效果报告</h2></div>
+      <div id="metrics-chart" class="chart"></div>
+      <article id="learning-report" class="markdown"></article>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
