@@ -96,7 +96,33 @@ config/
 | Provider | 说明 |
 | --- | --- |
 | `offline`（默认） | 内置确定性 Provider：解析需求 → 匹配算子 → 生成**真实可运行代码**与**真实可执行测试**，并按配置注入首轮缺陷以演示缺陷闭环。无 API Key 即可端到端跑通 |
-| `openai_compatible` | 标准聊天补全接口，处理任意需求（设置 `OPENAI_API_KEY`，改 `config/system.yaml` 的 `llm.provider/base_url/model`） |
+| `openai_compatible` | 标准 `/chat/completions` 接口，处理任意需求（`config/system.yaml` 的 `llm.provider` 设为它，模型名填端点上真实存在的模型） |
+
+### API Key 与 BASE_URL 的外注方式
+
+凭据不写死在代码里，统一由三个通道注入，**后者覆盖前者**：
+
+| 优先级 | 通道 | 用法 |
+| --- | --- | --- |
+| 1（低） | `config/credentials.yaml` | 前端面板填写后点「设为默认」自动写入；也可手工编辑。该文件已在 `.gitignore` 中，不会进版本库 |
+| 2（中） | 环境变量 | 变量名由 `system.yaml` 的 `llm.api_key_env` / `llm.base_url_env` 指定，当前为 `MAS_LLM_API_KEY` / `MAS_LLM_BASE_URL`（未配置这两个键时回落 `OPENAI_API_KEY` / `OPENAI_BASE_URL`） |
+| 3（高） | 运行时注入 | 前端表单填写后直接发起（仅本次生效，不落盘）；或 CLI `python -m mas run ... --api-key sk-xxx --base-url https://.../v1` |
+
+```bash
+# 例：不落盘，用环境变量注入
+export MAS_LLM_API_KEY=sk-xxx
+export MAS_LLM_BASE_URL=https://api.chat.csu.edu.cn/v1
+python -m mas run -r "实现一个订单计价服务" --text
+```
+
+前端面板（`python frontend/server.py`）顶栏有「⚙ 模型配置」入口，弹窗里填写供应商、接口地址、
+API Key、默认模型与令牌备注名：可先点「测试连接」校验 Key 并拉取该 Key 支持的模型列表，
+点「保存」写回配置并**立即生效**（无需重启）。
+对话区的模型下拉框按当前 API Key 动态填充：Key 变更或所选模型不在可用列表时，
+自动回退到第一个可用模型并在状态栏给出明确提示。
+对话区左下角实时展示上下文用量（单次调用 token 峰值 / 模型上下文窗口 + 占比进度条），
+达到 80% 转橙、95% 转红并提示精简需求。窗口大小（端点不返回该值，平台公告当前不超过 256K）
+在「模型配置」弹窗的「上下文窗口」里填，写回 `system.yaml` 的 `llm.context_window`，改完进度条立即重算。
 
 > 离线模式的“确定性”体现在：代码生成、测试执行、静态审查、门禁判定全部真实发生，
 > 只有“自然语言理解”部分被规则化算子库替代，用于可重复回归。
@@ -125,7 +151,7 @@ workspace/
 
 ```
 mas/
-├── config.py       # 配置加载/深合并/校验（Profile、节点裁剪）
+├── config.py       # 配置加载/深合并/校验（Profile、节点裁剪、LLM 凭据外注）
 ├── expr.py         # 门禁表达式安全求值（AST 白名单）
 ├── events.py       # 事件日志
 ├── blackboard.py   # 版本化共享黑板

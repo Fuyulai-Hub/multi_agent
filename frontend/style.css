@@ -98,6 +98,7 @@ button.ghost:hover { color: var(--accent); border-color: var(--accent); }
   outline: none;
 }
 .control input { min-width: 180px; }
+.control input.wide { min-width: 300px; }
 .control select:focus,
 .control input:focus { border-color: var(--accent); }
 .composer textarea {
@@ -337,9 +338,90 @@ button.primary:hover:not(:disabled) { filter: brightness(1.1); }
 .chart .bar-value { font-size: 11px; color: var(--text); }
 .chart-title { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
 
+/* 顶栏「模型配置」入口 */
+.settings-btn {
+  display: flex; align-items: center; gap: 6px;
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  transition: all .15s;
+}
+.settings-btn:hover { color: var(--text); border-color: var(--accent); }
+.settings-btn .gear { font-size: 14px; }
+
+/* 模型配置弹窗 */
+.overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, .55);
+  display: grid; place-items: center;
+  animation: fade .18s ease;
+}
+.overlay[hidden] { display: none; }
+.modal {
+  width: min(560px, 92vw); max-height: 86vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .5);
+  animation: pop .18s ease;
+}
+.modal-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 16px 20px; border-bottom: 1px solid var(--border);
+}
+.modal-head h2 { font-size: 15px; }
+.icon-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  width: 28px; height: 28px; border-radius: 8px; cursor: pointer; transition: all .15s;
+}
+.icon-btn:hover { color: var(--accent); border-color: var(--accent); }
+.modal-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field-label { font-size: 12.5px; color: var(--muted); }
+.field select,
+.field input {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 12px; font-size: 13px; outline: none; width: 100%;
+}
+.field select:focus,
+.field input:focus { border-color: var(--accent); }
+.key-row { display: flex; gap: 8px; }
+.key-row input { flex: 1; min-width: 0; }
+.key-row button { white-space: nowrap; }
+.modal-status { font-size: 12px; color: var(--muted); min-height: 16px; line-height: 1.6; }
+.modal-status.running { color: var(--orange); }
+.modal-status.done { color: var(--green); }
+.modal-status.error { color: var(--red); }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 14px 20px; border-top: 1px solid var(--border);
+}
+
+/* 上下文用量进度条 */
+.ctx { display: flex; align-items: center; gap: 8px; min-width: 210px; }
+.ctx-bar {
+  width: 120px; height: 6px; flex: 0 0 120px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 999px; overflow: hidden;
+}
+.ctx-fill { height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
+.ctx-text { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.ctx.warn .ctx-fill { background: var(--orange); }
+.ctx.warn .ctx-text { color: var(--orange); }
+.ctx.danger .ctx-fill { background: var(--red); }
+.ctx.danger .ctx-text { color: var(--red); }
+
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pop {
+  from { opacity: 0; transform: translateY(8px) scale(.98); }
+  to { opacity: 1; transform: none; }
+}
+
 @media (max-width: 900px) {
   .runs-grid { grid-template-columns: 1fr; }
   .run-list { height: auto; max-height: 320px; }
   .event { grid-template-columns: 40px 100px 1fr; }
   .event .agent { display: none; }
+  .tabs { flex-wrap: wrap; }
+  .composer-bar { flex-wrap: wrap; }
+  .ctx { min-width: 160px; }
+  .modal { width: 96vw; max-height: 90vh; }
 }

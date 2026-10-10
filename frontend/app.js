@@ -6,6 +6,12 @@ const state = {
   selectedRun: null,
   experience: [],
   tierFilter: "all",
+  // 当前生效的 LLM 配置：模型列表按 API Key 动态获取
+  llm: {
+    provider: "offline", model: "", models: [],
+    contextWindow: 262144, lastTraces: [],
+    apiKeySet: false, apiKeyMasked: "", notice: "",
+  },
 };
 
 /* ---------------- 视图切换 ---------------- */
@@ -122,6 +128,7 @@ function renderRunDetail(detail, openTraces = []) {
   document.querySelectorAll("#run-detail .trace").forEach((el, i) => {
     if (openTraces.includes(i)) el.open = true;
   });
+  updateContextUsage(detail.llm_traces);   // 每次刷新同步上下文用量（运行中也会实时更新）
   if (detail.finished === false) {
     const tl = $("#run-detail .timeline");
     if (tl) tl.scrollTop = tl.scrollHeight; // 运行中自动滚动到最新事件
@@ -226,56 +233,254 @@ $("#refresh-runs").addEventListener("click", loadRuns);
 /* ---------------- 对话入口：发起新运行并实时轮询 ---------------- */
 let pollTimer = null;
 
-/* 模型选择控件：初始化默认值并联动"模型名"输入框显隐 */
-function syncModelControl() {
-  const isLLM = $("#llm-provider").value === "openai_compatible";
-  $("#model-control").hidden = !isLLM;
+/* ---------------- 模型配置弹窗：API Key / Base URL / 默认模型 ---------------- */
+const CFG = {
+  overlay: "#settings-overlay", provider: "#cfg-provider", baseUrl: "#cfg-base-url",
+  apiKey: "#cfg-api-key", model: "#cfg-model", tokenName: "#cfg-token-name",
+  status: "#cfg-status", modelList: "#cfg-model-list", contextWindow: "#cfg-context-window",
+};
+
+function setCfgStatus(text, cls) {
+  const el = $(CFG.status);
+  el.textContent = text;
+  el.className = `modal-status ${cls || ""}`;
+}
+
+async function fetchLlmConfig() {
+  const res = await fetch("/api/llm");
+  return res.json();
+}
+
+/* 用弹窗里填写的（留空则用已保存的）凭据探测 /models，拿到该 Key 支持的模型列表 */
+async function fetchModels(apiKey, baseUrl) {
+  const res = await fetch("/api/llm/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key: apiKey || null, base_url: baseUrl || null }),
+  });
+  return res.json();
+}
+
+/* 按当前凭据刷新模型下拉框：所选模型不可用时自动回退到可用模型并给出提示 */
+async function refreshModelList({ silent = false, preferModel = "" } = {}) {
+  const llm = state.llm;
+  const select = $("#llm-model-select");
+  llm.notice = "";
+  if (llm.provider !== "openai_compatible") {
+    llm.models = [];
+    select.innerHTML = '<option value="">offline-deterministic（内置确定性）</option>';
+    return true;
+  }
+  try {
+    const data = await fetchModels();
+    if (!data.ok) {
+      select.innerHTML = `<option value="${escapeHtml(llm.model)}">${escapeHtml(llm.model || "当前模型")}（列表获取失败）</option>`;
+      llm.notice = `模型列表获取失败：${data.error || "未知错误"}`;
+      if (!silent) setComposerStatus(`${llm.notice}（到「模型配置」检查 Key / Base URL）`, "error");
+      return false;
+    }
+    llm.models = (data.models || []).filter(Boolean);
+    select.innerHTML = llm.models.length
+      ? llm.models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("")
+      : `<option value="${escapeHtml(llm.model)}">${escapeHtml(llm.model || "未获取到模型")}</option>`;
+    const want = preferModel || llm.model;
+    if (want && llm.models.includes(want)) {
+      select.value = want;
+      llm.model = want;
+    } else {
+      const fallback = llm.models[0] || want || "";
+      if (want && fallback && fallback !== want) {
+        llm.notice = `模型 ${want} 不在当前 Key 的可用列表中，已自动回退到 ${fallback}`;
+        if (!silent) setComposerStatus(llm.notice, "error");
+      }
+      if (fallback) { select.value = fallback; llm.model = fallback; }
+    }
+    return true;
+  } catch (err) {
+    llm.notice = `模型列表获取失败：${err.message}`;
+    if (!silent) setComposerStatus(llm.notice, "error");
+    return false;
+  }
 }
 
 async function initLlmControls() {
   try {
-    const res = await fetch("/api/llm");
-    const cfg = await res.json();
-    if (cfg.provider) $("#llm-provider").value = cfg.provider;
-    if (cfg.model) {
-      $("#llm-model").value = cfg.model;
-      $("#llm-model").placeholder = cfg.model;
-    }
-    if (Array.isArray(cfg.model_presets)) {
-      $("#model-presets").innerHTML = cfg.model_presets
-        .map((m) => `<option value="${escapeHtml(m)}">`)
-        .join("");
-    }
+    const cfg = await fetchLlmConfig();
+    state.llm.provider = cfg.provider || "offline";
+    state.llm.model = cfg.model || "";
+    state.llm.contextWindow = cfg.context_window || 262144;   // 端点不返回上下文长度，由弹窗维护
+    state.llm.apiKeySet = !!cfg.api_key_set;
+    state.llm.apiKeyMasked = cfg.api_key_masked || "";
+    await refreshModelList({ silent: true });
   } catch { /* 保持默认 offline */ }
-  syncModelControl();
+  // 仅当还没有任何运行用量时渲染占位，避免覆盖已选中运行（loadRuns 可能先于本函数完成）
+  if (!state.llm.lastTraces.length) updateContextUsage([]);
 }
 
-$("#llm-provider").addEventListener("change", syncModelControl);
+/* 打开弹窗：回显当前生效的凭据与模型 */
+function openSettings() {
+  setCfgStatus("正在读取当前配置……", "");
+  fetchLlmConfig().then((cfg) => {
+    state.llm.apiKeySet = !!cfg.api_key_set;
+    state.llm.apiKeyMasked = cfg.api_key_masked || "";
+    $(CFG.provider).value = cfg.provider || "offline";
+    $(CFG.baseUrl).value = cfg.base_url || "";
+    $(CFG.apiKey).value = cfg.api_key || "";
+    $(CFG.model).value = cfg.model || "";
+    $(CFG.tokenName).value = cfg.token_name || "";
+    $(CFG.contextWindow).value = cfg.context_window || 262144;
+    $(CFG.modelList).innerHTML = (cfg.model_presets || [])
+      .map((m) => `<option value="${escapeHtml(m)}">`).join("");
+    $(CFG.apiKey).placeholder = cfg.api_key
+      ? "输入新的 API Key（留空表示沿用已保存值）"
+      : (cfg.api_key_masked ? `已保存 ${cfg.api_key_masked}（留空沿用）` : "输入你的 API Key");
+    setCfgStatus(cfg.api_key_set ? `当前凭据：${cfg.api_key_masked}` : "当前未设置 API Key", "");
+  }).catch(() => setCfgStatus("读取当前配置失败，请检查服务是否可用", "error"));
+  $(CFG.overlay).hidden = false;
+}
 
-/* 设为默认：把当前 Provider/模型写回 config/system.yaml */
-$("#save-llm").addEventListener("click", async () => {
-  const provider = $("#llm-provider").value;
-  const model = $("#llm-model").value.trim();
-  if (provider === "openai_compatible" && !model) {
-    setComposerStatus("请先填写模型名", "error");
+function closeSettings() { $(CFG.overlay).hidden = true; }
+
+function validateSettings(provider, baseUrl, apiKey, model, contextWindow) {
+  if (provider === "openai_compatible") {
+    if (!/^https?:\/\/\S+/i.test(baseUrl || "")) return "接口地址必须以 http(s):// 开头";
+    if (!apiKey && !state.llm.apiKeySet) return "API Key 不能为空";
+    if (!model) return "默认模型不能为空";
+  }
+  if (contextWindow && (!Number.isInteger(Number(contextWindow)) || Number(contextWindow) < 1024)) {
+    return "上下文窗口必须是不小于 1024 的整数（平台当前不超过 256K = 262144）";
+  }
+  return "";
+}
+
+$("#open-settings").addEventListener("click", openSettings);
+$("#settings-close").addEventListener("click", closeSettings);
+$("#cfg-cancel").addEventListener("click", closeSettings);
+$(CFG.overlay).addEventListener("click", (ev) => { if (ev.target === $(CFG.overlay)) closeSettings(); });
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !$(CFG.overlay).hidden) closeSettings();
+});
+
+/* 显示/隐藏 API Key */
+$("#cfg-eye").addEventListener("click", () => {
+  const el = $(CFG.apiKey);
+  el.type = el.type === "password" ? "text" : "password";
+});
+
+/* 测试连接：顺带把该 Key 的模型列表灌进默认模型的下拉 */
+$("#cfg-test").addEventListener("click", async () => {
+  const apiKey = $(CFG.apiKey).value.trim();
+  const baseUrl = $(CFG.baseUrl).value.trim();
+  setCfgStatus("正在测试连接……", "running");
+  let data;
+  try {
+    data = await fetchModels(apiKey || null, baseUrl || null);
+  } catch (err) {
+    data = { ok: false, error: err.message };
+  }
+  if (!data.ok) {
+    setCfgStatus(`连接失败：${data.error}`, "error");
     return;
   }
+  const models = data.models || [];
+  $(CFG.modelList).innerHTML = models.map((m) => `<option value="${escapeHtml(m)}">`).join("");
+  const current = $(CFG.model).value.trim();
+  if (models.length && !models.includes(current)) $(CFG.model).value = models[0];
+  setCfgStatus(
+    `连接成功：${data.base_url}（Key ${data.api_key_masked}）· 可用模型 ${models.length} 个：${models.slice(0, 8).join(" / ")}`,
+    "done"
+  );
+});
+
+/* 保存：写回配置凭据，关闭后立即生效；Key 变更或模型不可用时自动回退 */
+$("#cfg-save").addEventListener("click", async () => {
+  const provider = $(CFG.provider).value;
+  const baseUrl = $(CFG.baseUrl).value.trim();
+  const apiKey = $(CFG.apiKey).value.trim();
+  const model = $(CFG.model).value.trim();
+  const tokenName = $(CFG.tokenName).value.trim();
+  const contextWindow = $(CFG.contextWindow).value.trim();
+  const problem = validateSettings(provider, baseUrl, apiKey, model, contextWindow);
+  if (problem) {
+    setCfgStatus(problem, "error");
+    return;
+  }
+  setCfgStatus("正在保存……", "running");
   try {
     const res = await fetch("/api/llm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider, model: model || null }),
+      body: JSON.stringify({
+        provider,
+        model: model || null,
+        api_key: apiKey || null,      // 留空表示沿用已保存的 Key
+        base_url: baseUrl || null,
+        token_name: tokenName || null,
+        context_window: contextWindow ? Number(contextWindow) : null,
+      }),
     });
     const data = await res.json();
     if (!res.ok) {
-      setComposerStatus(data.error || "保存失败", "error");
+      setCfgStatus(data.error || "保存失败", "error");
       return;
     }
-    setComposerStatus(`已保存默认：${data.provider}${data.model ? " / " + data.model : ""}（对 CLI 同样生效）`, "done");
+    const keyChanged = !!apiKey;
+    state.llm.provider = data.provider || provider;
+    state.llm.model = data.model || model;
+    state.llm.contextWindow = data.context_window || state.llm.contextWindow;
+    updateContextUsage(state.llm.lastTraces);   // 改了上下文窗口立即重算进度条
+    setCfgStatus(
+      `已保存：${data.provider}${data.model ? " / " + data.model : ""}${data.api_key_masked ? " · Key " + data.api_key_masked : ""}`,
+      "done"
+    );
+    await refreshModelList({ preferModel: state.llm.model });   // 保存后按新 Key 重取模型，必要时自动回退
+    closeSettings();
+    if (!state.llm.notice) {
+      setComposerStatus(`配置已生效：${state.llm.model || state.llm.provider}${keyChanged ? "（Key 已更新）" : ""}`, "done");
+    }
   } catch (err) {
-    setComposerStatus(`保存失败：${err.message}`, "error");
+    setCfgStatus(`保存失败：${err.message}`, "error");
   }
 });
+
+/* 手动刷新模型列表 */
+$("#reload-models").addEventListener("click", async () => {
+  setComposerStatus("正在获取可用模型……", "running");
+  const ok = await refreshModelList();
+  if (ok && !state.llm.notice) setComposerStatus(`已更新可用模型：${state.llm.models.length} 个`, "done");
+});
+
+/* 对话窗口切换模型 */
+$("#llm-model-select").addEventListener("change", () => {
+  state.llm.model = $("#llm-model-select").value;
+  setComposerStatus(`本次运行将使用模型：${state.llm.model || "（内置确定性）"}`, "");
+});
+
+/* ---------------- 上下文用量（已用 / 总量 / 占比进度条） ---------------- */
+function fmtTokens(n) {
+  const v = Number(n) || 0;
+  // 按 1024 进位显示成 K，与平台"上下文不超过 256K"的口径一致
+  if (v >= 1024) return `${(v / 1024).toFixed(v >= 10240 ? 0 : 1)}K`;
+  return String(v);
+}
+
+function updateContextUsage(traces) {
+  const list = traces || [];
+  state.llm.lastTraces = list;                  // 记住最近一次用量，改配置后可立即重算
+  // 取单次调用 token 峰值，代表该模型一次请求占用的上下文
+  const used = list.reduce((max, t) => Math.max(max, Number(t && t.tokens) || 0), 0);
+  const model = (list.length && list[list.length - 1].model) || state.llm.model || "";
+  const total = state.llm.contextWindow || 262144;
+  const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+  const box = $("#context-usage");
+  box.classList.toggle("warn", pct >= 80 && pct < 95);
+  box.classList.toggle("danger", pct >= 95);
+  box.querySelector(".ctx-fill").style.width = `${pct.toFixed(1)}%`;
+  const tip = pct >= 95 ? " · 接近上限，请精简需求或拆分运行" : (pct >= 80 ? " · 已接近上限" : "");
+  box.querySelector(".ctx-text").textContent = list.length
+    ? `上下文 ${fmtTokens(used)} / ${fmtTokens(total)}（${pct.toFixed(1)}%）${tip}`
+    : `上下文 0 / ${fmtTokens(total)}（当前运行无模型调用）`;
+}
 
 function setComposerStatus(text, cls) {
   const el = $("#composer-status");
@@ -289,8 +494,8 @@ async function startRun() {
     setComposerStatus("请先输入需求描述", "error");
     return;
   }
-  const provider = $("#llm-provider").value;
-  const model = $("#llm-model").value.trim();
+  const provider = state.llm.provider || "offline";
+  const model = $("#llm-model-select").value.trim();
   const btn = $("#start-run");
   btn.disabled = true;
   setComposerStatus("正在启动流水线……", "running");

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +34,11 @@ __all__ = [
     "LearningConfig",
     "TierConfig",
     "deep_merge",
+    "credentials_path",
+    "load_credentials",
+    "save_credentials",
+    "resolve_credentials",
+    "mask_secret",
 ]
 
 
@@ -57,6 +63,100 @@ def deep_merge(base: Any, override: Any) -> Any:
             merged[key] = deep_merge(merged[key], value) if key in merged else copy.deepcopy(value)
         return merged
     return copy.deepcopy(override)
+
+
+# --------------------------------------------------------------------------- 凭据
+# API Key / BASE_URL 不写死在代码里，统一由三个通道注入（后者覆盖前者）：
+#   1) config/credentials.yaml（本地文件，前端界面「设为默认」写入）
+#   2) 环境变量 OPENAI_API_KEY / OPENAI_BASE_URL（可用 llm.api_key_env / base_url_env 改名）
+#   3) 运行时注入 SystemConfig.llm_overrides（前端表单单次运行、CLI --api-key/--base-url）
+CREDENTIALS_FILE = "credentials.yaml"
+DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_BASE_URL_ENV = "OPENAI_BASE_URL"
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+CREDENTIAL_KEYS = ("api_key", "base_url", "token_name")
+
+
+def credentials_path(config_dir: str | Path | None = None) -> Path:
+    """本地凭据文件路径（含密钥，已加入 .gitignore）。"""
+    base = Path(config_dir) if config_dir is not None else Path(__file__).resolve().parent.parent / "config"
+    return (base / CREDENTIALS_FILE).resolve()
+
+
+def load_credentials(config_dir: str | Path | None = None) -> Dict[str, str]:
+    """读取本地凭据文件；文件不存在或为空时返回空字典（不报错，回落到其他注入通道）。"""
+    path = credentials_path(config_dir)
+    if not path.exists():
+        return {}
+    try:
+        raw = read_yaml(path)
+    except ConfigError:
+        return {}
+    return {key: str(raw[key]).strip() for key in CREDENTIAL_KEYS if str(raw.get(key) or "").strip()}
+
+
+def save_credentials(
+    config_dir: str | Path | None = None,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    token_name: Optional[str] = None,
+) -> Dict[str, str]:
+    """把凭据写入 config/credentials.yaml：只覆盖传入字段，未传的保持原值。"""
+    path = credentials_path(config_dir)
+    current = load_credentials(config_dir)
+    if api_key and api_key.strip():
+        current["api_key"] = api_key.strip()
+    if base_url and base_url.strip():
+        current["base_url"] = base_url.strip().rstrip("/")
+    if token_name and token_name.strip():
+        current["token_name"] = token_name.strip()
+    header = (
+        "# =============================================================================\n"
+        "# LLM 凭据（本地文件，已加入 .gitignore，禁止提交到版本库）\n"
+        "#\n"
+        "# 三种注入方式，生效优先级（后者覆盖前者）：\n"
+        "#   1. config/credentials.yaml —— 本文件，前端「设为默认」写入，也可手工编辑\n"
+        "#   2. 环境变量 —— 变量名由 system.yaml 的 llm.api_key_env / base_url_env 指定\n"
+        "#                （未配置时回落 OPENAI_API_KEY / OPENAI_BASE_URL）\n"
+        "#   3. 运行时注入              —— 前端表单单次运行、或 CLI 的 --api-key / --base-url\n"
+        "# =============================================================================\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = yaml.safe_dump(current, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    path.write_text(header + body, encoding="utf-8")
+    return current
+
+
+def mask_secret(value: str, keep: int = 4) -> str:
+    """密钥脱敏展示：sk-0gW…yyxW3。"""
+    text = str(value or "")
+    if not text:
+        return ""
+    if len(text) <= keep + 4:
+        return "*" * len(text)
+    return f"{text[:3]}…{text[-keep:]}"
+
+
+def resolve_credentials(
+    llm_cfg: Dict[str, Any],
+    config_dir: str | Path | None = None,
+    override: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str]:
+    """按优先级解析 (api_key, base_url)：凭据文件 < 环境变量 < 运行时注入。"""
+    file_creds = load_credentials(config_dir)
+    runtime = {k: str(v).strip() for k, v in (override or {}).items() if str(v or "").strip()}
+    api_key_env = str(llm_cfg.get("api_key_env") or DEFAULT_API_KEY_ENV)
+    base_url_env = str(llm_cfg.get("base_url_env") or DEFAULT_BASE_URL_ENV)
+    api_key = runtime.get("api_key") or os.environ.get(api_key_env, "") or str(file_creds.get("api_key") or "")
+    base_url = (
+        runtime.get("base_url")
+        or os.environ.get(base_url_env, "")
+        or str(file_creds.get("base_url") or "")
+        or str(llm_cfg.get("base_url") or "")   # system.yaml 的 llm.base_url 作为最低优先级默认
+        or DEFAULT_BASE_URL
+    )
+    return api_key, base_url.rstrip("/")
 
 
 def _dig(data: Dict[str, Any], path: str, default: Any = None) -> Any:
@@ -358,6 +458,8 @@ class SystemConfig:
     raw: Dict[str, Any]
     source_files: List[Path] = field(default_factory=list)
     workspace_override: Optional[Path] = None
+    # 运行时注入的 LLM 凭据（{"api_key": ..., "base_url": ...}），优先级高于环境变量与凭据文件
+    llm_overrides: Dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------ 便捷访问
     @property

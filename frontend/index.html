@@ -19,6 +19,9 @@
       <button class="tab active" data-view="runs">运行流水线</button>
       <button class="tab" data-view="experience">经验库</button>
       <button class="tab" data-view="learning">自学习报告</button>
+      <button id="open-settings" class="settings-btn" title="配置 API Key / Base URL / 默认模型">
+        <span class="gear">⚙</span>模型配置
+      </button>
     </nav>
   </header>
 
@@ -32,17 +35,9 @@
           <div class="composer-controls">
             <label class="control">
               <span class="control-label">模型</span>
-              <select id="llm-provider">
-                <option value="offline">offline · 内置确定性（无需 Key）</option>
-                <option value="openai_compatible">openai_compatible · 真实 LLM</option>
-              </select>
+              <select id="llm-model-select" title="按当前 API Key 动态获取，点击「模型配置」可切换 Key"></select>
             </label>
-            <label class="control" id="model-control" hidden>
-              <span class="control-label">模型名</span>
-              <input id="llm-model" type="text" list="model-presets" placeholder="如 glm-5.3-flash">
-              <datalist id="model-presets"></datalist>
-            </label>
-            <button id="save-llm" class="ghost-btn" title="把当前模型/Provider 写回 config/system.yaml，作为以后运行的默认值">设为默认</button>
+            <button id="reload-models" class="ghost-btn" title="按当前凭据重新获取可用模型列表">⟳ 刷新模型</button>
             <label class="control">
               <span class="control-label">流程</span>
               <select id="new-profile">
@@ -54,9 +49,13 @@
           </div>
         </div>
         <textarea id="new-requirement" rows="9"
-          placeholder="输入你的需求……&#10;&#10;离线 Provider 需使用结构化 Markdown（点下方「载入示例模板」查看格式）；&#10;选择 openai_compatible 真实 LLM 后可直接输入任意自然语言。"></textarea>
+          placeholder="输入你的需求……&#10;&#10;离线 Provider 需使用结构化 Markdown（点下方「载入示例模板」查看格式）；&#10;配置真实 LLM 后可直接输入任意自然语言。"></textarea>
         <div class="composer-bar">
           <button id="load-example" class="ghost-btn">载入示例模板</button>
+          <div id="context-usage" class="ctx" title="当前所选运行的单次调用上下文峰值占用">
+            <div class="ctx-bar"><div class="ctx-fill"></div></div>
+            <span class="ctx-text">上下文 --</span>
+          </div>
           <span id="composer-status" class="composer-status"></span>
           <button id="start-run" class="primary">发起流水线（Ctrl+Enter）</button>
         </div>
@@ -97,6 +96,55 @@
       <article id="learning-report" class="markdown"></article>
     </section>
   </main>
+
+  <!-- 模型配置弹窗：API Key / Base URL / 默认模型，保存后立即生效 -->
+  <div id="settings-overlay" class="overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal-head">
+        <h2 id="settings-title">模型配置</h2>
+        <button id="settings-close" class="icon-btn" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span class="field-label">供应商（仅支持 OpenAI 兼容协议 API）</span>
+          <select id="cfg-provider">
+            <option value="openai_compatible">◈ 自定义（OpenAI 兼容）</option>
+            <option value="offline">offline · 内置确定性（无需 Key）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">接口地址（Base URL）</span>
+          <input id="cfg-base-url" type="text" placeholder="https://api.example.com/v1" spellcheck="false">
+        </label>
+        <div class="field">
+          <span class="field-label">API Key</span>
+          <div class="key-row">
+            <input id="cfg-api-key" type="password" placeholder="输入你的 API Key" autocomplete="off" spellcheck="false">
+            <button id="cfg-eye" class="ghost-btn" type="button" title="显示/隐藏">👁</button>
+            <button id="cfg-test" class="ghost-btn" type="button">测试连接</button>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">默认模型（可点「测试连接」后从下拉选择，或手动输入）</span>
+          <input id="cfg-model" type="text" list="cfg-model-list" placeholder="例如 DeepSeek / Qwen / GLM" spellcheck="false">
+          <datalist id="cfg-model-list"></datalist>
+        </label>
+        <label class="field">
+          <span class="field-label">上下文窗口（token，平台当前不超过 256K = 262144）</span>
+          <input id="cfg-context-window" type="number" min="1024" step="1024" placeholder="例如 262144">
+        </label>
+        <label class="field">
+          <span class="field-label">令牌备注名（可选）</span>
+          <input id="cfg-token-name" type="text" placeholder="例如 fa_244511009">
+        </label>
+        <div id="cfg-status" class="modal-status"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="cfg-cancel" class="ghost-btn">取消</button>
+        <button id="cfg-save" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

@@ -1,5 +1,7 @@
 # 运行产物
 workspace/
+# 本地 LLM 凭据（含密钥，禁止提交）
+config/credentials.yaml
 # Python
 __pycache__/
 *.py[cod]

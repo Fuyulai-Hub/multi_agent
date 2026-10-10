@@ -9,6 +9,9 @@ API：
     GET /api/experience              分级经验库
     GET /api/metrics                 每轮效果指标
     GET /api/learning-report         自学习效果报告（Markdown）
+    GET /api/llm                     当前 LLM 配置与凭据（Key 脱敏/回显、来源标注）
+    POST /api/llm                    保存 provider/model 到 system.yaml，凭据到 credentials.yaml
+    POST /api/llm/test               用给定凭据探测 BASE_URL 的 /models，验证 Key 是否可用
 静态文件：/ 直接映射本目录（index.html / app.js / style.css）
 """
 
@@ -16,9 +19,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import sys
 import threading
+import urllib.error
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -107,38 +113,72 @@ SYSTEM_YAML = PROJECT_ROOT / "config" / "system.yaml"
 
 # 常用模型预设（供前端下拉快速选择，仍可自由输入其他模型名）
 MODEL_PRESETS = [
+    "DeepSeek",
+    "Qwen",
+    "GLM",
     "glm-5.3-flash",
-    "glm-5.3",
     "glm-4.5-flash",
-    "glm-4.5",
-    "glm-4.5-air",
-    "glm-4-flash",
     "gpt-4o-mini",
     "gpt-4o",
 ]
 
+# API Key / BASE_URL 的注入通道（前端界面填写保存 → config/credentials.yaml）
+CREDENTIALS_YAML = PROJECT_ROOT / "config" / "credentials.yaml"
+
 
 def load_llm_defaults() -> dict:
-    """读取当前生效的 LLM 配置（供前端初始化模型选择控件）。"""
-    from mas.config import load_config
+    """读取当前生效的 LLM 配置与凭据（供前端初始化模型/凭据控件）。"""
+    from mas.config import credentials_path, load_config, load_credentials, mask_secret, resolve_credentials
 
     config = load_config(PROJECT_ROOT / "config")
     llm = config.llm or {}
+    # 按优先级解析：凭据文件 < 环境变量 < 运行时注入（此处无运行时注入）
+    api_key, base_url = resolve_credentials(llm, PROJECT_ROOT / "config")
+    creds = load_credentials(PROJECT_ROOT / "config")
     return {
         "provider": llm.get("provider") or "offline",
         "model": llm.get("model") or "",
-        "base_url": llm.get("base_url") or "",
+        "base_url": base_url,
+        "api_key": api_key,                      # 本地面板回显，便于修改/切换其他 Key
+        "api_key_set": bool(api_key),
+        "api_key_masked": mask_secret(api_key),
+        "token_name": creds.get("token_name") or "",
+        "api_key_env": llm.get("api_key_env") or "OPENAI_API_KEY",
+        "base_url_env": llm.get("base_url_env") or "OPENAI_BASE_URL",
+        # 上下文窗口（token）：端点不返回该值，由用户在「模型配置」弹窗维护
+        "context_window": int(llm.get("context_window") or 262144),
+        "credential_file": str(credentials_path(PROJECT_ROOT / "config")),
         "providers": sorted(VALID_PROVIDERS),
         "model_presets": MODEL_PRESETS,
     }
 
 
-def save_llm_defaults(provider: str, model: str | None, base_url: str | None) -> dict:
-    """把 provider/model/base_url 写回 config/system.yaml（仅精确改写对应行，保留注释）。"""
+def save_llm_defaults(
+    provider: str | None,
+    model: str | None,
+    base_url: str | None,
+    api_key: str | None = None,
+    token_name: str | None = None,
+    context_window: int | None = None,
+) -> dict:
+    """把 provider/model/base_url/context_window 写回 config/system.yaml，凭据写回 config/credentials.yaml。"""
     import re
 
-    if provider not in VALID_PROVIDERS:
+    from mas.config import save_credentials
+
+    if provider and provider not in VALID_PROVIDERS:
         raise ValueError(f"provider 非法: {provider}（{' | '.join(sorted(VALID_PROVIDERS))}）")
+    if context_window is not None:
+        if int(context_window) < 1024:
+            raise ValueError("context_window 不能小于 1024")
+        context_window = int(context_window)
+    if api_key or base_url or token_name:
+        save_credentials(
+            PROJECT_ROOT / "config",
+            api_key=api_key,
+            base_url=base_url,
+            token_name=token_name,
+        )
     lines = SYSTEM_YAML.read_text(encoding="utf-8").splitlines()
     out: list[str] = []
     in_llm = False
@@ -155,9 +195,40 @@ def save_llm_defaults(provider: str, model: str | None, base_url: str | None) ->
                 line = f'  model: "{model}"'
             elif key == "base_url" and base_url:
                 line = f'  base_url: "{base_url}"'
+            elif key == "context_window" and context_window:
+                line = f"  context_window: {context_window}"
         out.append(line)
     SYSTEM_YAML.write_text("\n".join(out) + "\n", encoding="utf-8")
     return load_llm_defaults()
+
+
+def test_llm_connection(api_key: str | None = None, base_url: str | None = None) -> dict:
+    """用给定（或已保存的）凭据探测 BASE_URL 的 /models 接口，用于前端「测试连接」。"""
+    from mas.config import load_config, mask_secret, resolve_credentials
+
+    config = load_config(PROJECT_ROOT / "config")
+    key, url = resolve_credentials(
+        config.llm, PROJECT_ROOT / "config", override={"api_key": api_key, "base_url": base_url}
+    )
+    if not key:
+        return {"ok": False, "error": "缺少 API Key（请填写后重试）", "base_url": url}
+    request = urllib.request.Request(f"{url}/models", headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        return {"ok": False, "error": f"HTTP {exc.code}: {detail}", "base_url": url}
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "base_url": url}
+    models = [str(item.get("id")) for item in (body.get("data") or []) if item.get("id")]
+    return {
+        "ok": True,
+        "base_url": url,
+        "api_key_masked": mask_secret(key),
+        "models": models,
+        "model_count": len(models),
+    }
 
 
 def start_run(
@@ -166,6 +237,8 @@ def start_run(
     requirement_text: str,
     provider: str | None = None,
     model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
 ) -> str:
     """在后台线程中启动一次流水线，返回预分配的 run_id。"""
     from mas.config import load_config
@@ -178,6 +251,11 @@ def start_run(
         config.llm["provider"] = provider
     if model:
         config.llm["model"] = model
+    # 运行时注入凭据：仅本次运行生效，不落盘（落盘走「设为默认」）
+    if api_key:
+        config.llm_overrides["api_key"] = api_key
+    if base_url:
+        config.llm_overrides["base_url"] = base_url
     stamp = datetime.now().strftime(str(config.runtime.get("run_id_format", "%Y%m%d-%H%M%S")))
     run_id = f"{stamp}-{secrets.token_hex(2)}"
 
@@ -263,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802（标准库命名）
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/run", "/api/llm"):
+        if parsed.path not in ("/api/run", "/api/llm", "/api/llm/test"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -273,12 +351,28 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._send_json({"error": "请求体不是合法 JSON"}, 400)
             return
+        if parsed.path == "/api/llm/test":
+            self._send_json(
+                test_llm_connection(
+                    (data.get("api_key") or "").strip() or None,
+                    (data.get("base_url") or "").strip() or None,
+                )
+            )
+            return
         if parsed.path == "/api/llm":
             provider = (data.get("provider") or "").strip()
             model = (data.get("model") or "").strip() or None
             base_url = (data.get("base_url") or "").strip() or None
+            api_key = (data.get("api_key") or "").strip() or None
+            token_name = (data.get("token_name") or "").strip() or None
+            raw_window = data.get("context_window")
             try:
-                self._send_json(save_llm_defaults(provider, model, base_url))
+                context_window = int(raw_window) if raw_window not in (None, "") else None
+            except (TypeError, ValueError):
+                self._send_json({"error": "context_window 必须是整数"}, 400)
+                return
+            try:
+                self._send_json(save_llm_defaults(provider, model, base_url, api_key, token_name, context_window))
             except (ValueError, OSError) as exc:
                 self._send_json({"error": str(exc)}, 400)
             return
@@ -289,8 +383,13 @@ class Handler(BaseHTTPRequestHandler):
         profile = data.get("profile") or None
         provider = (data.get("provider") or "").strip() or None
         model = (data.get("model") or "").strip() or None
+        api_key = (data.get("api_key") or "").strip() or None
+        base_url = (data.get("base_url") or "").strip() or None
         try:
-            run_id = start_run(self.workspace, profile, requirement, provider=provider, model=model)
+            run_id = start_run(
+                self.workspace, profile, requirement,
+                provider=provider, model=model, api_key=api_key, base_url=base_url,
+            )
         except Exception as exc:
             self._send_json({"error": f"启动失败：{exc}"}, 400)
             return

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .config import SystemConfig
+from .config import SystemConfig, resolve_credentials
 from .errors import AgentError
 from .prompts import PromptBundle
 
@@ -119,13 +118,17 @@ class LLMClient:
     # ---------------------------------------------------------------- openai
     def _generate_openai(self, task_kind: str, bundle: PromptBundle) -> Generation:
         api_key_env = str(self.config.llm.get("api_key_env", "OPENAI_API_KEY"))
-        api_key = os.environ.get(api_key_env, "")
+        # 凭据统一外注：config/credentials.yaml < 环境变量 < 运行时注入（前端表单 / CLI）
+        api_key, base_url = resolve_credentials(
+            self.config.llm, self.config.config_dir, override=self.config.llm_overrides
+        )
         if not api_key:
             raise AgentError(
-                f"llm.provider=openai_compatible 需要环境变量 {api_key_env}；"
+                f"llm.provider=openai_compatible 需要 API Key，请任选一种方式注入："
+                f"① config/credentials.yaml 的 api_key（前端「设为默认」可写入）；"
+                f"② 环境变量 {api_key_env}；③ 前端表单 / CLI --api-key。"
                 "如需无 Key 运行请把配置切回 provider=offline"
             )
-        base_url = str(self.config.llm.get("base_url", "https://api.openai.com/v1")).rstrip("/")
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [

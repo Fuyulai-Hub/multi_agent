@@ -46,8 +46,19 @@ def _load(args: argparse.Namespace) -> SystemConfig:
 
 
 # ---------------------------------------------------------------- run / demo
+def _apply_credential_overrides(config: SystemConfig, args: argparse.Namespace) -> None:
+    """把 CLI 传入的 --api-key/--base-url 作为运行时注入（优先级高于环境变量与凭据文件）。"""
+    api_key = getattr(args, "api_key", None)
+    base_url = getattr(args, "base_url", None)
+    if api_key:
+        config.llm_overrides["api_key"] = api_key
+    if base_url:
+        config.llm_overrides["base_url"] = base_url
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config = _load(args)
+    _apply_credential_overrides(config, args)
     leader = Leader(config)
     summary = leader.run(args.requirement, as_text=args.text, run_id=args.run_id)
     print(json.dumps({
@@ -65,6 +76,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_demo(args: argparse.Namespace) -> int:
     config = _load(args)
+    _apply_credential_overrides(config, args)
     requirement = args.requirement
     requirement_path = Path(requirement)
     if not requirement_path.is_absolute():
@@ -210,6 +222,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--profile", default=None, help="配置 Profile（strict / lean）")
     run_p.add_argument("--workspace", default=None, help="工作区目录（默认 workspace）")
     run_p.add_argument("--run-id", default=None, help="指定运行 ID")
+    run_p.add_argument("--api-key", default=None, help="覆盖 API Key（等价环境变量 OPENAI_API_KEY，优先级更高）")
+    run_p.add_argument("--base-url", default=None, help="覆盖 BASE_URL（等价环境变量 OPENAI_BASE_URL，优先级更高）")
     run_p.set_defaults(func=cmd_run)
 
     demo_p = sub.add_parser("demo", help="多轮演示：文档输入 + 经验复用 + 文字输入")
@@ -218,6 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     demo_p.add_argument("--config", default="config")
     demo_p.add_argument("--profile", default=None)
     demo_p.add_argument("--workspace", default=None)
+    demo_p.add_argument("--api-key", default=None, help="覆盖 API Key（见 config/credentials.yaml 优先级说明）")
+    demo_p.add_argument("--base-url", default=None, help="覆盖 BASE_URL")
     demo_p.set_defaults(func=cmd_demo)
 
     exp_p = sub.add_parser("experience", help="经验库管理")
