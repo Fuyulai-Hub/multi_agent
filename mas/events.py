@@ -108,6 +108,29 @@ class EventLog:
                     records.append(json.loads(line))
         return records
 
+    def load(self) -> List[Event]:
+        """把磁盘上的历史日志载入内存（供复盘/沉淀等只读场景复用 stats/filter/timeline）。"""
+        self._events = []
+        self._seq = 0
+        for record in self.read():
+            payload = dict(record or {})
+            self._seq += 1
+            self._events.append(Event(
+                seq=int(record.get("seq", self._seq)),
+                id=str(record.get("id", f"evt-{self._seq:05d}")),
+                ts=str(record.get("ts", "")),
+                run_id=str(record.get("run_id", self.run_id)),
+                type=str(record.get("type", "")),
+                agent=record.get("agent"),
+                node=record.get("node"),
+                iteration=record.get("iteration"),
+                severity=str(record.get("severity", "info")),
+                payload=dict(payload.get("payload") or {}),
+                refs=list(record.get("refs") or []),
+                parent=record.get("parent"),
+            ))
+        return self.events
+
     @property
     def events(self) -> List[Event]:
         return list(self._events)

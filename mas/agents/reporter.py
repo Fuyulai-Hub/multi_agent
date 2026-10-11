@@ -7,8 +7,10 @@ import shutil
 from datetime import datetime
 from typing import Any, Dict, List
 
+from ..errors import ConfigError
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
+from ..skills import load_skill, save_skill, validate_skill
 from .base import BaseAgent, Perception
 
 __all__ = ["ReporterAgent"]
@@ -16,15 +18,22 @@ __all__ = ["ReporterAgent"]
 
 class ReporterAgent(BaseAgent):
     role_id = "reporter"
-    task_kinds = {"default": "acceptance_report"}
+    task_kinds = {"default": "acceptance_report", "skill_distill": "skill_distill"}
     contracts = {
         "default": {
             "markdown": "完整验收报告（Markdown）",
             "json": {"run_id": "", "verdict": "pass|fail", "test_summary": {}, "bugs": {}},
-        }
+        },
+        "skill_distill": {
+            "markdown": "技能补充说明（Markdown，可为空）",
+            "json": {"name": "", "description": "", "when_to_use": [], "trigger": {},
+                     "inputs": [], "steps": [], "error_handling": [], "checkpoints": []},
+        },
     }
 
     def build_context(self, task: NodeTask, perception: Perception) -> Dict[str, Any]:
+        if self.task_kind_for(task) == "skill_distill":
+            return {"facts": self.ctx.run_state.get("distill_facts") or {}}
         return {"facts": self._build_facts(task, perception)}
 
     def apply(
@@ -35,6 +44,9 @@ class ReporterAgent(BaseAgent):
         context: Dict[str, Any],
         result: AgentResult,
     ) -> None:
+        if self.task_kind_for(task) == "skill_distill":
+            self._apply_skill_distill(generation, result)
+            return
         data = generation.data or {}
         markdown = str(data.get("markdown", ""))
         json_summary = dict(data.get("json") or {})
@@ -100,6 +112,41 @@ class ReporterAgent(BaseAgent):
         result.events = ["report_ready"]
         result.broadcast_payload = {"verdict": verdict, "report": str(report_path)}
         self.evidence(result, "report", path=str(report_path), verdict=verdict)
+
+    # ---------------------------------------------------------------- 流程沉淀
+    def _apply_skill_distill(self, generation: Generation, result: AgentResult) -> None:
+        """把本次运行的成功路径落盘为技能（只在用户显式要求时被调用）。"""
+        data = generation.data or {}
+        meta = dict(data.get("json") or {})
+        body = str(data.get("markdown") or "")
+        if not meta.get("steps"):
+            result.status, result.error = "fail", "技能沉淀失败：未产出执行步骤 steps"
+            result.summary = result.error
+            return
+
+        skills_dir = self.ctx.config.skills_dir
+        skill_id = str(meta.get("name") or "").strip() or f"distilled-{self.ctx.run_id}"
+        meta["name"] = skill_id
+        meta.setdefault("source", "distilled")
+        meta.setdefault("source_run", self.ctx.run_id)
+        meta.setdefault("version", "0.1.0")
+
+        try:
+            path = save_skill(skills_dir, skill_id, meta, body, overwrite=True)
+            problems = validate_skill(load_skill(skills_dir, skill_id))
+        except ConfigError as exc:
+            result.status, result.error = "fail", f"技能落盘失败：{exc}"
+            result.summary = result.error
+            return
+
+        result.status = "pass"
+        result.artifacts["skill"] = {"id": skill_id, "path": str(path), "problems": problems}
+        result.summary = (
+            f"已沉淀技能 {skill_id} → {path}"
+            + (f"；元信息仍缺：{'、'.join(problems)}" if problems else "（元信息校验通过）")
+        )
+        result.metrics["skill_id"] = skill_id
+        self.evidence(result, "skill", id=skill_id, path=str(path))
 
     # ---------------------------------------------------------------- 事实收集
     def _build_facts(self, task: NodeTask, perception: Perception) -> Dict[str, Any]:

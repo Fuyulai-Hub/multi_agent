@@ -29,6 +29,7 @@ from .llm import LLMClient
 from .prompts import PromptBuilder
 from .sandbox import Sandbox
 from .schemas import AgentContext, AgentResult, NodeTask
+from .skills import load_run_facts
 
 __all__ = ["Leader", "RunSummary"]
 
@@ -304,6 +305,55 @@ class Leader:
             f"｜耗时 {duration_s}s\n  报告：{report.get('path', '-')}"
         )
         return summary
+
+    # ================================================================= 流程沉淀
+    def distill_skill(self, run_id: str) -> Dict[str, Any]:
+        """把一次「验收通过」的运行沉淀为可复用技能。
+
+        这是 off-flow 动作：`Leader.run()` 不会调用它，只能由用户在后续命令中显式要求。
+        提炼规则见 `mas.skills.load_run_facts`——只保留最终通过路径，剔除试错与环境绑定细节。
+        """
+        run_dir = self.config.runs_dir / run_id
+        if not (run_dir / "run_summary.json").exists():
+            raise ConfigError(f"运行不存在: {run_id}（可用 `python -m mas report list` 查看）")
+        facts = load_run_facts(run_dir, self.config.workspace_dir)
+        if facts.get("verdict") != "pass":
+            raise ConfigError(
+                f"运行 {run_id} 未通过验收（verdict={facts.get('verdict') or '未知'}），只沉淀成功流程"
+            )
+
+        events = EventLog(run_dir / "events.jsonl", run_id)
+        events.load()
+        bus = MessageBus(run_dir / "messages.jsonl", events, run_id)
+        blackboard = Blackboard(run_dir / "artifacts", events, run_id)
+        sandbox = Sandbox(run_dir / "code", self.config, events=events)
+        experience = ExperienceLibrary(self.config.workspace_dir, self.config.learning, events, run_id)
+        # 沉淀是 off-flow 动作，不再往历史运行目录追加 Prompt 留痕
+        prompts = PromptBuilder(self.config, run_dir, enabled=False)
+        llm = LLMClient(self.config)
+
+        ctx = AgentContext(
+            config=self.config, run_id=run_id, run_dir=run_dir, events=events, blackboard=blackboard,
+            bus=bus, llm=llm, sandbox=sandbox, prompts=prompts, experience=experience,
+            log=self._logger(events), run_state={"distill_facts": facts},
+        )
+        ctx.consult = self._consult_factory()
+        agents = {"reporter": create_agent("reporter", ctx)}
+        self._bind_runtime(ctx, bus, events, agents)
+
+        task = NodeTask(
+            node_id="skill_distill", title="把本次成功流程沉淀为可复用技能", role="reporter",
+            kind="task", iteration=1, inputs=[], outputs=["skill"],
+            directive="剔除临时试错与环境绑定细节，只保留可复用的输入参数、执行步骤、异常处理与结果校验点",
+        )
+        result = agents["reporter"].act(task)
+        return {
+            "run_id": run_id,
+            "status": result.status,
+            "summary": result.summary,
+            "error": result.error,
+            "skill": result.artifacts.get("skill") or {},
+        }
 
     # ================================================================= 门禁
     def _run_gate(self, ctx: AgentContext, task: NodeTask, agents: Dict[str, Any]) -> Dict[str, Any]:

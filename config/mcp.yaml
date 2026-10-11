@@ -1,0 +1,31 @@
+# =============================================================================
+# MCP 服务配置（服务名称 / 传输方式 / 启动命令 / 参数 / 环境变量）
+#
+# transport: stdio —— 本地子进程，command 必填，args 为参数列表
+# transport: sse   —— 远端事件流，url 必填
+# env / headers 中的 ${VAR} 在运行时从环境变量展开，避免明文落盘
+# 新增后可用 `python -m mas mcp check <name>` 做参数校验与握手冒烟
+# =============================================================================
+servers: []
+
+# ---------------- 配置示例（去掉注释即可启用）----------------
+# servers:
+#   - name: filesystem
+#     transport: stdio
+#     enabled: true
+#     command: npx
+#     args:
+#       - -y
+#       - "@modelcontextprotocol/server-filesystem"
+#       - .
+#     env:
+#       LOG_LEVEL: info
+#       API_TOKEN: "${MCP_FS_TOKEN}"      # 运行时从环境变量展开，不落明文
+#     timeout_s: 15
+#   - name: remote-search
+#     transport: sse
+#     enabled: false
+#     url: https://mcp.example.com/sse
+#     headers:
+#       Authorization: "Bearer ${MCP_SEARCH_TOKEN}"
+#     timeout_s: 15

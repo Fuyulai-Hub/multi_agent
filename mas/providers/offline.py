@@ -10,6 +10,7 @@
     acceptance_signoff 评审 Agent   验收签署意见
     consultation       研发 Agent   响应测试 Agent 的歧义澄清请求
     acceptance_report  报告 Agent   汇总证据生成验收报告
+    skill_distill      报告 Agent   把一次成功运行提炼为可复用技能（SKILL.md）
 
 自学习闭环在本 Provider 中的体现：PromptBundle 注入的经验若携带 action_key
 （如 avoid_missing_function_docstring / guard_calc_shipping__boundary），
@@ -79,6 +80,7 @@ class OfflineProvider:
             "acceptance_signoff": self._acceptance_signoff,
             "consultation": self._consultation,
             "acceptance_report": self._acceptance_report,
+            "skill_distill": self._skill_distill,
         }
         handler = handlers.get(task_kind)
         if handler is None:
@@ -1105,6 +1107,38 @@ if __name__ == "__main__":
             "metrics": facts.get("metrics") or {},
         }
         return {"markdown": "\n".join(md), "json": json_summary}
+
+    # ================================================================ 流程沉淀
+    def _skill_distill(self, bundle: PromptBundle, context: Dict[str, Any]) -> Dict[str, Any]:
+        """规则化沉淀：从「最终通过路径」生成 SKILL.md（质量上限低于真实 LLM）。"""
+        from ..skills import distill_meta
+
+        facts = context.get("facts") or {}
+        meta = distill_meta(facts)
+        node_path = facts.get("node_path") or []
+
+        md: List[str] = []
+        md.append(f"# 技能：{facts.get('title') or meta['name']}")
+        md.append("")
+        md.append(f"沉淀自运行 `{facts.get('run_id', '')}`，该运行已通过验收。")
+        md.append("")
+        md.append("## 执行步骤")
+        md.append("")
+        md.extend(f"{index}. {step}" for index, step in enumerate(meta["steps"], start=1))
+        md.append("")
+        if meta["checkpoints"]:
+            md.append("## 结果校验点")
+            md.append("")
+            md.extend(f"- {item}" for item in meta["checkpoints"])
+            md.append("")
+        if meta["error_handling"]:
+            md.append("## 异常处理")
+            md.append("")
+            md.extend(f"- {item}" for item in meta["error_handling"])
+            md.append("")
+        md.append(f"## 流程路径\n\n{' → '.join(node_path)}")
+        md.append("")
+        return {"markdown": "\n".join(md), "json": meta}
 
 
 def _camel(name: str) -> str:

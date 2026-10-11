@@ -484,6 +484,11 @@ class SystemConfig:
     def reports_dir(self) -> Path:
         return self.workspace_dir / "reports"
 
+    @property
+    def skills_dir(self) -> Path:
+        """技能目录（每个技能一个子目录，见 mas/skills.py 的目录规范）。"""
+        return (self.config_dir / str(self.system.get("skills_dir", "skills"))).resolve()
+
     def role(self, role_id: str) -> RoleConfig:
         try:
             return self.roles[role_id]

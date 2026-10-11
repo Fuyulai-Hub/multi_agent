@@ -38,9 +38,70 @@ python -m mas report show latest
 python -m mas experience list
 python -m mas config show --profile lean
 
+# 技能（Skill）与 MCP 工具
+python -m mas skill list
+python -m mas skill check demo-delivery
+python -m mas skill add --from-run <run_id>      # 把一次已通过验收的运行沉淀为技能
+python -m mas mcp add demo --transport stdio --command npx --args "-y @x/server"
+python -m mas mcp check demo
+
 # 框架自测
 python -m unittest discover -s tests -v
+
+# 启动前端可视化面板（默认 http://127.0.0.1:8000）
+python frontend/server.py
+
+# 指定端口
+python frontend/server.py --port 8080
 ```
+
+> 前端服务需要在**项目根目录**下执行，且依赖 `workspace/` 已存在（先用 `python -m mas demo` 或
+> `python -m mas run` 生成一次运行数据），否则会打印提示并以退出码 2 结束。
+> 更多启动方式见下文 [前端面板](#前端面板)。
+
+## 前端面板
+
+内置可视化面板（仅 Python 标准库，无额外依赖）：运行列表与摘要指标、单次运行的事件流/验收报告/时间线、
+分级经验库、跨轮效果指标，以及顶栏「⚙ 模型配置」入口。
+
+### 启动命令
+
+在**项目根目录**下执行：
+
+```bash
+# ① 默认端口 8000，浏览器打开 http://127.0.0.1:8000
+python frontend/server.py
+
+# ② 指定端口（端口被占用时换一个即可）
+python frontend/server.py --port 8080
+
+# ③ 指定端口 + 监听地址（0.0.0.0 开放局域网访问，默认仅本机）
+python frontend/server.py --host 0.0.0.0 --port 8080
+
+# ④ 同时指定数据目录（默认 <项目根>/workspace）
+python frontend/server.py --port 8080 --workspace workspace
+```
+
+启动成功后终端会打印实际访问地址：
+
+```text
+前端面板：http://127.0.0.1:8080  （数据目录：G:\...\multi_agent\workspace）
+```
+
+浏览器打开该地址即可，停止服务按 `Ctrl + C`。
+
+### 启动参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--port` | `8000` | HTTP 监听端口；被占用时改用其他空闲端口（如 `8080`、`9000`） |
+| `--host` | `127.0.0.1` | 监听地址；`127.0.0.1` 仅本机可访问，改成 `0.0.0.0` 开放局域网访问 |
+| `--workspace` | `<项目根>/workspace` | 面板读取的运行数据目录，应与 `python -m mas run/demo` 的产出目录一致 |
+
+> 端口、监听地址与数据目录**只能通过命令行参数指定**：不读配置文件、不支持环境变量，
+> 也没有对应的 `mas` CLI 子命令，必须直接运行 `frontend/server.py`。
+> 若 `--workspace` 指向的目录不存在，服务打印「工作区不存在」提示并以退出码 2 退出，
+> 先跑一次 `python -m mas demo` 生成数据即可。
 
 ## 流程与状态机
 
@@ -72,6 +133,50 @@ config/
 
 - 门禁是**表达式驱动**的（AST 白名单安全求值），例如 `test_report.coverage.boundary.rate >= 1.0`；
 - Profile 深合并覆盖任意片段，`skip: true` 的节点被裁剪后，指向它的流转边自动改接到其后继。
+
+## 技能（Skill）与 MCP 扩展
+
+能力扩展是**独立于交付流水线的能力层**：不占 `flow.yaml` 的节点，也不新增角色 Agent，
+由 `mas/skills.py` / `mas/mcp.py` 两个确定性模块 + CLI 入口提供。
+
+### 技能（Skill）
+
+每个技能一个目录，`SKILL.md` 的 YAML front-matter 必填六项：
+
+```
+config/skills/<skill-id>/
+├── SKILL.md        # 必需：name / description / when_to_use / trigger / inputs / steps
+├── scripts/        # 可选：可执行脚本（冒烟命令以此为工作目录执行）
+├── references/     # 可选
+└── assets/         # 可选
+```
+
+| 命令 | 说明 |
+| --- | --- |
+| `skill list` / `skill show <id>` | 查看 |
+| `skill add --yaml <file>` / `skill add --from-run <run_id>` | 手写添加 / 从成功运行沉淀 |
+| `skill edit <id> --set k=v` / `skill remove <id>` | 修改 / 删除 |
+| `skill check <id>` | 装载校验：解析 → 参数校验 → 冒烟 |
+
+**沉淀不自动发生**：一次运行跑通后不会写入任何技能；只有在后续明确执行
+`skill add --from-run <run_id>` 时才提炼落盘，且只保留最终通过路径，剔除被回退的迭代、
+缺陷试错与绝对路径（替换为 `{{workspace}}` / `{{run_id}}` 等占位符）。
+
+### MCP 工具
+
+`config/mcp.yaml` 一个服务一条，支持 `stdio`（子进程 + 换行分隔 JSON-RPC）与
+`sse`（远端事件流）两种传输，含服务名称、启动命令、参数、环境变量与超时。
+`env` / `headers` 中的 `${VAR}` 在运行时从环境变量展开，避免明文落盘。
+
+| 命令 | 说明 |
+| --- | --- |
+| `mcp add --name <n> --transport stdio\|sse ...` | 添加 |
+| `mcp list` / `mcp show <name>` / `mcp remove <name>` | 查看 / 删除 |
+| `mcp check <name> [--call <tool> --params '{...}']` | 参数校验 → 连接 → `initialize` 握手 → `tools/list` 冒烟 |
+
+`check` 失败时按阶段给出原因与修复建议：`parse`（未配置）、`validate`（参数非法）、
+`connect`（命令不存在 / 地址不可达）、`handshake`（握手失败）、`smoke`（工具调用失败）。
+未声明 `smoke.command` 的技能只做静态校验，结果会明确标注「未做动态验证」。
 
 ## 自学习闭环
 
@@ -115,7 +220,7 @@ export MAS_LLM_BASE_URL=https://api.chat.csu.edu.cn/v1
 python -m mas run -r "实现一个订单计价服务" --text
 ```
 
-前端面板（`python frontend/server.py`）顶栏有「⚙ 模型配置」入口，弹窗里填写供应商、接口地址、
+前端面板（启动命令见上文「前端面板」小节）顶栏有「⚙ 模型配置」入口，弹窗里填写供应商、接口地址、
 API Key、默认模型与令牌备注名：可先点「测试连接」校验 Key 并拉取该 Key 支持的模型列表，
 点「保存」写回配置并**立即生效**（无需重启）。
 对话区的模型下拉框按当前 API Key 动态填充：Key 变更或所选模型不在可用列表时，
@@ -159,6 +264,8 @@ mas/
 ├── experience.py   # 分级经验库：提炼/检索/注入/晋级/反馈
 ├── prompts.py      # Prompt 组装（感知段 + 分层经验段 + 交付契约）
 ├── llm.py          # LLM 客户端（offline / openai_compatible）
+├── skills.py       # 技能注册表：目录规范、持久化、参数校验、冒烟、流程沉淀
+├── mcp.py          # MCP 服务配置与最小客户端（stdio / sse，仅实现健康检查所需方法）
 ├── sandbox.py      # 沙箱执行 + AST 静态分析
 ├── leader.py       # 调度器：状态机/门禁/回退/协商/经验闭环
 ├── schemas.py      # 数据契约
