@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import LearningConfig
 from .events import EventLog
+from .filelock import file_lock
 
 __all__ = ["Experience", "ExperienceLibrary", "RetrievalResult"]
 
@@ -73,6 +74,34 @@ def _key_of(*parts: str) -> str:
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", "", str(text or "")).lower()
+
+
+def _tokenize_for_match(text: str) -> set:
+    """匹配用切词：英文/数字按词，中文按「单字 + 相邻二字(bigram)」。
+
+    bigram 是零依赖条件下对中文最有效的「软匹配」手段：
+    「运费计算」与「物流计价」虽无公共子串，但共享单字「计」「算」与
+    bigram「计算」的变体，重叠系数即可给出非零相似度，缓解同义改写召回不到的问题。
+    """
+    normalized = _normalize(text)
+    tokens: set = set()
+    for word in re.findall(r"[a-z0-9_]+", normalized):
+        tokens.add(word)
+    for segment in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        tokens.update(segment)
+        tokens.update(segment[index:index + 2] for index in range(len(segment) - 1))
+    return tokens
+
+
+def _expand_with_synonyms(tokens: set, synonyms: Dict[str, List[str]]) -> set:
+    """同义词扩展：把命中词典的 token 追加其同义词 token（词典在 learning.yaml 配置）。"""
+    if not synonyms:
+        return tokens
+    expanded = set(tokens)
+    for token in tokens:
+        for related in synonyms.get(token, []) or []:
+            expanded.update(_tokenize_for_match(related))
+    return expanded
 
 
 def _estimate_tokens(text: str) -> int:
@@ -162,6 +191,17 @@ class ExperienceLibrary:
         self.metrics_path = self.workspace_dir / str(config.storage.get("metrics", "knowledge/metrics.jsonl"))
         self._entries: List[Experience] = []
         self._loaded = False
+        self._lock_timeout_s = float((config.extraction or {}).get("lock_timeout_s", 10))
+        # 同义词词典（learning.yaml synonyms 段）：键为词，值为同义词列表，检索时做查询扩展
+        self._synonyms: Dict[str, List[str]] = {
+            str(key): [str(item) for item in (value or [])]
+            for key, value in (getattr(config, "synonyms", None) or {}).items()
+        }
+
+    def _locked(self):
+        """经验库读-改-写锁：多进程（如前端并发起的多次运行）共享同一 experience.jsonl 时，
+        保证 load → merge → save 全链路的原子性，避免后写覆盖先写丢经验。"""
+        return file_lock(self.path, timeout_s=self._lock_timeout_s)
 
     # ---------------------------------------------------------------- 持久化
     def load(self) -> List[Experience]:
@@ -192,54 +232,58 @@ class ExperienceLibrary:
 
     # ---------------------------------------------------------------- 写入
     def add(self, entries: Iterable[Experience], *, source_run: str = "") -> List[Dict[str, Any]]:
-        """加入经验：同源经验自动合并（置信度递增 + 证据计数）。"""
-        self.load() if not self._loaded else None
-        step = float(self.config.extraction.get("confidence_step", 0.1))
+        """加入经验：同源经验自动合并（置信度递增 + 证据计数）。
+
+        整个 load→merge→save 在文件锁内完成，多进程共享经验库不会互相覆盖。
+        """
         results: List[Dict[str, Any]] = []
-        for entry in entries:
-            entry.source_run = entry.source_run or source_run or self.run_id
-            if not entry.created_at:
-                entry.created_at = _now()
-            match = next((item for item in self._entries if item.key == entry.key), None)
-            if match:
-                match.confidence = min(1.0, round(match.confidence + step, 3))
-                match.evidence_count += max(1, entry.evidence_count)
-                match.tags = sorted(set(match.tags) | set(entry.tags))
-                match.last_used_at = match.last_used_at
-                if entry.lesson and entry.lesson not in match.lesson:
-                    match.lesson = f"{match.lesson}；{entry.lesson}"
-                results.append({"entry": match, "merged": True})
-                if self.events is not None:
-                    self.events.emit(
-                        "experience_reinforced",
-                        agent="experience_library",
-                        payload={
-                            "experience_id": match.id,
-                            "tier": match.tier,
-                            "confidence": match.confidence,
-                            "lesson": match.lesson,
-                        },
-                    )
-            else:
-                entry.id = entry.id or f"exp-{_key_of(entry.key, _now())}"
-                entry.evidence_count = max(1, entry.evidence_count)
-                self._entries.append(entry)
-                results.append({"entry": entry, "merged": False})
-                if self.events is not None:
-                    self.events.emit(
-                        "experience_learned",
-                        agent="experience_library",
-                        payload={
-                            "experience_id": entry.id,
-                            "tier": entry.tier,
-                            "scope": entry.scope,
-                            "lesson": entry.lesson,
-                            "action_key": entry.action_key,
-                            "confidence": entry.confidence,
-                            "trigger": entry.trigger,
-                        },
-                    )
-        self.save()
+        with self._locked():
+            self.load() if not self._loaded else None
+            step = float(self.config.extraction.get("confidence_step", 0.1))
+            for entry in entries:
+                entry.source_run = entry.source_run or source_run or self.run_id
+                if not entry.created_at:
+                    entry.created_at = _now()
+                match = next((item for item in self._entries if item.key == entry.key), None)
+                if match:
+                    match.confidence = min(1.0, round(match.confidence + step, 3))
+                    match.evidence_count += max(1, entry.evidence_count)
+                    match.tags = sorted(set(match.tags) | set(entry.tags))
+                    match.last_used_at = match.last_used_at
+                    if entry.lesson and entry.lesson not in match.lesson:
+                        match.lesson = f"{match.lesson}；{entry.lesson}"
+                    results.append({"entry": match, "merged": True})
+                    if self.events is not None:
+                        self.events.emit(
+                            "experience_reinforced",
+                            agent="experience_library",
+                            payload={
+                                "experience_id": match.id,
+                                "tier": match.tier,
+                                "confidence": match.confidence,
+                                "lesson": match.lesson,
+                            },
+                        )
+                else:
+                    entry.id = entry.id or f"exp-{_key_of(entry.key, _now())}"
+                    entry.evidence_count = max(1, entry.evidence_count)
+                    self._entries.append(entry)
+                    results.append({"entry": entry, "merged": False})
+                    if self.events is not None:
+                        self.events.emit(
+                            "experience_learned",
+                            agent="experience_library",
+                            payload={
+                                "experience_id": entry.id,
+                                "tier": entry.tier,
+                                "scope": entry.scope,
+                                "lesson": entry.lesson,
+                                "action_key": entry.action_key,
+                                "confidence": entry.confidence,
+                                "trigger": entry.trigger,
+                            },
+                        )
+            self.save()
         return results
 
     # ---------------------------------------------------------------- 检索
@@ -320,11 +364,12 @@ class ExperienceLibrary:
         if result.text:
             result.text += str(self.config.injection.get("footer", ""))
         result.tokens = _estimate_tokens(result.text)
-        for entry in result.entries:
-            entry.hits += 1
-            entry.last_used_at = _now()
         if result.entries:
-            self.save()
+            with self._locked():
+                for entry in result.entries:
+                    entry.hits += 1
+                    entry.last_used_at = _now()
+                self.save()
         return result
 
     def _score(
@@ -345,12 +390,7 @@ class ExperienceLibrary:
             normalized_tags = {_normalize(tag) for tag in tags}
             entry_tags = {_normalize(tag) for tag in entry.tags}
             tag_overlap = len(normalized_tags & entry_tags) / max(1, len(normalized_tags))
-        keyword_overlap = 0.0
-        if task_text:
-            haystack = _normalize(task_text)
-            keywords = [kw for kw in re.split(r"[、,;；\s]+", f"{entry.lesson}{entry.action}") if len(kw) >= 2]
-            if keywords:
-                keyword_overlap = sum(1 for kw in keywords[:12] if _normalize(kw) in haystack) / len(keywords[:12])
+        keyword_overlap = self._semantic_overlap(task_text, f"{entry.lesson}{entry.action}")
         relevance = 0.5 * role_match + 0.3 * tag_overlap + 0.2 * min(1.0, keyword_overlap * 3)
         usage = min(1.0, entry.hits / 5.0)
         recency = 0.5
@@ -369,10 +409,26 @@ class ExperienceLibrary:
         detail = {
             "role_match": round(role_match, 2),
             "tag_overlap": round(tag_overlap, 2),
+            "keyword_overlap": round(keyword_overlap, 3),
             "confidence": entry.confidence,
             "hits": entry.hits,
         }
         return score, detail
+
+    def _semantic_overlap(self, task_text: str, entry_text: str) -> float:
+        """语义软匹配（零依赖）：中文 bigram + 同义词扩展后的重叠系数。
+
+        替代原来的「关键词子串精确包含」判断——同义改写（运费计算↔物流计价）、
+        词序变化都不再导致召回失败。词典来自 learning.yaml 的 synonyms 段。
+        """
+        if not task_text or not entry_text:
+            return 0.0
+        query = _expand_with_synonyms(_tokenize_for_match(task_text), self._synonyms)
+        haystack = _tokenize_for_match(entry_text)
+        if not query or not haystack:
+            return 0.0
+        # 重叠系数：交集 / 较小集合大小（对长短文本不对称的场景比 Jaccard 稳健）
+        return len(query & haystack) / max(1, min(len(query), len(haystack)))
 
     def _format_entry(self, entry: Experience, score: float) -> str:
         lines = [f"- (置信度 {entry.confidence:.2f} / 命中 {entry.hits} / 触发 {entry.trigger or '-'}) {entry.lesson}"]
@@ -389,45 +445,47 @@ class ExperienceLibrary:
     # ---------------------------------------------------------------- 反馈
     def reinforce(self, ids: Iterable[str], *, reward: Optional[float] = None) -> int:
         """经验被实际消费后的置信度反馈（闭环保真：用得越多越可信）。"""
-        self.load() if not self._loaded else None
-        reward = float(self.config.feedback.get("reward_on_effect", 0.0) if reward is None else reward)
-        touched = 0
-        for entry in self._entries:
-            if entry.id in set(ids):
-                entry.confidence = min(1.0, round(entry.confidence + reward, 3))
-                entry.hits += 1
-                entry.last_used_at = _now()
-                touched += 1
-        if touched:
-            self.save()
+        with self._locked():
+            self.load() if not self._loaded else None
+            reward = float(self.config.feedback.get("reward_on_effect", 0.0) if reward is None else reward)
+            touched = 0
+            for entry in self._entries:
+                if entry.id in set(ids):
+                    entry.confidence = min(1.0, round(entry.confidence + reward, 3))
+                    entry.hits += 1
+                    entry.last_used_at = _now()
+                    touched += 1
+            if touched:
+                self.save()
         return touched
 
     # ---------------------------------------------------------------- 晋级
     def promote(self) -> List[Dict[str, Any]]:
         """L1→L2→L3 晋级：被反复复用的经验提升层级与复用范围。"""
-        self.load() if not self._loaded else None
-        thresholds = {
-            "L1": int(self.config.promotion.get("L1_to_L2", 1)),
-            "L2": int(self.config.promotion.get("L2_to_L3", 2)),
-        }
-        promoted: List[Dict[str, Any]] = []
-        for entry in self._entries:
-            current_tier = entry.tier or self._tier_of_scope(entry.scope)
-            need = thresholds.get(current_tier)
-            if need is None or entry.hits < need:
-                continue
-            if current_tier == "L1":
-                entry.tier, entry.scope = "L2", "project"
-                entry.confidence = min(1.0, round(entry.confidence + 0.05, 3))
-            elif current_tier == "L2":
-                entry.tier, entry.scope = "L3", "global"
-                entry.confidence = min(1.0, round(entry.confidence + 0.05, 3))
-            promoted.append({"id": entry.id, "tier": entry.tier, "scope": entry.scope, "lesson": entry.lesson, "hits": entry.hits})
-        if promoted:
-            self.save()
-            if self.events is not None:
-                for item in promoted:
-                    self.events.emit("experience_promoted", agent="experience_library", payload=item)
+        with self._locked():
+            self.load() if not self._loaded else None
+            thresholds = {
+                "L1": int(self.config.promotion.get("L1_to_L2", 1)),
+                "L2": int(self.config.promotion.get("L2_to_L3", 2)),
+            }
+            promoted: List[Dict[str, Any]] = []
+            for entry in self._entries:
+                current_tier = entry.tier or self._tier_of_scope(entry.scope)
+                need = thresholds.get(current_tier)
+                if need is None or entry.hits < need:
+                    continue
+                if current_tier == "L1":
+                    entry.tier, entry.scope = "L2", "project"
+                    entry.confidence = min(1.0, round(entry.confidence + 0.05, 3))
+                elif current_tier == "L2":
+                    entry.tier, entry.scope = "L3", "global"
+                    entry.confidence = min(1.0, round(entry.confidence + 0.05, 3))
+                promoted.append({"id": entry.id, "tier": entry.tier, "scope": entry.scope, "lesson": entry.lesson, "hits": entry.hits})
+            if promoted:
+                self.save()
+                if self.events is not None:
+                    for item in promoted:
+                        self.events.emit("experience_promoted", agent="experience_library", payload=item)
         return promoted
 
     # ---------------------------------------------------------------- 提炼
@@ -571,8 +629,9 @@ class ExperienceLibrary:
     # ---------------------------------------------------------------- 指标
     def record_metrics(self, metrics: Dict[str, Any]) -> None:
         self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.metrics_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(metrics, ensure_ascii=False, default=str) + "\n")
+        with file_lock(self.metrics_path, timeout_s=self._lock_timeout_s):
+            with self.metrics_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(metrics, ensure_ascii=False, default=str) + "\n")
 
     def metrics_history(self) -> List[Dict[str, Any]]:
         if not self.metrics_path.exists():
@@ -631,15 +690,16 @@ class ExperienceLibrary:
         }
 
     def prune(self, *, min_confidence: float = 0.2) -> int:
-        self.load() if not self._loaded else None
-        before = len(self._entries)
-        self._entries = [
-            entry for entry in self._entries
-            if entry.confidence >= min_confidence or entry.hits > 0
-        ]
-        removed = before - len(self._entries)
-        if removed:
-            self.save()
+        with self._locked():
+            self.load() if not self._loaded else None
+            before = len(self._entries)
+            self._entries = [
+                entry for entry in self._entries
+                if entry.confidence >= min_confidence or entry.hits > 0
+            ]
+            removed = before - len(self._entries)
+            if removed:
+                self.save()
         return removed
 
     def learning_report_markdown(self) -> str:

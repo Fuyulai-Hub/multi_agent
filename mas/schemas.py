@@ -78,6 +78,8 @@ class AgentContext:
     experience: Any
     log: Callable[[str, str], None] = lambda level, message: None
     consult: Optional[Callable[..., Dict[str, Any]]] = None
+    # function calling 工具执行器（ToolRunner，可为 None：None 时行为与无工具版完全一致）
+    tools: Optional[Any] = None
     run_state: Dict[str, Any] = field(default_factory=dict)
 
     def role_config(self, role_id: str) -> Any:

@@ -14,8 +14,9 @@ outputs: ["requirement_spec"]
 
 permissions:
   can_write_code: false
+  can_execute: false
   can_rollback: false
-  can_block_acceptance: true
+  can_block_acceptance: true     # 需求侧可对验收提出否决意见
 
 prompt:
   persona: "你是一名严谨的资深产品经理，擅长把模糊需求拆成可测试的契约。"

@@ -30,6 +30,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
 async function loadRuns() {
   const res = await fetch("/api/runs");
   state.runs = await res.json();
+  renderChat();   // 对话区里运行记录的状态随列表一起刷新
   const ul = $("#runs");
   ul.innerHTML = "";
   if (!state.runs.length) {
@@ -37,20 +38,76 @@ async function loadRuns() {
     return;
   }
   state.runs.forEach((run) => {
+    const running = run.finished === false;
     const li = document.createElement("li");
     li.className = "run-item" + (state.selectedRun === run.run_id ? " selected" : "");
     li.innerHTML = `
       <div class="rid">${run.run_id}</div>
-      <div class="title">${escapeHtml(run.requirement_title || "-")}</div>
+      <div class="title">${escapeHtml(run.requirement_title || (running ? "（解析需求中…）" : "-"))}</div>
       <div class="meta">
-        <span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>
-        <span>${run.steps} 步</span><span>${run.rollbacks} 回退</span><span>${run.bugs_total} 缺陷</span>
+        <span class="badge ${running ? "running" : "done"}">${running ? "进行中" : "已完成"}</span>
+        ${run.verdict ? `<span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>` : ""}
+        <span>${run.steps ?? 0} 步</span><span>${run.rollbacks ?? 0} 回退</span><span>${run.bugs_total ?? 0} 缺陷</span>
       </div>`;
     li.addEventListener("click", () => selectRun(run.run_id));
     ul.appendChild(li);
   });
   if (!state.selectedRun && state.runs.length) selectRun(state.runs[0].run_id);
 }
+
+/* ---------------- 对话区 ---------------- */
+/* 一条用户消息 + 一条对应的运行记录气泡；点击气泡跳转该运行详情 */
+const chatMessages = [];
+
+function pushChatMessage(text, runId) {
+  chatMessages.push({ kind: "user", text, ts: new Date() });
+  chatMessages.push({ kind: "run", runId, ts: new Date() });
+  renderChat();
+}
+
+function fmtTime(d) {
+  return d.toTimeString().slice(0, 8);
+}
+
+function renderChat() {
+  const box = $("#chat-messages");
+  if (!chatMessages.length) {
+    box.innerHTML = '<div class="empty" style="height:80px">暂无对话，输入需求后按 Enter 发送</div>';
+    return;
+  }
+  box.innerHTML = chatMessages
+    .map((m) => {
+      if (m.kind === "user") {
+        return `<div class="msg user">
+          <div class="bubble">${escapeHtml(m.text)}</div>
+          <span class="msg-time">${fmtTime(m.ts)}</span>
+        </div>`;
+      }
+      const run = state.runs.find((r) => r.run_id === m.runId);
+      const running = !run || run.finished === false;
+      const meta = run
+        ? `${run.steps ?? 0} 步 · ${run.rollbacks ?? 0} 回退 · ${run.bugs_total ?? 0} 缺陷${run.duration_s != null ? " · " + run.duration_s + "s" : ""}`
+        : "已提交，等待流水线启动…";
+      return `<div class="msg run-msg" data-run="${escapeHtml(m.runId)}" title="点击查看该次任务的执行情况与思考链路">
+        <div class="bubble">
+          <div class="msg-head">
+            <span class="badge ${running ? "running" : "done"}">${running ? "进行中" : "已完成"}</span>
+            ${run && run.verdict ? `<span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>` : ""}
+            <code>${escapeHtml(m.runId)}</code>
+          </div>
+          <div class="msg-meta">${escapeHtml(meta)}</div>
+          <div class="msg-link">查看执行情况与思考链路 →</div>
+        </div>
+        <span class="msg-time">${fmtTime(m.ts)}</span>
+      </div>`;
+    })
+    .join("");
+}
+
+$("#chat-messages").addEventListener("click", (ev) => {
+  const el = ev.target.closest(".run-msg");
+  if (el && el.dataset.run) selectRun(el.dataset.run);
+});
 
 const renderCache = { runId: null, key: "" };
 
@@ -81,7 +138,9 @@ function renderRunDetail(detail, openTraces = []) {
   const iter = s.iterations || {};
   const verdictCard = detail.finished === false
     ? ["验收", "进行中…", "orange"]
-    : ["验收", s.verdict === "pass" ? "通过" : "未通过", s.verdict === "pass" ? "green" : "red"];
+    : !s.verdict
+      ? ["验收", "异常中断", "red"]   // 无验收结论：服务中断/线程异常，未跑完
+      : ["验收", s.verdict === "pass" ? "通过" : "未通过", s.verdict === "pass" ? "green" : "red"];
   const cards = [
     verdictCard,
     ["总步数", s.steps ?? "-", ""],
@@ -218,7 +277,9 @@ function renderTraces(traces) {
           <span class="trace-kind">${escapeHtml(t.task_kind || "")}</span>
           ${t.error ? `<span class="badge fail">失败</span>` : ""}
           ${hasReasoning ? '<span class="badge pass">含思考链</span>' : ""}
-          <span class="trace-meta">${t.model || ""} · ${t.tokens ?? "-"} tok · ${((t.latency_ms || 0) / 1000).toFixed(1)}s</span>
+          ${t.finish_reason === "length" ? '<span class="badge fail">输出被截断</span>' : ""}
+          ${t.degraded ? '<span class="badge pass">已降级重发</span>' : ""}
+          <span class="trace-meta">${t.model || ""} · ${t.tokens ?? "-"} tok${t.reasoning_tokens ? `（思考 ${t.reasoning_tokens}）` : ""} · ${((t.latency_ms || 0) / 1000).toFixed(1)}s</span>
         </summary>
         ${t.error ? `<div class="trace-section"><h4>错误</h4><pre>${escapeHtml(t.error)}</pre></div>` : ""}
         ${hasReasoning ? `<div class="trace-section"><h4>思考链（reasoning）</h4><pre>${escapeHtml(t.reasoning)}</pre></div>` : ""}
@@ -232,6 +293,8 @@ $("#refresh-runs").addEventListener("click", loadRuns);
 
 /* ---------------- 对话入口：发起新运行并实时轮询 ---------------- */
 let pollTimer = null;
+/* 正在执行的运行集合：支持上一个任务进行中继续发起新需求，各自独立刷新 */
+const activeRuns = new Set();
 
 /* ---------------- 模型配置弹窗：API Key / Base URL / 默认模型 ---------------- */
 const CFG = {
@@ -497,7 +560,7 @@ async function startRun() {
   const provider = state.llm.provider || "offline";
   const model = $("#llm-model-select").value.trim();
   const btn = $("#start-run");
-  btn.disabled = true;
+  btn.disabled = true;   // 仅在提交请求期间禁用，发起后立即可继续输入新需求
   setComposerStatus("正在启动流水线……", "running");
   try {
     const res = await fetch("/api/run", {
@@ -513,46 +576,54 @@ async function startRun() {
     const data = await res.json();
     if (!res.ok) {
       setComposerStatus(data.error || "启动失败", "error");
-      btn.disabled = false;
       return;
     }
+    $("#new-requirement").value = "";                 // 发送后清空输入框
+    pushChatMessage(requirement, data.run_id);        // 消息进入对话区
     state.selectedRun = data.run_id;
-    setComposerStatus(`运行中 ${data.run_id} …`, "running");
-    pollRun(data.run_id);
+    activeRuns.add(data.run_id);
+    await loadRuns();
+    await selectRun(data.run_id);
+    setComposerStatus(`运行中 ${data.run_id} …（可继续发起新需求）`, "running");
+    startPolling();
   } catch (err) {
     setComposerStatus(`请求失败：${err.message}`, "error");
+  } finally {
     btn.disabled = false;
   }
 }
 
-async function pollRun(runId) {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    if (state.selectedRun !== runId) {
-      // 用户已手动切换到其他运行，停止跟随本轮轮询
-      clearInterval(pollTimer);
-      pollTimer = null;
-      $("#start-run").disabled = false;
-      return;
-    }
-    await loadRuns();
-    await selectRun(runId); // 运行中也能展示实时事件流（summary 未生成时显示"进行中"）
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(pollTick, 1500);
+}
+
+async function pollTick() {
+  await loadRuns();   // 列表里的"进行中 / 已完成"随轮询刷新
+  for (const runId of Array.from(activeRuns)) {
     const run = state.runs.find((r) => r.run_id === runId);
-    if (run && run.verdict) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-      $("#start-run").disabled = false;
+    if (run && run.finished !== false) {
+      activeRuns.delete(runId);
       setComposerStatus(
         `完成 ${runId}：${run.verdict === "pass" ? "验收通过" : "验收未通过"}（${run.steps} 步 / ${run.rollbacks} 回退 / ${run.bugs_total} 缺陷）`,
         run.verdict === "pass" ? "done" : "error"
       );
     }
-  }, 1500);
+  }
+  if (state.selectedRun) await selectRun(state.selectedRun);   // 刷新当前查看详情（含思考链路）
+  if (!activeRuns.size && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 }
 
 $("#start-run").addEventListener("click", startRun);
 $("#new-requirement").addEventListener("keydown", (ev) => {
-  if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") startRun();
+  // Enter 发送，Shift+Enter 换行（Ctrl/Cmd+Enter 仍保留为发送快捷键）
+  if (ev.key === "Enter" && !ev.shiftKey) {
+    ev.preventDefault();
+    startRun();
+  }
 });
 $("#load-example").addEventListener("click", async () => {
   const res = await fetch("/api/example");

@@ -7,3 +7,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+# WorkBuddy 本地项目数据（会话/记忆，禁止提交）
+.workbuddy/

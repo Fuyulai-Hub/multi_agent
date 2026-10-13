@@ -128,13 +128,13 @@ class DeveloperAgent(BaseAgent):
     def _write_files(self, files: List[Dict[str, Any]], task: NodeTask, result: AgentResult) -> List[str]:
         written = []
         for file_item in files or []:
-            path = self.ctx.sandbox.write_file(str(file_item["path"]), str(file_item["content"]))
+            path = self.sandbox_write(str(file_item["path"]), str(file_item["content"]))
             written.append(str(file_item["path"]))
             self.evidence(result, "file", path=str(file_item["path"]), chars=len(str(file_item["content"])))
         return written
 
     def _self_check(self, package: str, task: NodeTask) -> Dict[str, Any]:
-        check = self.ctx.sandbox.run(
+        check = self.sandbox_run(
             [self.ctx.sandbox.python, "-c", f"import {package}; print('import-ok')"],
             env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
         )
@@ -234,7 +234,7 @@ class DeveloperAgent(BaseAgent):
                 "regression_ok": None,
             }
             if test_file and bug.get("test"):
-                regression = self.ctx.sandbox.run(
+                regression = self.sandbox_run(
                     [self.ctx.sandbox.python, test_file, "--only", str(bug["test"])],
                     env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
                     result_marker="<<<MASS_RESULT>>>",

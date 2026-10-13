@@ -56,7 +56,7 @@ class TesterAgent(BaseAgent):
         # 1) 写入测试文件（真实可执行）
         test_file = ""
         for file_item in data.get("files", []):
-            self.ctx.sandbox.write_file(str(file_item["path"]), str(file_item["content"]))
+            self.sandbox_write(str(file_item["path"]), str(file_item["content"]))
             if str(file_item["path"]).startswith("tests/"):
                 test_file = str(file_item["path"])
                 self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
@@ -69,7 +69,7 @@ class TesterAgent(BaseAgent):
         negotiation = self._negotiate(data, task, result)
 
         # 3) 沙箱真实执行
-        exec_result = self.ctx.sandbox.run(
+        exec_result = self.sandbox_run(
             [self.ctx.sandbox.python, test_file],
             env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
             result_marker="<<<MASS_RESULT>>>",

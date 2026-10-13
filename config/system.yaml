@@ -29,7 +29,27 @@ llm:
   api_key_env: "MAS_LLM_API_KEY"
   temperature: 0.2
   max_tokens: 16000           # 推理模型（Qwen/DeepSeek/GLM）的思考链会抢占 token 预算，给足余量避免正文被截断
+  # —— 思考预算治理 ——
+  # 实测（本端点，GLM）：implement 长 JSON 任务思考链 60735 字符打满 max_tokens=16000 →
+  # finish_reason=length、正文 0 字符、耗时 221s；下发 reasoning_effort=low 后同一任务
+  # 35s 返回 12620 字符正文（finish_reason=stop）。思考链确实计入 max_tokens 输出预算。
+  reasoning_effort: ""              # 空=不下发（保持端点默认）；可填 low / medium / high
+  # 降级阶梯：结果不可用时依次尝试的思考强度（逗号分隔或 YAML 列表）。
+  # 顺序按实测耗时排：low ≈33s（距网关 300s 上限余量约 9 倍）→ high ≈115s（余量约 2.6 倍，但同样能收敛）。
+  # "不可用" = 被预算截断(length) / 网关 504 超时；降级档另含 空正文 / 解析不出 JSON。
+  downgrade_reasoning_effort: "low,high"
+  empty_output_retry: 2             # 最多降级重发几次（0=关闭降级）；与上面的阶梯长度取小者生效
   timeout: 600            # 该端点单次响应实测 150~200s（超时 120s 会导致 implement/optimize 读超时）
+  # function calling（默认关闭）：开启后从 config/mcp.yaml 的 enabled 服务拉取工具清单，
+  # 以 OpenAI tools 格式随请求下发；模型返回 tool_calls 时由 ToolRunner 真实执行并回传。
+  # 注意：tools 与 response_format(json_object) 互斥，开启后 JSON 约束改由 Prompt 契约保证。
+  tools_enabled: false
+  tool_choice: "auto"         # auto | required | {"type":"function","function":{"name":...}}
+  tool_max_rounds: 2          # 单次生成的工具调用闭环轮数上限
+  # 网络重试：默认 1（不重试，保持既有行为）；端点不稳定时按需开启（仅重试网络错误与 429/5xx）
+  retry:
+    max_attempts: 1
+    backoff_s: 2.0
   # 上下文窗口（token）：端点不返回该值，前端"已用/总量"进度条用。
   # 平台公告：模型名不再含版本号（DeepSeek / Qwen / GLM / Embedding / Reranker），
   # 上下文大小随资源调整、当前均不超过 256K，故默认取 262144；可在前端「模型配置」弹窗修改。
@@ -44,6 +64,19 @@ llm:
 runtime:
   python: "python"
   sandbox_timeout: 180            # 单次沙箱执行超时（秒）
+  # 沙箱命令白名单：只放行 Python 解释器（含绝对路径/版本号变体），拒绝 shell 解释器
+  sandbox_command_policy:
+    enabled: true
+    allowed: ["python", "python3", "py"]
+  sandbox_strip_sensitive_env: true   # 剔除含 KEY/TOKEN/SECRET 等词的环境变量再进沙箱
+  # POSIX 资源限制（Windows 无标准库等价方案，自动跳过并在事件中标注）
+  sandbox_limits:
+    cpu_seconds: 300
+    address_space_bytes: 1073741824
+    file_size_bytes: 67108864
+    max_processes: 128
+  # 静态分析并行度（按文件并行，IO 等待型负载；不配则用默认 min(8, cpu+4)）
+  sandbox_analyze_workers: null
   save_prompts: true              # 落盘每次 Prompt（含分层经验注入证据）
   max_steps: 40                   # 单次运行最大状态推进步数（防死循环）
   run_id_format: "%Y%m%d-%H%M%S"

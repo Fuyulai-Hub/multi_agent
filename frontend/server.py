@@ -23,6 +23,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -58,31 +59,94 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+# 事件日志超过该时长无新增且没有 run_summary，视为运行已中断（服务进程被杀等），
+# 避免这类记录在列表里长期停在"进行中"（正常跑的流水线每隔几秒就有新事件）
+RUN_STALE_SECONDS = 600
+
+
+def run_finished(run_dir: Path, run_id: str) -> bool:
+    """判定一次运行是否已结束：产出 run_summary，或异常终止（error.log / 事件长期无新增）。"""
+    if (run_dir / "run_summary.json").exists():
+        return True
+    if (run_dir.parent / f"{run_id}.error.log").exists():
+        return True
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        return False
+    try:
+        return (time.time() - events_path.stat().st_mtime) > RUN_STALE_SECONDS
+    except OSError:
+        return True
+
+
+def _running_summary(run_dir: Path, run_id: str) -> dict:
+    """尚无 run_summary.json 的运行：从事件日志推导实时摘要（运行中或已中断）。"""
+    title = ""
+    steps = 0
+    ts = None
+    for event in read_jsonl(run_dir / "events.jsonl"):
+        payload = event.get("payload") or {}
+        if not title and event.get("type") == "run_started":
+            title = payload.get("requirement") or ""
+        if not ts:
+            ts = event.get("ts")
+        if event.get("type") == "node_start":
+            steps += 1
+    ended = run_finished(run_dir, run_id)   # True = 已中断结束（无验收结论，按未通过计）
+    return {
+        "run_id": run_id,
+        "requirement_title": title,
+        "verdict": "fail" if ended else None,
+        "steps": steps,
+        "rollbacks": 0,
+        "review_rejections": 0,
+        "bugs_total": 0,
+        "bugs_fixed": 0,
+        "duration_s": None,
+        "injected_experiences": None,
+        "profile": None,
+        "ts": ts,
+        "finished": ended,            # False = 进行中
+        "status": "已完成" if ended else "进行中",
+        "error": ended,
+    }
+
+
 def load_runs(workspace: Path) -> list[dict]:
     runs_dir = workspace / "runs"
     if not runs_dir.exists():
         return []
     runs = []
-    for summary_path in sorted(runs_dir.glob("*/run_summary.json")):
-        try:
-            data = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
             continue
-        metrics = data.get("metrics") or {}
-        runs.append({
-            "run_id": data.get("run_id"),
-            "requirement_title": data.get("requirement_title"),
-            "verdict": data.get("verdict"),
-            "steps": data.get("steps"),
-            "rollbacks": data.get("rollbacks"),
-            "review_rejections": data.get("review_rejections"),
-            "bugs_total": data.get("bugs_total"),
-            "bugs_fixed": data.get("bugs_fixed"),
-            "duration_s": metrics.get("duration_s"),
-            "injected_experiences": metrics.get("injected_experiences"),
-            "profile": metrics.get("profile"),
-            "ts": metrics.get("ts"),
-        })
+        run_id = run_dir.name
+        summary_path = run_dir / "run_summary.json"
+        if summary_path.exists():
+            try:
+                data = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            metrics = data.get("metrics") or {}
+            runs.append({
+                "run_id": data.get("run_id") or run_id,
+                "requirement_title": data.get("requirement_title"),
+                "verdict": data.get("verdict"),
+                "steps": data.get("steps"),
+                "rollbacks": data.get("rollbacks"),
+                "review_rejections": data.get("review_rejections"),
+                "bugs_total": data.get("bugs_total"),
+                "bugs_fixed": data.get("bugs_fixed"),
+                "duration_s": metrics.get("duration_s"),
+                "injected_experiences": metrics.get("injected_experiences"),
+                "profile": metrics.get("profile"),
+                "ts": metrics.get("ts"),
+                "finished": True,
+                "status": "已完成",
+                "error": False,
+            })
+        elif (run_dir / "events.jsonl").exists():
+            runs.append(_running_summary(run_dir, run_id))
     runs.sort(key=lambda r: r.get("run_id") or "", reverse=True)
     return runs
 
@@ -96,9 +160,12 @@ def load_run_detail(workspace: Path, run_id: str) -> dict | None:
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else None
     report_path = run_dir / "reports" / "acceptance_report.md"
     timeline_path = run_dir / "timeline.md"
+    # 无 run_summary.json 即仍在运行（error.log / 事件长期无新增视为已中断结束）
+    finished = run_finished(run_dir, run_id)
     return {
         "summary": summary,
-        "finished": summary_path.exists(),
+        "finished": finished,
+        "status": "已完成" if finished else "进行中",
         "events": read_jsonl(events_path),
         "llm_traces": read_jsonl(run_dir / "llm_traces.jsonl"),
         "report": report_path.read_text(encoding="utf-8") if report_path.exists() else "",
@@ -258,6 +325,10 @@ def start_run(
         config.llm_overrides["base_url"] = base_url
     stamp = datetime.now().strftime(str(config.runtime.get("run_id_format", "%Y%m%d-%H%M%S")))
     run_id = f"{stamp}-{secrets.token_hex(2)}"
+    # 先落目录与空事件文件：运行记录在启动瞬间即可见于列表（状态"进行中"）
+    run_dir = workspace / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "events.jsonl").touch(exist_ok=True)
 
     def worker() -> None:
         try:

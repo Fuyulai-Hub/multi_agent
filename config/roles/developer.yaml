@@ -13,9 +13,11 @@ inputs: ["requirement_spec", "solution_design", "review_report", "test_report", 
 outputs: ["solution_design", "code_manifest", "implementation_summary", "fix_summary", "fix_test_report"]
 
 permissions:
-  can_write_code: true
-  can_rollback: false
-  can_block_acceptance: false
+  can_write_code: true           # 写沙箱内实现代码（tests/ 之外的 .py）
+  can_write_tests: true          # 写沙箱内 tests/ 测试文件
+  can_execute: true              # 沙箱执行命令（导入自检 / 定向回归）
+  can_rollback: false            # 研发节点失败不触发回退边（向前流转或终止）
+  can_block_acceptance: false    # 无验收否决权
 
 prompt:
   persona: "你是一名注重工程质量与可测试性的资深工程师。"

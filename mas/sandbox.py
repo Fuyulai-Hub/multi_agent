@@ -18,10 +18,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .concurrency import parallel_map
 from .config import SystemConfig
 from .errors import SandboxError
 
 __all__ = ["ExecResult", "AnalysisResult", "Sandbox", "Finding"]
+
+# 网络相关模块：沙箱无网络隔离（标准库无跨平台网络命名空间方案），
+# 对 LLM 生成的交付代码做静态检测，让 reviewer 能显式拦截高危外连依赖。
+_NETWORK_MODULES = {
+    "socket", "ssl", "urllib", "urllib2", "urllib3", "http", "httplib", "requests",
+    "aiohttp", "ftplib", "telnetlib", "smtplib", "asyncio", "paramiko", "websocket",
+}
+
+# 命令白名单默认值：本系统所有沙箱命令都是 Python 解释器调用（跑实现/跑测试），
+# 默认不放行任何 shell 解释器（cmd/sh/bash -c 可绕过一切路径级约束）。
+DEFAULT_ALLOWED_COMMANDS = ("python", "python3", "py")
+# 环境变量敏感词：命中即从沙箱子进程环境剔除，防止交付代码/测试窃取 LLM 凭据
+_SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+# POSIX 资源限制默认值（秒/字节），防止失控脚本耗尽机器资源
+DEFAULT_RLIMITS = {
+    "cpu_seconds": 300,        # RLIMIT_CPU：单命令 CPU 时间上限（超时 kill 之外的硬闸
+    "address_space_bytes": 1 << 30,   # RLIMIT_AS：1GB 虚拟内存上限
+    "file_size_bytes": 64 << 20,      # RLIMIT_FSIZE：单文件 64MB，防日志打满磁盘
+    "max_processes": 128,       # RLIMIT_NPROC：防 fork 炸弹
+}
 
 
 @dataclass
@@ -91,7 +112,16 @@ class AnalysisResult:
 
 
 class Sandbox:
-    """工作目录受限的命令执行器。"""
+    """工作目录受限的命令执行器。
+
+    隔离层次（由弱到强）：
+    1. 路径级：resolve() 拒绝越界读写（既有能力）；
+    2. 命令级：白名单只放行 Python 解释器，拒绝 shell 解释器；
+    3. 环境级：剔除含 KEY/TOKEN/SECRET 等敏感词的环境变量，防凭据泄露给被测代码；
+    4. 资源级（仅 POSIX 单线程进程）：rlimit 限制 CPU/内存/文件大小/进程数；
+    5. 检测级：静态分析 network_import 规则标记外连依赖（沙箱无网络命名空间隔离，
+       这一步是"让高危依赖可见"，不是隔离，已在 finding 消息中如实标注）。
+    """
 
     def __init__(self, root: Path, config: SystemConfig, *, events: Any = None) -> None:
         self.root = Path(root).resolve()
@@ -100,6 +130,15 @@ class Sandbox:
         self.root.mkdir(parents=True, exist_ok=True)
         self.python = str(config.runtime.get("python") or sys.executable or "python")
         self.timeout = int(config.runtime.get("sandbox_timeout", 180))
+        # 命令白名单（runtime.sandbox_command_policy 可覆盖；enabled=false 可关闭）
+        policy = dict(config.runtime.get("sandbox_command_policy") or {})
+        self.command_policy_enabled = bool(policy.get("enabled", True))
+        self.allowed_commands = {
+            str(item).lower() for item in (policy.get("allowed") or DEFAULT_ALLOWED_COMMANDS)
+        }
+        self.strip_sensitive_env = bool(config.runtime.get("sandbox_strip_sensitive_env", True))
+        limits = dict(config.runtime.get("sandbox_limits") or DEFAULT_RLIMITS)
+        self.rlimits = {key: int(value) for key, value in limits.items() if int(value) > 0}
 
     # ---------------------------------------------------------------- 文件
     def resolve(self, relative: str) -> Path:
@@ -166,12 +205,10 @@ class Sandbox:
         result_marker: Optional[str] = None,
     ) -> ExecResult:
         workdir = self.resolve(cwd) if cwd else self.root
-        env = dict(os.environ)
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-        if env_extra:
-            env.update(env_extra)
+        self._check_command(cmd)
+        env = self._build_env(env_extra)
         started = time.time()
+        spawn_kwargs = self._spawn_kwargs()
         try:
             completed = subprocess.run(
                 cmd,
@@ -183,6 +220,7 @@ class Sandbox:
                 timeout=timeout or self.timeout,
                 env=env,
                 shell=False,
+                **spawn_kwargs,
             )
             exit_code, stdout, stderr = completed.returncode, completed.stdout or "", completed.stderr or ""
         except subprocess.TimeoutExpired as exc:
@@ -212,9 +250,96 @@ class Sandbox:
                     "exit_code": exit_code,
                     "duration_ms": duration_ms,
                     "ok": result.ok,
+                    "isolation": self._isolation_label(),
                 },
             )
         return result
+
+    # ---------------------------------------------------------------- 隔离策略
+    def _check_command(self, cmd: List[str]) -> None:
+        """命令白名单：只放行 Python 解释器；显式拒绝 shell 解释器（-c 可绕过路径约束）。
+
+        匹配规则：取可执行文件 basename，去 .exe 后缀后——
+        ① 与白名单条目全等（python / python3 / py）；
+        ② 或匹配白名单条目 + 版本号后缀（python3.13 / python3.13.exe，兼容绝对路径调用）。
+        """
+        if not cmd:
+            raise SandboxError("空命令")
+        raw_name = Path(str(cmd[0])).name.lower()
+        executable = raw_name[:-4] if raw_name.endswith(".exe") else raw_name
+        if executable in {"cmd", "sh", "bash", "zsh", "powershell", "pwsh"}:
+            raise SandboxError(f"沙箱禁止执行 shell 解释器: {cmd[0]}（请改用 python 直接执行脚本）")
+        if self.command_policy_enabled and not self._executable_allowed(executable):
+            raise SandboxError(
+                f"命令不在沙箱白名单: {cmd[0]}（允许: {sorted(self.allowed_commands)}；"
+                f"可在 system.yaml runtime.sandbox_command_policy 中调整）"
+            )
+
+    def _executable_allowed(self, executable: str) -> bool:
+        if executable in self.allowed_commands:
+            return True
+        # python3.13 / python3.13.exe 这类带版本号的解释器名
+        return any(
+            re.fullmatch(re.escape(entry) + r"[\d.]*", executable)
+            for entry in self.allowed_commands
+        )
+
+    def _build_env(self, env_extra: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """构造子进程环境：默认剔除敏感变量（LLM 凭据等），显式 env_extra 仍可注入。"""
+        env = dict(os.environ)
+        if self.strip_sensitive_env:
+            for key in [name for name in env if any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS)]:
+                env.pop(key, None)
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+        if env_extra:
+            env.update(env_extra)
+        return env
+
+    def _spawn_kwargs(self) -> Dict[str, Any]:
+        """POSIX 单线程场景下注入 rlimit preexec_fn。
+
+        取舍说明：preexec_fn 在 fork→exec 窗口内运行 Python 代码，多线程进程中有
+        极小概率死锁（子进程继承父进程的锁状态）。因此仅当进程单线程
+        （CLI 直跑）时启用；多线程场景（前端面板）跳过并在 sandbox_exec 事件中
+        标注降级，保证可用性优先。
+        """
+        if os.name == "nt" or not self.rlimits:
+            return {}
+        import threading
+
+        if threading.active_count() > 1:
+            return {}
+        return {"preexec_fn": self._apply_rlimits}
+
+    def _apply_rlimits(self) -> None:  # pragma: no cover - 仅在 POSIX 子进程上下文中运行
+        import resource
+
+        mapping = {
+            "cpu_seconds": resource.RLIMIT_CPU,
+            "address_space_bytes": resource.RLIMIT_AS,
+            "file_size_bytes": resource.RLIMIT_FSIZE,
+            "max_processes": resource.RLIMIT_NPROC,
+        }
+        for key, value in self.rlimits.items():
+            limit = mapping.get(key)
+            if limit is not None:
+                try:
+                    resource.setrlimit(limit, (value, value))
+                except (ValueError, OSError):
+                    continue  # 平台不支持的限制项跳过，不阻断执行
+
+    def _isolation_label(self) -> str:
+        """本次执行的隔离等级标签（写入事件，便于审计实际生效的隔离措施）。"""
+        if os.name == "nt":
+            limits = "windows-no-rlimit"
+        elif not self.rlimits:
+            limits = "no-rlimit"
+        elif __import__("threading").active_count() > 1:
+            limits = "rlimit-skipped-multithread"
+        else:
+            limits = "rlimit-active"
+        return f"path+cmd{' +env-strip' if self.strip_sensitive_env else ''}+{limits}"
 
     def run_python(self, script: str, *, args: Optional[List[str]] = None, cwd: Optional[str] = None,
                    result_marker: Optional[str] = None, timeout: Optional[int] = None) -> ExecResult:
@@ -245,6 +370,7 @@ class Sandbox:
 
     # ---------------------------------------------------------------- 静态分析
     def analyze(self, files: List[str], policies: Dict[str, Any]) -> AnalysisResult:
+        """按文件并行做 AST 静态分析（各文件分析相互独立，无共享状态，可安全并行）。"""
         severity_map: Dict[str, str] = dict(policies.get("severity_map") or {})
         max_lines = int(policies.get("max_function_lines", 60))
         max_line_length = int(policies.get("max_line_length", 120))
@@ -253,120 +379,187 @@ class Sandbox:
         require_hints = bool(policies.get("require_type_hints", True))
         result = AnalysisResult(files=list(files))
 
+        def analyze_one(relative: str) -> Optional[Dict[str, Any]]:
+            return self._analyze_file(
+                relative,
+                severity_map=severity_map,
+                max_lines=max_lines,
+                max_line_length=max_line_length,
+                require_module_doc=require_module_doc,
+                require_function_doc=require_function_doc,
+                require_hints=require_hints,
+            )
+
+        # 并行度可被 runtime.sandbox_analyze_workers 覆盖（默认 IO 等待型负载，见 concurrency 模块）
+        workers = self.config.runtime.get("sandbox_analyze_workers")
+        per_file = parallel_map(
+            analyze_one, [name for name in files if self._analyzable(name)],
+            max_workers=int(workers) if workers else None,
+        )
+        for item in per_file:
+            if item is None:
+                continue
+            result.findings.extend(item["findings"])
+            result.loc += item["loc"]
+            result.classes += item["classes"]
+            result.functions.extend(item["functions"])
+            result.syntax_errors.extend(item["syntax_errors"])
+        return result
+
+    def _analyzable(self, relative: str) -> bool:
+        try:
+            path = self.resolve(relative)
+        except SandboxError:
+            return False
+        return path.exists() and path.suffix == ".py"
+
+    def _analyze_file(
+        self,
+        relative: str,
+        *,
+        severity_map: Dict[str, str],
+        max_lines: int,
+        max_line_length: int,
+        require_module_doc: bool,
+        require_function_doc: bool,
+        require_hints: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """单文件 AST 分析：返回可合并的中间结果（findings/loc/classes/functions/syntax_errors）。"""
         def severity(rule: str, default: str = "minor") -> str:
             return severity_map.get(rule, default)
 
-        for relative in files:
-            path = self.resolve(relative)
-            if not path.exists() or path.suffix != ".py":
+        path = self.resolve(relative)
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        findings: List[Finding] = []
+        functions: List[Dict[str, Any]] = []
+        syntax_errors: List[Dict[str, Any]] = []
+        loc = 0
+        classes = 0
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as exc:
+            syntax_errors.append({"file": relative, "line": exc.lineno, "message": exc.msg})
+            findings.append(Finding(
+                rule="syntax_error", severity=severity("syntax_error", "critical"),
+                file=relative, line=exc.lineno or 0, message=f"语法错误: {exc.msg}",
+            ))
+            return {"findings": findings, "loc": 0, "classes": 0,
+                    "functions": functions, "syntax_errors": syntax_errors}
+
+        code_lines = [line for line in lines if line.strip() and not line.strip().startswith("#")]
+        loc = len(code_lines)
+        classes = sum(1 for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
+
+        if require_module_doc and not ast.get_docstring(tree):
+            findings.append(Finding(
+                rule="missing_module_docstring", severity=severity("missing_module_docstring"),
+                file=relative, line=1, message="模块缺少文档字符串",
+            ))
+
+        imported_names: Dict[str, int] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_names[(alias.asname or alias.name).split(".")[0]] = node.lineno
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    imported_names[alias.asname or alias.name] = node.lineno
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            source = path.read_text(encoding="utf-8")
-            lines = source.splitlines()
-            try:
-                tree = ast.parse(source)
-            except SyntaxError as exc:
-                result.syntax_errors.append({"file": relative, "line": exc.lineno, "message": exc.msg})
-                result.findings.append(Finding(
-                    rule="syntax_error", severity=severity("syntax_error", "critical"),
-                    file=relative, line=exc.lineno or 0, message=f"语法错误: {exc.msg}",
+            args = [arg for arg in node.args.args if arg.arg not in ("self", "cls")]
+            arg_names = [arg.arg for arg in args]
+            length = (getattr(node, "end_lineno", node.lineno) or node.lineno) - node.lineno + 1
+            functions.append({
+                "name": node.name,
+                "file": relative,
+                "line": node.lineno,
+                "lines": length,
+                "args": arg_names,
+                "has_docstring": bool(ast.get_docstring(node)),
+            })
+            if require_function_doc and not ast.get_docstring(node):
+                findings.append(Finding(
+                    rule="missing_function_docstring", severity=severity("missing_function_docstring"),
+                    file=relative, line=node.lineno, symbol=node.name, message="公开函数缺少文档字符串",
                 ))
-                continue
+            missing_hints = [name for name, arg in zip(arg_names, args) if arg.annotation is None]
+            if node.returns is None and not node.name.startswith("_"):
+                missing_hints.append("return")
+            if require_hints and missing_hints:
+                findings.append(Finding(
+                    rule="missing_type_hints", severity=severity("missing_type_hints"),
+                    file=relative, line=node.lineno, symbol=node.name,
+                    message=f"缺少类型注解: {', '.join(missing_hints)}",
+                ))
+            if length > max_lines:
+                findings.append(Finding(
+                    rule="function_too_long", severity=severity("function_too_long"),
+                    file=relative, line=node.lineno, symbol=node.name,
+                    message=f"函数长度 {length} 行，超过阈值 {max_lines} 行",
+                ))
+            defaults = [d for d in list(node.args.defaults) + [d for d in node.args.kw_defaults if d is not None]]
+            for default in defaults:
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    findings.append(Finding(
+                        rule="mutable_default", severity=severity("mutable_default"),
+                        file=relative, line=getattr(default, "lineno", node.lineno), symbol=node.name,
+                        message="使用了可变对象作为默认参数",
+                    ))
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.ExceptHandler) and sub.type is None:
+                    findings.append(Finding(
+                        rule="bare_except", severity=severity("bare_except"),
+                        file=relative, line=getattr(sub, "lineno", node.lineno), symbol=node.name,
+                        message="裸 except 会吞掉所有异常",
+                    ))
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in {"eval", "exec"}:
+                    findings.append(Finding(
+                        rule="eval_usage", severity=severity("eval_usage", "critical"),
+                        file=relative, line=getattr(sub, "lineno", node.lineno), symbol=node.name,
+                        message=f"使用了危险调用 {sub.func.id}()",
+                    ))
 
-            code_lines = [line for line in lines if line.strip() and not line.strip().startswith("#")]
-            result.loc += len(code_lines)
-            result.classes += sum(1 for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
+        # 网络导入检测：对整棵树做一遍（覆盖模块级与函数内 import），避免逐函数重复计数
+        for sub in ast.walk(tree):
+            roots: List[str] = []
+            if isinstance(sub, ast.Import):
+                roots = [(alias.asname or alias.name).split(".")[0] for alias in sub.names]
+            elif isinstance(sub, ast.ImportFrom):
+                roots = [(sub.module or "").split(".")[0]]
+            for root in roots:
+                if root in _NETWORK_MODULES:
+                    findings.append(Finding(
+                        rule="network_import", severity=severity("network_import", "major"),
+                        file=relative, line=getattr(sub, "lineno", 0),
+                        message=f"导入网络模块 {root}（沙箱无网络隔离，属高危依赖，需审查确认）",
+                    ))
 
-            if require_module_doc and not ast.get_docstring(tree):
-                result.findings.append(Finding(
-                    rule="missing_module_docstring", severity=severity("missing_module_docstring"),
-                    file=relative, line=1, message="模块缺少文档字符串",
+        for name, lineno in imported_names.items():
+            occurrences = len(re.findall(rf"\b{re.escape(name)}\b", source))
+            if occurrences <= 1:
+                findings.append(Finding(
+                    rule="unused_import", severity=severity("unused_import"),
+                    file=relative, line=lineno, symbol=name, message=f"导入 {name} 未被使用",
                 ))
 
-            imported_names: Dict[str, int] = {}
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        imported_names[(alias.asname or alias.name).split(".")[0]] = node.lineno
-                elif isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        imported_names[alias.asname or alias.name] = node.lineno
-
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                args = [arg for arg in node.args.args if arg.arg not in ("self", "cls")]
-                arg_names = [arg.arg for arg in args]
-                length = (getattr(node, "end_lineno", node.lineno) or node.lineno) - node.lineno + 1
-                result.functions.append({
-                    "name": node.name,
-                    "file": relative,
-                    "line": node.lineno,
-                    "lines": length,
-                    "args": arg_names,
-                    "has_docstring": bool(ast.get_docstring(node)),
-                })
-                if require_function_doc and not ast.get_docstring(node):
-                    result.findings.append(Finding(
-                        rule="missing_function_docstring", severity=severity("missing_function_docstring"),
-                        file=relative, line=node.lineno, symbol=node.name, message="公开函数缺少文档字符串",
-                    ))
-                missing_hints = [name for name, arg in zip(arg_names, args) if arg.annotation is None]
-                if node.returns is None and not node.name.startswith("_"):
-                    missing_hints.append("return")
-                if require_hints and missing_hints:
-                    result.findings.append(Finding(
-                        rule="missing_type_hints", severity=severity("missing_type_hints"),
-                        file=relative, line=node.lineno, symbol=node.name,
-                        message=f"缺少类型注解: {', '.join(missing_hints)}",
-                    ))
-                if length > max_lines:
-                    result.findings.append(Finding(
-                        rule="function_too_long", severity=severity("function_too_long"),
-                        file=relative, line=node.lineno, symbol=node.name,
-                        message=f"函数长度 {length} 行，超过阈值 {max_lines} 行",
-                    ))
-                defaults = [d for d in list(node.args.defaults) + [d for d in node.args.kw_defaults if d is not None]]
-                for default in defaults:
-                    if isinstance(default, (ast.List, ast.Dict, ast.Set)):
-                        result.findings.append(Finding(
-                            rule="mutable_default", severity=severity("mutable_default"),
-                            file=relative, line=getattr(default, "lineno", node.lineno), symbol=node.name,
-                            message="使用了可变对象作为默认参数",
-                        ))
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.ExceptHandler) and sub.type is None:
-                        result.findings.append(Finding(
-                            rule="bare_except", severity=severity("bare_except"),
-                            file=relative, line=getattr(sub, "lineno", node.lineno), symbol=node.name,
-                            message="裸 except 会吞掉所有异常",
-                        ))
-                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in {"eval", "exec"}:
-                        result.findings.append(Finding(
-                            rule="eval_usage", severity=severity("eval_usage", "critical"),
-                            file=relative, line=getattr(sub, "lineno", node.lineno), symbol=node.name,
-                            message=f"使用了危险调用 {sub.func.id}()",
-                        ))
-
-            for name, lineno in imported_names.items():
-                occurrences = len(re.findall(rf"\b{re.escape(name)}\b", source))
-                if occurrences <= 1:
-                    result.findings.append(Finding(
-                        rule="unused_import", severity=severity("unused_import"),
-                        file=relative, line=lineno, symbol=name, message=f"导入 {name} 未被使用",
-                    ))
-
-            for index, line in enumerate(lines, start=1):
-                if len(line) > max_line_length:
-                    result.findings.append(Finding(
-                        rule="line_too_long", severity=severity("line_too_long", "info"),
-                        file=relative, line=index, message=f"单行长度 {len(line)} 超过 {max_line_length}",
-                    ))
-                if re.search(r"#\s*(TODO|FIXME)", line, re.IGNORECASE):
-                    result.findings.append(Finding(
-                        rule="todo_comment", severity=severity("todo_comment", "info"),
-                        file=relative, line=index, message="存在 TODO/FIXME 注释",
-                    ))
-        return result
+        for index, line in enumerate(lines, start=1):
+            if len(line) > max_line_length:
+                findings.append(Finding(
+                    rule="line_too_long", severity=severity("line_too_long", "info"),
+                    file=relative, line=index, message=f"单行长度 {len(line)} 超过 {max_line_length}",
+                ))
+            if re.search(r"#\s*(TODO|FIXME)", line, re.IGNORECASE):
+                findings.append(Finding(
+                    rule="todo_comment", severity=severity("todo_comment", "info"),
+                    file=relative, line=index, message="存在 TODO/FIXME 注释",
+                ))
+        return {
+            "findings": findings, "loc": loc, "classes": classes,
+            "functions": functions, "syntax_errors": syntax_errors,
+        }
 
     # ---------------------------------------------------------------- 便捷
     def python_version(self) -> str:

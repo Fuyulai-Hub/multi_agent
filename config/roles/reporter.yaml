@@ -14,8 +14,9 @@ outputs: ["acceptance_report", "evidence_index", "learning_report"]
 
 permissions:
   can_write_code: false
+  can_execute: false
   can_rollback: false
-  can_block_acceptance: false
+  can_block_acceptance: false    # 报告者只陈述证据，不参与否决
 
 prompt:
   persona: "你是一名审计级报告撰写者，只陈述有证据支撑的结论。"

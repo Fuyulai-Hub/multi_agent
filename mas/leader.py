@@ -34,6 +34,14 @@ from .skills import load_run_facts
 __all__ = ["Leader", "RunSummary"]
 
 
+def _permission_allows(agent: Any, action: str) -> bool:
+    """读取角色 Agent 的 permissions 声明：只有显式 false/0/'false' 才视为无权限（宽松缺省）。"""
+    role = getattr(agent, "role", None)
+    permissions = getattr(role, "permissions", None) or {}
+    value = permissions.get(action, True)
+    return not (value is False or value == 0 or str(value).lower() == "false")
+
+
 @dataclass
 class RunSummary:
     run_id: str
@@ -100,6 +108,11 @@ class Leader:
         agents = {role_id: create_agent(role_id, ctx) for role_id in self.config.roles}
         self._bind_runtime(ctx, bus, events, agents)
 
+        # function calling：默认不装配（tools=None，行为与原先完全一致）；
+        # llm.tools_enabled=true 时从 MCP 服务拉取工具清单，供 Agent 生成时调用。
+        tool_runner = self._build_tool_runner()
+        ctx.tools = tool_runner
+
         # ---------------------------------------------------------------- 输入
         try:
             req_title, req_text = load_requirement(
@@ -128,107 +141,116 @@ class Leader:
         print(f"\n[RUN] {run_id}｜{self.config.name}｜需求：{req_title}")
 
         # ---------------------------------------------------------------- 状态机
-        flow = self.config.flow
-        collaboration = self.config.collaboration
-        iterations: Dict[str, int] = {}
-        rollback_counts: Dict[str, int] = {}
-        pending_reason = ""
-        forced_fail = False
-        node_id: Optional[str] = flow.entry
-        steps = 0
-        max_steps = min(int(flow.max_steps), int(self.config.runtime.get("max_steps", flow.max_steps)))
-        max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
-
-        while node_id and node_id not in flow.terminal and steps < max_steps:
-            steps += 1
-            node = flow.node(node_id)
-            iteration = iterations.get(node_id, 0) + 1
-            iterations[node_id] = iteration
-            ctx.run_state["node_executions"] = steps
-            events.emit(
-                "node_start", agent=node.role, node=node_id, iteration=iteration,
-                payload={"title": node.title, "kind": node.kind},
-            )
-            task = NodeTask.from_node(
-                node, iteration=iteration,
-                directive=self._directive_for(ctx, node_id, iteration),
-                rollback_reason=pending_reason if iteration > 1 else "",
-            )
+        try:
+            flow = self.config.flow
+            collaboration = self.config.collaboration
+            iterations: Dict[str, int] = {}
+            rollback_counts: Dict[str, int] = {}
             pending_reason = ""
+            forced_fail = False
+            node_id: Optional[str] = flow.entry
+            steps = 0
+            max_steps = min(int(flow.max_steps), int(self.config.runtime.get("max_steps", flow.max_steps)))
+            max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
 
-            if node.kind == "gate":
-                outcome = self._run_gate(ctx, task, agents)
-                status = outcome["status"]
-                result = AgentResult(status=status, summary=outcome.get("summary", ""))
-            else:
-                if not node.role or node.role not in agents:
-                    raise ConfigError(f"节点 {node_id} 的角色 {node.role} 未注册")
-                result = agents[node.role].act(task)
-                status = result.status
-                self._track_experience(ctx, result)
-
-            # 广播（按协作矩阵）
-            for topic in result.events or []:
-                self._broadcast(ctx, node.role or "leader", topic,
-                                 result.broadcast_payload or {"summary": result.summary})
-            events.emit(
-                "node_end", agent=node.role, node=node_id, iteration=iteration,
-                payload={"status": status, "summary": result.summary[:300]},
-                severity="info" if status == "pass" else "warning",
-            )
-            if node_id == "review" and status == "fail":
-                ctx.run_state["review_rejections"] += 1
-
-            # L1 即时经验提炼（增量：只处理本步新增事件）
-            self._extract_inline(ctx)
-
-            # 分支与回退
-            branch = collaboration.branch_of(status)
-            target = node.target(branch)
-            if target is None:
-                target = "halt"
-            if branch == "fail" and self._is_rollback(node_id, target, iterations, rollback_counts):
-                policy = collaboration.rollback_policy(node_id, node)
-                rollback_counts[node_id] = rollback_counts.get(node_id, 0) + 1
-                ctx.run_state["rollbacks"] = sum(rollback_counts.values())
-                attempt = rollback_counts[node_id]
-                reason = policy.reason
+            while node_id and node_id not in flow.terminal and steps < max_steps:
+                steps += 1
+                node = flow.node(node_id)
+                iteration = iterations.get(node_id, 0) + 1
+                iterations[node_id] = iteration
+                ctx.run_state["node_executions"] = steps
                 events.emit(
-                    "rollback", agent="leader", node=node_id, iteration=iteration,
-                    severity="warning",
-                    payload={
-                        "from": node_id, "to": target, "reason": reason,
-                        "attempt": attempt, "max_attempts": policy.max_attempts,
-                        "summary": result.summary[:200] or result.error[:200],
-                    },
+                    "node_start", agent=node.role, node=node_id, iteration=iteration,
+                    payload={"title": node.title, "kind": node.kind},
                 )
-                self._broadcast(ctx, "leader", "rollback",
-                                {"from": node_id, "to": target, "reason": reason, "attempt": attempt})
-                pending_reason = f"{reason}（第 {attempt} 次回退）"
-                if attempt > policy.max_attempts or ctx.run_state["rollbacks"] > max_total_rollbacks:
-                    forced_fail = True
-                    events.emit(
-                        "escalation", agent="leader", node=node_id, severity="error",
-                        payload={
-                            "reason": f"回退次数耗尽（{node_id} 已回退 {attempt - 1} 次）",
-                            "strategy": collaboration.escalation.get("on_exhausted", "fail_run_and_report"),
-                            "notify": collaboration.escalation.get("notify", []),
-                        },
-                    )
-                    if str(collaboration.escalation.get("on_exhausted", "fail_run_and_report")) == "fail_run_and_report":
-                        blackboard.publish(
-                            "acceptance_gate",
-                            {"node": "acceptance", "passed": False, "forced": True,
-                             "criteria": [], "failed_criteria": [{"id": "回退次数耗尽", "reason": pending_reason}],
-                             "signoff": {"verdict": "reject", "opinion": "回退次数耗尽，验收不通过"},
-                             "evaluated_at": datetime.now().astimezone().isoformat(timespec="seconds")},
-                            producer="leader", node="acceptance", iteration=iteration,
-                            summary="回退耗尽，判定不通过",
-                        )
-                        target = "report"
-                    else:
+                task = NodeTask.from_node(
+                    node, iteration=iteration,
+                    directive=self._directive_for(ctx, node_id, iteration),
+                    rollback_reason=pending_reason if iteration > 1 else "",
+                )
+                pending_reason = ""
+
+                if node.kind == "gate":
+                    outcome = self._run_gate(ctx, task, agents)
+                    status = outcome["status"]
+                    result = AgentResult(status=status, summary=outcome.get("summary", ""))
+                else:
+                    if not node.role or node.role not in agents:
+                        raise ConfigError(f"节点 {node_id} 的角色 {node.role} 未注册")
+                    result, status = self._act_with_retry(ctx, task, agents, node)
+                    self._track_experience(ctx, result)
+
+                # 广播（按协作矩阵）
+                for topic in result.events or []:
+                    self._broadcast(ctx, node.role or "leader", topic,
+                                     result.broadcast_payload or {"summary": result.summary})
+                events.emit(
+                    "node_end", agent=node.role, node=node_id, iteration=iteration,
+                    payload={"status": status, "summary": result.summary[:300]},
+                    severity="info" if status == "pass" else "warning",
+                )
+                if node_id == "review" and status == "fail":
+                    ctx.run_state["review_rejections"] += 1
+
+                # L1 即时经验提炼（增量：只处理本步新增事件）
+                self._extract_inline(ctx)
+
+                # 分支与回退
+                branch = collaboration.branch_of(status)
+                target = node.target(branch)
+                if target is None:
+                    target = "halt"
+                if branch == "fail" and self._is_rollback(node_id, target, iterations, rollback_counts):
+                    # 权限落地：节点角色显式声明 can_rollback=false 时，拒绝回退并终止流程
+                    if not self._rollback_permitted(node_id, node, target, agents, events, iteration):
                         target = "halt"
-            node_id = target
+                        pending_reason = f"角色 {node.role} 无回退权限（can_rollback=false），流程终止"
+                    else:
+                        policy = collaboration.rollback_policy(node_id, node)
+                        rollback_counts[node_id] = rollback_counts.get(node_id, 0) + 1
+                        ctx.run_state["rollbacks"] = sum(rollback_counts.values())
+                        attempt = rollback_counts[node_id]
+                        reason = policy.reason
+                        events.emit(
+                            "rollback", agent="leader", node=node_id, iteration=iteration,
+                            severity="warning",
+                            payload={
+                                "from": node_id, "to": target, "reason": reason,
+                                "attempt": attempt, "max_attempts": policy.max_attempts,
+                                "summary": result.summary[:200] or result.error[:200],
+                            },
+                        )
+                        self._broadcast(ctx, "leader", "rollback",
+                                        {"from": node_id, "to": target, "reason": reason, "attempt": attempt})
+                        pending_reason = f"{reason}（第 {attempt} 次回退）"
+                        if attempt > policy.max_attempts or ctx.run_state["rollbacks"] > max_total_rollbacks:
+                            forced_fail = True
+                            events.emit(
+                                "escalation", agent="leader", node=node_id, severity="error",
+                                payload={
+                                    "reason": f"回退次数耗尽（{node_id} 已回退 {attempt - 1} 次）",
+                                    "strategy": collaboration.escalation.get("on_exhausted", "fail_run_and_report"),
+                                    "notify": collaboration.escalation.get("notify", []),
+                                },
+                            )
+                            if str(collaboration.escalation.get("on_exhausted", "fail_run_and_report")) == "fail_run_and_report":
+                                blackboard.publish(
+                                    "acceptance_gate",
+                                    {"node": "acceptance", "passed": False, "forced": True,
+                                     "criteria": [], "failed_criteria": [{"id": "回退次数耗尽", "reason": pending_reason}],
+                                     "signoff": {"verdict": "reject", "opinion": "回退次数耗尽，验收不通过"},
+                                     "evaluated_at": datetime.now().astimezone().isoformat(timespec="seconds")},
+                                    producer="leader", node="acceptance", iteration=iteration,
+                                    summary="回退耗尽，判定不通过",
+                                )
+                                target = "report"
+                            else:
+                                target = "halt"
+                node_id = target
+
+        finally:
+            if tool_runner is not None:
+                tool_runner.close()
 
         if node_id is None or steps >= max_steps and node_id not in flow.terminal:
             forced_fail = True
@@ -376,6 +398,19 @@ class Leader:
             signoff_result = agents[node.role].act(task)
             self._track_experience(ctx, signoff_result)
             signoff = signoff_result.artifacts.get("acceptance_opinion") or {}
+            # 权限落地：未声明 can_block_acceptance 的角色，其否决（reject）无效
+            if str(signoff.get("verdict", "")) == "reject" and not _permission_allows(
+                agents[node.role], "can_block_acceptance"
+            ):
+                ctx.events.emit(
+                    "permission_denied", agent=node.role, node=node.id, iteration=task.iteration,
+                    severity="warning",
+                    payload={
+                        "action": "can_block_acceptance",
+                        "reason": f"角色 {node.role} 无验收否决权，其 reject 签署不生效",
+                    },
+                )
+                signoff = {}
 
         passed = all_pass and str(signoff.get("verdict", "pass")) != "reject"
         failed = [item for item in criteria_results if not item["passed"]]
@@ -450,11 +485,90 @@ class Leader:
         self._current_events = events
         self._current_agents = agents
 
+    def _build_tool_runner(self):
+        """按 llm.tools_enabled 装配 function calling 工具执行器（默认关闭，返回 None）。
+
+        开启后从 config/mcp.yaml 的 enabled 服务拉取 tools/list 转 OpenAI schema；
+        单个 MCP 服务不可用只跳过该服务，不阻塞运行。
+        """
+        if not bool(self.config.llm.get("tools_enabled", False)):
+            return None
+        from .toolrunner import ToolRunner
+
+        runner = ToolRunner(self.config)
+        try:
+            schemas = runner.register_from_mcp()
+            static = list(self.config.llm.get("tools") or [])
+            if static:
+                runner.register_static(static)
+            if not schemas and not static:
+                self._current_events.emit(
+                    "tool_runner_empty", agent="leader", severity="warning",
+                    payload={"reason": "llm.tools_enabled=true 但未拉到任何工具（检查 config/mcp.yaml）"},
+                )
+                runner.close()
+                return None      # 无工具可用：降级为无工具运行，避免空 tools 下发干扰端点
+            self._current_events.emit(
+                "tool_runner_ready", agent="leader",
+                payload={"tools": len(runner.schemas)},
+            )
+        except Exception as exc:  # noqa: BLE001 - 工具装配失败降级为无工具运行
+            self._current_events.emit(
+                "tool_runner_failed", agent="leader", severity="warning",
+                payload={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            runner.close()
+            return None
+        return runner
+
     def _broadcast(self, ctx: AgentContext, sender: str, topic: str, payload: Dict[str, Any]) -> None:
         targets = self.config.collaboration.broadcast_targets(topic)
         if not targets:
             return
         ctx.bus.broadcast(sender, topic, payload, targets)
+
+    # ---------------------------------------------------------------- 重试与权限
+    def _act_with_retry(
+        self, ctx: AgentContext, task: NodeTask, agents: Dict[str, Any], node: Any
+    ) -> Tuple[AgentResult, str]:
+        """节点级原地重试：flow.yaml 的 retry.max_attempts > 1 时，失败后原地重跑该节点。
+
+        与 collaboration.rollback 的回退是两套机制：retry 不改变流程位置（原地重试），
+        rollback 退回到上游节点。默认 max_attempts=1（不重试），行为与原来一致。
+        """
+        result = agents[node.role].act(task)
+        max_attempts = max(1, int(getattr(node.retry, "max_attempts", 1) or 1))
+        attempts = 1
+        while result.status != "pass" and attempts < max_attempts:
+            attempts += 1
+            ctx.events.emit(
+                "node_retry", agent=node.role, node=node.id, iteration=task.iteration,
+                severity="warning",
+                payload={
+                    "attempt": attempts, "max_attempts": max_attempts,
+                    "reason": (result.error or result.summary)[:200],
+                },
+            )
+            result = agents[node.role].act(task)
+        return result, result.status
+
+    def _rollback_permitted(
+        self, node_id: str, node: Any, target: str, agents: Dict[str, Any],
+        events: EventLog, iteration: int,
+    ) -> bool:
+        """回退权限：节点角色显式声明 can_rollback=false 时拒绝回退（缺省允许，不破坏既有流程）。"""
+        agent = agents.get(node.role) if node.role else None
+        if agent is None or _permission_allows(agent, "can_rollback"):
+            return True
+        events.emit(
+            "permission_denied", agent=node.role, node=node_id, iteration=iteration,
+            severity="error",
+            payload={
+                "action": "can_rollback", "from": node_id, "to": target,
+                "reason": f"角色 {node.role} 未声明回退权限，拒绝回退并终止流程",
+            },
+        )
+        return False
 
     def _track_experience(self, ctx: AgentContext, result: AgentResult) -> None:
         state = ctx.run_state

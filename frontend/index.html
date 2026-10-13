@@ -57,8 +57,16 @@
             <span class="ctx-text">上下文 --</span>
           </div>
           <span id="composer-status" class="composer-status"></span>
-          <button id="start-run" class="primary">发起流水线（Ctrl+Enter）</button>
+          <button id="start-run" class="primary">发送需求（Enter）</button>
         </div>
+      </div>
+      <!-- 对话区：发出的需求消息 + 对应运行记录（消息点开即看执行情况与思考链路） -->
+      <div class="chat">
+        <div class="panel-title">
+          <h2>对话</h2>
+          <span class="chat-hint">Enter 发送 · Shift+Enter 换行 · 上一个任务进行中也可继续发送新需求</span>
+        </div>
+        <div id="chat-messages" class="chat-messages"></div>
       </div>
       <div class="runs-grid">
         <aside class="run-list">

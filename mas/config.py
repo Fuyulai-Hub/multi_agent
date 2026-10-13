@@ -410,6 +410,7 @@ class LearningConfig:
     promotion: Dict[str, int]
     injection: Dict[str, Any]
     feedback: Dict[str, float]
+    synonyms: Dict[str, List[str]] = field(default_factory=dict)
 
     @classmethod
     def from_raw(cls, raw: Dict[str, Any]) -> "LearningConfig":
@@ -426,6 +427,12 @@ class LearningConfig:
                 budget_tokens=int(value.get("budget_tokens", 300)),
                 weight=float(value.get("weight", 1.0)),
             )
+        synonyms: Dict[str, List[str]] = {}
+        for key, value in (raw.get("synonyms") or {}).items():
+            if isinstance(value, str):
+                synonyms[str(key)] = [value]
+            elif isinstance(value, list):
+                synonyms[str(key)] = [str(item) for item in value]
         return cls(
             enabled=bool(raw.get("enabled", True)),
             storage={k: str(v) for k, v in (raw.get("storage") or {}).items()},
@@ -435,6 +442,7 @@ class LearningConfig:
             promotion={k: int(v) for k, v in (raw.get("promotion") or {}).items()},
             injection=dict(raw.get("injection") or {}),
             feedback={k: float(v) for k, v in (raw.get("feedback") or {}).items()},
+            synonyms=synonyms,
         )
 
     def tier(self, key: str) -> Optional[TierConfig]:
