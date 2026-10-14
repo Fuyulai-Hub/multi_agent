@@ -70,9 +70,11 @@ learning:
     header: "经验注入（{tier} {name}，命中 {count} 条）"
     footer: "以上经验来自历史事件日志，请优先采纳高置信度条目，并避免重复昨日之误。"
 
-  # 经验反馈：注入后若该经验被实际采纳（Provider 消费其 action_key），提升置信度
+  # 经验反馈：注入后若该经验被实际采纳（Provider 消费其 action_key），提升置信度；
+  # 回退归因降权：注入的经验未能预防其声称能防的失败（trigger 与失败事件匹配）时下调置信度。
   feedback:
     reward_on_effect: 0.05
+    penalize_on_rollback: 0.1      # 回退归因 negative 反馈的置信度下调量（下限 0.05）
     penalize_on_ignore: 0.0
 
   # 同义词词典（语义检索的查询扩展）：键命中任务文本时，其同义词 token 一并参与匹配。

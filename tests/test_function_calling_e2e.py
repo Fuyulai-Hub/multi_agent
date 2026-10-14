@@ -234,17 +234,17 @@ class FunctionCallingE2ETests(unittest.TestCase):
     def test_leader_build_tool_runner_gate(self):
         """tools_enabled 默认 false 不装配；显式 true 时装配并发 tool_runner_ready 事件。"""
         leader = Leader(self.config)
-        leader._current_events = _RecordingEvents()
+        events = _RecordingEvents()
 
         # 默认（system.yaml 为 false）→ None，不拉任何 MCP 子进程
-        self.assertIsNone(leader._build_tool_runner())
+        self.assertIsNone(leader._build_tool_runner(events))
 
         self.config.llm["tools_enabled"] = True
-        runner = leader._build_tool_runner()
+        runner = leader._build_tool_runner(events)
         try:
             self.assertIsNotNone(runner)
             self.assertEqual([t["function"]["name"] for t in runner.schemas], ["echo", "ping"])
-            ready = [r for r in leader._current_events.records if r["type"] == "tool_runner_ready"]
+            ready = [r for r in events.records if r["type"] == "tool_runner_ready"]
             self.assertEqual(len(ready), 1)
             self.assertEqual(ready[0]["payload"]["tools"], 2)
         finally:
@@ -256,11 +256,11 @@ class FunctionCallingE2ETests(unittest.TestCase):
         (self.root / "config" / "mcp.yaml").write_text("servers: []\n", encoding="utf-8")
         self.config.llm["tools_enabled"] = True
         leader = Leader(self.config)
-        leader._current_events = _RecordingEvents()
-        runner = leader._build_tool_runner()
+        events = _RecordingEvents()
+        runner = leader._build_tool_runner(events)
         self.assertIsNone(runner)
         self.assertTrue(any(r["type"] == "tool_runner_empty"
-                            for r in leader._current_events.records))
+                            for r in events.records))
 
     # ---------------------------------------------------------------- 关闭时的行为保持
     def test_disabled_by_default_sends_no_tools(self):

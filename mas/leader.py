@@ -5,6 +5,8 @@
 - 处理 pass/fail 分支、回退（含次数上限与升级策略）；
 - 中介 Agent 间协商（请求-应答）与关键事件广播（按 collaboration.yaml 矩阵）；
 - 每步之后做 L1 即时经验提炼，运行结束做总结提炼 + 晋级 + 指标记录（自学习闭环）；
+- 经验反馈闭环：回退时按失败归因降权（negative）、验收通过时奖励（positive），
+  接线 ExperienceLibrary.reinforce()；运行时引用全部由参数显式传递（无类属性共享）；
 - 产出 run_summary.json / timeline.md，并返回结构化 RunSummary。
 """
 
@@ -40,6 +42,18 @@ def _permission_allows(agent: Any, action: str) -> bool:
     permissions = getattr(role, "permissions", None) or {}
     value = permissions.get(action, True)
     return not (value is False or value == 0 or str(value).lower() == "false")
+
+
+# 回退归因：失败节点本次执行发出的事件类型 -> 经验 trigger。
+# 与 experience._facts_from_events / extract_from_events 的提炼规则一一对应：
+# 只有「声称能预防该类失败」的经验才会被降权，避免把无关经验误判为坏经验
+# （实证：首轮 test 失败时在册的只有 review_rejected 类经验，全量降权会误伤它们，
+# 破坏第二轮自学习——见 tests/test_runtime_isolation.py 的归因精确性用例）。
+_FAILURE_TRIGGER_BY_EVENT = {
+    "review_completed": "review_rejected",     # 审查驳回
+    "bug_reported": "bug_found",               # 测试发现缺陷
+    "gate_evaluated": "acceptance_rejected",   # 验收门禁未通过
+}
 
 
 @dataclass
@@ -101,16 +115,15 @@ class Leader:
             log=self._logger(events), run_state={
                 "run_id": run_id, "injected_experience_ids": [], "injected_tiers": {},
                 "injected_total": 0, "rollbacks": 0, "review_rejections": 0, "node_executions": 0,
-                "last_extract_seq": 0, "negotiations": 0,
+                "last_extract_seq": 0, "negotiations": 0, "penalized_experience_ids": [],
             },
         )
-        ctx.consult = self._consult_factory()
         agents = {role_id: create_agent(role_id, ctx) for role_id in self.config.roles}
-        self._bind_runtime(ctx, bus, events, agents)
+        ctx.consult = self._consult_factory(ctx, bus, events, agents)
 
         # function calling：默认不装配（tools=None，行为与原先完全一致）；
         # llm.tools_enabled=true 时从 MCP 服务拉取工具清单，供 Agent 生成时调用。
-        tool_runner = self._build_tool_runner()
+        tool_runner = self._build_tool_runner(events)
         ctx.tools = tool_runner
 
         # ---------------------------------------------------------------- 输入
@@ -222,6 +235,12 @@ class Leader:
                         )
                         self._broadcast(ctx, "leader", "rollback",
                                         {"from": node_id, "to": target, "reason": reason, "attempt": attempt})
+                        # 经验反馈闭环：回退归因降权。只降权「声称能预防本次失败」的经验
+                        # （trigger 与失败节点本次执行的事件匹配），不误伤无关经验。
+                        self._reinforce_injected(
+                            ctx, outcome="negative", evidence=f"{node_id} 回退：{reason}",
+                            failure_triggers=self._failure_triggers_of(ctx, node_id, iteration),
+                        )
                         pending_reason = f"{reason}（第 {attempt} 次回退）"
                         if attempt > policy.max_attempts or ctx.run_state["rollbacks"] > max_total_rollbacks:
                             forced_fail = True
@@ -264,6 +283,13 @@ class Leader:
         verdict = "pass" if gate.get("passed") and not forced_fail else "fail"
         bugs = blackboard.get("bug_reports") or {}
         report = blackboard.get("acceptance_report") or {}
+
+        # 经验反馈闭环（终态）：通过 → 奖励本次注入且未被降权的经验；
+        # 未通过但无法归因 → neutral 仅留痕（回退归因的降权已在回退分支发生）。
+        self._reinforce_injected(
+            ctx, outcome="positive" if verdict == "pass" else "neutral",
+            evidence=f"运行结论：{verdict}（步数 {steps}、回退 {ctx.run_state['rollbacks']}）",
+        )
 
         # 运行级经验提炼（成功路径/效率） + 晋级 + 指标
         learned_end = self._extract_run_end(ctx, verdict, steps, duration_s)
@@ -359,9 +385,8 @@ class Leader:
             bus=bus, llm=llm, sandbox=sandbox, prompts=prompts, experience=experience,
             log=self._logger(events), run_state={"distill_facts": facts},
         )
-        ctx.consult = self._consult_factory()
         agents = {"reporter": create_agent("reporter", ctx)}
-        self._bind_runtime(ctx, bus, events, agents)
+        ctx.consult = self._consult_factory(ctx, bus, events, agents)
 
         task = NodeTask(
             node_id="skill_distill", title="把本次成功流程沉淀为可复用技能", role="reporter",
@@ -442,50 +467,43 @@ class Leader:
         }
 
     # ================================================================= 协作
-    def _consult_factory(self):
-        """构造 Agent 间协商函数（请求-应答，Leader 中介并留痕）。"""
+    def _consult_factory(self, ctx: AgentContext, bus: MessageBus, events: EventLog,
+                         agents: Dict[str, Any]):
+        """构造 Agent 间协商函数（请求-应答，Leader 中介并留痕）。
+
+        运行时引用（bus/events/agents/ctx）由参数显式传入并被闭包捕获：
+        每次 run() 持有独立的运行时，同一 Leader 实例被并发复用时
+        不会出现「后一次运行覆盖前一次运行绑定」导致的证据链串扰。
+        """
 
         def consult(*, requester: str, target_role: str, question: str, fp_id: str = "",
                     node: Optional[str] = None) -> Dict[str, Any]:
             negotiation = self.config.collaboration.negotiation
-            request = self._current_bus.send(
+            request = bus.send(
                 requester, "negotiation_request", {"question": question, "fp_id": fp_id},
                 recipients=[target_role], kind="request", node=node,
             )
-            agent = self._current_agents.get(target_role)
+            agent = agents.get(target_role)
             answer: Dict[str, Any] = {}
             if agent is not None and hasattr(agent, "consult"):
                 answer = agent.consult(question, fp_id) or {}
-            self._current_bus.send(
+            bus.send(
                 target_role, "negotiation_response",
                 {"question": question, "answer": answer.get("answer", ""), "fp_id": fp_id},
                 recipients=[requester], kind="response", correlation_id=request.id, node=node,
             )
-            self._current_events.emit(
+            events.emit(
                 "negotiation_closed", agent=target_role, node=node,
                 payload={"topic": "ambiguity", "question": question,
                          "answer": answer.get("answer", ""), "fp_id": fp_id, "requester": requester},
             )
-            self._current_ctx.run_state["negotiations"] = \
-                self._current_ctx.run_state.get("negotiations", 0) + 1
+            ctx.run_state["negotiations"] = \
+                ctx.run_state.get("negotiations", 0) + 1
             return answer
 
         return consult
 
-    # Leader.run 期间绑定的运行时引用（供 consult 闭包使用）
-    _current_bus: Optional[MessageBus] = None
-    _current_events: Optional[EventLog] = None
-    _current_agents: Dict[str, Any] = {}
-    _current_ctx: Optional[AgentContext] = None
-
-    def _bind_runtime(self, ctx: AgentContext, bus: MessageBus, events: EventLog,
-                      agents: Dict[str, Any]) -> None:
-        self._current_ctx = ctx
-        self._current_bus = bus
-        self._current_events = events
-        self._current_agents = agents
-
-    def _build_tool_runner(self):
+    def _build_tool_runner(self, events: EventLog):
         """按 llm.tools_enabled 装配 function calling 工具执行器（默认关闭，返回 None）。
 
         开启后从 config/mcp.yaml 的 enabled 服务拉取 tools/list 转 OpenAI schema；
@@ -502,18 +520,18 @@ class Leader:
             if static:
                 runner.register_static(static)
             if not schemas and not static:
-                self._current_events.emit(
+                events.emit(
                     "tool_runner_empty", agent="leader", severity="warning",
                     payload={"reason": "llm.tools_enabled=true 但未拉到任何工具（检查 config/mcp.yaml）"},
                 )
                 runner.close()
                 return None      # 无工具可用：降级为无工具运行，避免空 tools 下发干扰端点
-            self._current_events.emit(
+            events.emit(
                 "tool_runner_ready", agent="leader",
                 payload={"tools": len(runner.schemas)},
             )
         except Exception as exc:  # noqa: BLE001 - 工具装配失败降级为无工具运行
-            self._current_events.emit(
+            events.emit(
                 "tool_runner_failed", agent="leader", severity="warning",
                 payload={"error": f"{type(exc).__name__}: {exc}"},
             )
@@ -582,6 +600,76 @@ class Leader:
             state["injected_tiers"][tier] = state["injected_tiers"].get(tier, 0) + int(count)
         state["injected_total"] += int(result.metrics.get("experience_injected", 0) or 0)
 
+    # ================================================================= 经验反馈闭环
+    def _reinforce_injected(
+        self,
+        ctx: AgentContext,
+        *,
+        outcome: str,
+        evidence: str,
+        failure_triggers: Optional[set] = None,
+    ) -> int:
+        """用运行结果回头修正「本次运行已注入经验」的置信度（接线 experience.reinforce）。
+
+        - outcome="negative"（回退归因）：只降权 trigger 命中失败事件类型的经验——
+          这些经验声称能预防该类失败却没能预防；无法归因的经验不误伤。
+          已被降权过的经验在同一运行内不重复降权。
+        - outcome="positive"（运行通过）：奖励全部已注入且本运行未被降权的经验。
+        - outcome="neutral"（运行未通过但无法归因）：仅留痕，不奖不罚。
+        """
+        state = ctx.run_state
+        injected = list(state.get("injected_experience_ids") or [])
+        if not injected:
+            return 0
+        if outcome == "negative":
+            if not failure_triggers:
+                return 0
+            targets = [
+                experience_id for experience_id in injected
+                if self._experience_trigger(ctx, experience_id) in failure_triggers
+            ]
+            if not targets:
+                return 0
+            state["penalized_experience_ids"] = sorted(
+                set(state.get("penalized_experience_ids") or []) | set(targets)
+            )
+        elif outcome == "positive":
+            penalized = set(state.get("penalized_experience_ids") or [])
+            targets = [experience_id for experience_id in injected if experience_id not in penalized]
+        else:
+            targets = injected
+        if not targets:
+            return 0
+        return ctx.experience.reinforce(targets, outcome=outcome, evidence=evidence)
+
+    @staticmethod
+    def _experience_trigger(ctx: AgentContext, experience_id: str) -> str:
+        """按 id 查经验的 trigger（用于回退归因匹配；查不到返回空串即不匹配）。"""
+        for entry in ctx.experience.entries:
+            if entry.id == experience_id:
+                return str(entry.trigger or "")
+        return ""
+
+    @staticmethod
+    def _failure_triggers_of(ctx: AgentContext, node_id: str, iteration: int) -> set:
+        """收集失败节点本次执行发出的事件所对应的经验 trigger 集合（归因依据）。
+
+        只采纳确实表示失败的事件：review_completed 需 verdict=reject、
+        gate_evaluated 需 passed=false、bug_reported 本身就是失败信号。
+        """
+        triggers = set()
+        for event in ctx.events.events:
+            if event.node != node_id or event.iteration != iteration:
+                continue
+            if event.type == "review_completed" and str((event.payload or {}).get("verdict")) != "reject":
+                continue
+            if event.type == "gate_evaluated" and (event.payload or {}).get("passed"):
+                continue
+            trigger = _FAILURE_TRIGGER_BY_EVENT.get(event.type)
+            if trigger:
+                triggers.add(trigger)
+        return triggers
+
     # ================================================================= 经验闭环
     def _extract_inline(self, ctx: AgentContext) -> None:
         """每步之后的 L1 增量提炼：只处理上次提炼之后的新事件。"""
@@ -643,8 +731,8 @@ class Leader:
                 key = (str(payload.get("fp_id", "")), str(payload.get("category", "functional")))
                 record = bug_patterns.setdefault(key, {
                     "fp_id": payload.get("fp_id", ""), "category": payload.get("category", "functional"),
-                    "symptom": str(payload.get("symptom", ""))[:120], "fix_strategy": "",
-                    "count": 0, "refs": [],
+                    "op": payload.get("op", ""), "symptom": str(payload.get("symptom", ""))[:120],
+                    "fix_strategy": "", "count": 0, "refs": [],
                 })
                 record["count"] += 1
             elif event.type == "bug_fixed":

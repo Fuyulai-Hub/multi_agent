@@ -76,8 +76,70 @@ class ExperienceTests(unittest.TestCase):
         self.library.add([self._entry()])
         self.library.retrieve(role="developer", tags=["订单"], task_text="阈值",
                               current_run="run-1")   # hits -> 1
+        # 晋升依据是 hits × success_rate：注入（hits）之外还需要正向反馈证明有效
+        self.assertEqual(self.library.promote(), [])   # 无反馈：success_rate=0.5，0.5 < 1 不晋升
+        self.library.reinforce(self.library.entries[0].id, outcome="positive")
         promoted = self.library.promote()
         self.assertEqual(promoted[0]["tier"], "L2")
+
+    def test_promotion_requires_effective_success(self):
+        """纯使用次数（hits）不足以晋升：防止「反复注入但每次都导致返工」的经验爬上 L3。"""
+        self.library.add([self._entry()])
+        entry_id = self.library.entries[0].id
+        for _ in range(5):
+            self.library.retrieve(role="developer", tags=["订单"], task_text="阈值",
+                                  current_run="run-1")
+            self.library.reinforce(entry_id, outcome="negative")
+        entry = self.library.entries[0]
+        self.assertGreaterEqual(entry.hits, 5)
+        self.assertGreater(entry.hits_failed, 0)
+        self.assertEqual(entry.success_rate, 0.0)
+        self.assertEqual(self.library.promote(), [])   # 有效成功次数 0：不晋升
+        self.assertLess(entry.confidence, 0.8)         # 且置信度被下调
+
+    def test_reinforce_outcomes(self):
+        """reinforce 三态：positive 上调+计数、negative 下调+计数、neutral 仅留痕。"""
+        self.library.add([self._entry()])
+        entry_id = self.library.entries[0].id
+        before = self.library.entries[0].confidence
+
+        touched = self.library.reinforce(entry_id, outcome="positive")
+        self.assertEqual(touched, 1)
+        entry = self.library.entries[0]
+        self.assertAlmostEqual(entry.confidence, round(before + 0.05, 3), places=3)
+        self.assertEqual(entry.hits_success, 1)
+        self.assertEqual(entry.hits_failed, 0)
+
+        touched = self.library.reinforce(entry_id, outcome="negative")
+        self.assertEqual(touched, 1)
+        entry = self.library.entries[0]
+        self.assertAlmostEqual(entry.confidence, round(before + 0.05 - 0.1, 3), places=3)
+        self.assertEqual(entry.hits_failed, 1)
+
+        confidence_before = entry.confidence
+        touched = self.library.reinforce(entry_id, outcome="neutral")
+        self.assertEqual(touched, 1)
+        entry = self.library.entries[0]
+        self.assertEqual(entry.confidence, confidence_before)   # neutral 不动置信度
+        self.assertEqual(entry.hits_success, 1)
+        self.assertEqual(entry.hits_failed, 1)
+
+    def test_reinforce_unknown_id_and_empty(self):
+        self.assertEqual(self.library.reinforce([], outcome="positive"), 0)
+        self.assertEqual(self.library.reinforce(["exp-nope"], outcome="negative"), 0)
+
+    def test_reinforce_negative_floor_and_persistence(self):
+        """negative 反馈有置信度下限，且计数持久化后可重载（向后兼容旧库文件）。"""
+        self.library.add([self._entry(confidence=0.1)])
+        entry_id = self.library.entries[0].id
+        self.library.reinforce(entry_id, outcome="negative")
+        self.library.reinforce(entry_id, outcome="negative")
+        self.assertGreaterEqual(self.library.entries[0].confidence, 0.05)
+
+        reloaded = ExperienceLibrary(Path(self.tmp.name), LearningConfig.from_raw(RAW))
+        entry = reloaded.entries[0]
+        self.assertEqual(entry.hits_failed, 2)
+        self.assertEqual(entry.success_rate, 0.0)
 
     def test_extract_from_events(self):
         facts = {
@@ -93,9 +155,23 @@ class ExperienceTests(unittest.TestCase):
         entries = self.library.extract_from_events(facts)
         keys = {entry.action_key for entry in entries}
         self.assertIn("avoid_missing_function_docstring", keys)
-        self.assertIn("guard_FP-03__boundary", keys)
+        self.assertIn("guard_FP-03__boundary", keys)   # 缺 op 时回退功能点 id
         self.assertIn("boundary_tri_state", keys)
         self.assertIn("clarify_before_implement", keys)
+
+    def test_guard_action_key_uses_op(self):
+        """缺陷守护经验的 action_key 用算子键（op）：离线 Provider 按 guard_<op>__<category>
+        匹配是否注入缺陷（README/docs 声明的 guard_calc_shipping__boundary 形式）。"""
+        facts = {
+            "run_id": "run-x", "tags": ["订单"], "review_blocking": [], "acceptance_failed": [],
+            "metrics": {"acceptance": True, "node_executions": 12, "bugs_total": 2},
+            "negotiations": [],
+            "bug_patterns": [{"fp_id": "FP-03", "op": "calc_shipping", "category": "boundary",
+                              "symptom": "1.3kg 运费错误", "fix_strategy": "向上取整", "count": 1}],
+        }
+        entries = self.library.extract_from_events(facts)
+        guard = [item for item in entries if item.action_key.startswith("guard_")]
+        self.assertEqual(guard[0].action_key, "guard_calc_shipping__boundary")
 
     def test_different_ambiguities_do_not_merge(self):
         """同一 action_key 下的不同歧义必须各自成条，不拼成一条不断膨胀的 lesson。

@@ -3,11 +3,19 @@
 闭环链路：
     事件日志(events.jsonl) --extract--> 分级经验库(L1/L2/L3) --retrieve--> Prompt 分层注入
           ^                                                                       |
-          |__________________________ reinforce(hits/confidence) ________________|
+          |__________________________ reinforce(positive/negative/neutral) _______|
+
+反馈语义（由 Leader 调用，见 mas/leader.py）：
+- 回退归因降权：注入的经验未能预防其声称能防的失败（trigger 与失败事件匹配）→ negative，
+  置信度下调、hits_failed += 1；
+- 运行终态奖励：验收通过 → positive，置信度上调、hits_success += 1；未通过但无法归因 →
+  neutral，仅留痕；
+- 晋级依据：有效成功次数 hits × success_rate（而非纯 hits），防止「反复注入但每次都导致
+  返工」的经验晋升到 L3。
 
 - L1：本次运行内即时经验（当轮缺陷、驳回原因），只注入同一 run 的后续节点
 - L2：项目/领域经验（同一需求域内可复用），下次运行同域需求时注入
-- L3：全局通用经验（跨项目通用），命中次数达到阈值后自动晋级
+- L3：全局通用经验（跨项目通用），有效复用次数达到阈值后自动晋级
 """
 
 from __future__ import annotations
@@ -129,6 +137,8 @@ class Experience:
     dedupe: str = ""            # 去重细分维度：同一 action_key 下按此字段再分桶
     confidence: float = 0.5
     hits: int = 0
+    hits_success: int = 0       # 被注入后所在运行顺利通过（positive 反馈）的次数
+    hits_failed: int = 0        # 被注入后未能预防回退（negative 反馈）的次数
     evidence_count: int = 0
     source_run: str = ""
     source_refs: List[str] = field(default_factory=list)
@@ -152,6 +162,18 @@ class Experience:
         # 不同歧义不再被合并成一条不断膨胀的 lesson（实测：cron 的 misfire 歧义与
         # 电商的优惠券歧义被拼成一条，且 hits 累到 120、置信度 1.0，注入证据失真）。
         return _key_of(self.scope, self.action_key or _normalize(self.lesson), self.dedupe)
+
+    @property
+    def success_rate(self) -> float:
+        """经验的有效率：positive 反馈 / 总反馈次数。
+
+        无反馈数据（旧库条目或从未被注入）时取中性值 0.5：既不会因零证据快速晋升，
+        也不会把历史经验永久卡在低层级。
+        """
+        total = self.hits_success + self.hits_failed
+        if total <= 0:
+            return 0.5
+        return self.hits_success / total
 
 
 @dataclass
@@ -447,25 +469,91 @@ class ExperienceLibrary:
         return {"run": "L1", "project": "L2", "global": "L3"}.get(scope, "L3")
 
     # ---------------------------------------------------------------- 反馈
-    def reinforce(self, ids: Iterable[str], *, reward: Optional[float] = None) -> int:
-        """经验被实际消费后的置信度反馈（闭环保真：用得越多越可信）。"""
+    def reinforce(
+        self,
+        ids: Iterable[str],
+        *,
+        outcome: str = "positive",
+        reward: Optional[float] = None,
+        evidence: str = "",
+    ) -> int:
+        """经验被实际消费后的置信度反馈（自学习闭环保真）。
+
+        由调度器在两种时点调用（见 Leader）：
+        - 回退归因：注入的经验未能预防其声称能防的失败 → outcome="negative"，置信度下调；
+        - 运行终态：验收通过 → outcome="positive"，置信度上调；未通过但无法归因 →
+          outcome="neutral"，仅留痕不改动。
+
+        outcome:
+          positive — confidence += feedback.reward_on_effect（默认 0.05），hits_success += 1
+          negative — confidence -= feedback.penalize_on_rollback（默认 0.1，下限 0.05），
+                     hits_failed += 1，并发出 experience_demoted 事件留痕
+          neutral  — 不改置信度与计数（无法归因于经验，不奖不罚）
+
+        reward 参数保留直接指定奖惩值的能力（正数上调、负数下调），默认按 outcome 取配置值。
+        返回被更新的经验条数。
+        """
+        wanted = {str(item) for item in ([ids] if isinstance(ids, str) else ids)}
+        if not wanted:
+            return 0
+        outcome = str(outcome or "neutral").lower()
+        if outcome not in ("positive", "negative", "neutral"):
+            outcome = "neutral"
+        feedback = self.config.feedback or {}
+        if reward is None:
+            if outcome == "positive":
+                reward = float(feedback.get("reward_on_effect", 0.05))
+            elif outcome == "negative":
+                reward = -abs(float(feedback.get("penalize_on_rollback", 0.1)))
+            else:
+                reward = 0.0
+        reward = float(reward)
         with self._locked():
-            self.load() if not self._loaded else None
-            reward = float(self.config.feedback.get("reward_on_effect", 0.0) if reward is None else reward)
+            # 锁内强制重载：同一工作区被多个运行并发反馈时，避免后写者用陈旧内存
+            # 覆盖先写者的计数（与 add() 的锁内强制 load 模式一致）。
+            self.load()
             touched = 0
             for entry in self._entries:
-                if entry.id in set(ids):
-                    entry.confidence = min(1.0, round(entry.confidence + reward, 3))
-                    entry.hits += 1
-                    entry.last_used_at = _now()
-                    touched += 1
-            if touched:
+                if entry.id not in wanted:
+                    continue
+                touched += 1
+                if outcome == "neutral":
+                    continue      # 仅留痕：不改置信度、计数与时间戳
+                entry.confidence = min(1.0, max(0.05, round(entry.confidence + reward, 3)))
+                if outcome == "positive":
+                    entry.hits_success += 1
+                else:
+                    entry.hits_failed += 1
+                entry.last_used_at = _now()
+                if self.events is not None:
+                    self.events.emit(
+                        "experience_reinforced" if outcome == "positive" else "experience_demoted",
+                        agent="experience_library",
+                        payload={
+                            "experience_id": entry.id,
+                            "tier": entry.tier,
+                            "outcome": outcome,
+                            "reward": reward,
+                            "confidence": entry.confidence,
+                            "hits_success": entry.hits_success,
+                            "hits_failed": entry.hits_failed,
+                            "evidence": str(evidence)[:200],
+                            "lesson": entry.lesson,
+                        },
+                    )
+            if touched and outcome != "neutral":
                 self.save()
         return touched
 
     # ---------------------------------------------------------------- 晋级
     def promote(self) -> List[Dict[str, Any]]:
-        """L1→L2→L3 晋级：被反复复用的经验提升层级与复用范围。"""
+        """L1→L2→L3 晋级：被反复**有效**复用的经验提升层级与复用范围。
+
+        晋升依据是「有效成功次数 = hits × success_rate」而非纯 hits：
+        纯 hits 会把「反复注入但每次都导致返工」的经验推上 L3（使用次数多 ≠ 效果好，
+        是自学习的反模式）。success_rate 来自 reinforce() 的 positive/negative 反馈，
+        无反馈数据时取中性值 0.5（见 Experience.success_rate）。
+        """
         with self._locked():
             self.load() if not self._loaded else None
             thresholds = {
@@ -477,6 +565,9 @@ class ExperienceLibrary:
                 current_tier = entry.tier or self._tier_of_scope(entry.scope)
                 need = thresholds.get(current_tier)
                 if need is None or entry.hits < need:
+                    continue
+                effective = entry.hits * entry.success_rate
+                if effective < need:
                     continue
                 if current_tier == "L1":
                     entry.tier, entry.scope = "L2", "project"
@@ -529,6 +620,11 @@ class ExperienceLibrary:
             category_label = CATEGORY_LABELS.get(category, category)
             symptom = str(item.get("symptom", ""))
             strategy = str(item.get("fix_strategy", ""))
+            # action_key 用算子键（op）而非功能点 id：离线 Provider 的缺陷守护按
+            # guard_<op>__<category> 匹配（见 providers/offline.py guarded_ops），
+            # 文档（README / docs 01/02/09）声明的也是 guard_calc_shipping__boundary
+            # 这一形式。缺 op 时回退到 fp_id，保证键非空。
+            guard_key = str(item.get("op", "")) or fp_id
             entries.append(Experience(
                 id="",
                 tier="L1",
@@ -539,7 +635,7 @@ class ExperienceLibrary:
                 lesson=(f"功能点 {fp_id} 出现{category_label}缺陷：{symptom}"
                         + (f"；有效修复策略：{strategy}" if strategy else "")),
                 action=f"实现 {fp_id} 时显式覆盖{category_label}输入，并保留回归用例",
-                action_key=f"guard_{fp_id}__{category}",
+                action_key=f"guard_{guard_key}__{category}",
                 confidence=0.8,
                 evidence_count=int(item.get("count", 1)),
                 source_refs=list(item.get("refs", [])),
