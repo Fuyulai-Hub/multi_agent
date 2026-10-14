@@ -97,6 +97,50 @@ class ExperienceTests(unittest.TestCase):
         self.assertIn("boundary_tri_state", keys)
         self.assertIn("clarify_before_implement", keys)
 
+    def test_different_ambiguities_do_not_merge(self):
+        """同一 action_key 下的不同歧义必须各自成条，不拼成一条不断膨胀的 lesson。
+
+        实测（task02-attempt02）：`clarify_before_implement` 作为固定去重键，把
+        电商的「取消订单口径」与定时的「misfire 策略」两条歧义经验拼进同一条 lesson，
+        hits 累到 120、置信度 1.0，注入证据失真。
+        """
+        facts = {
+            "run_id": "run-x", "tags": ["订单"], "review_blocking": [], "bug_patterns": [],
+            "acceptance_failed": [],
+            "metrics": {"acceptance": True, "node_executions": 12, "bugs_total": 2},
+            "negotiations": [
+                {"question": "取消已支付订单的状态口径", "answer": "退款即取消", "fp_id": "FP-07"},
+                {"question": "misfire 积压周期的排水粒度", "answer": "每 tick 排一次", "fp_id": "FP-06"},
+            ],
+        }
+        entries = self.library.extract_from_events(facts)
+        clarify = [item for item in entries if item.action_key == "clarify_before_implement"]
+        self.assertEqual(len(clarify), 2)
+        self.assertNotEqual(clarify[0].key, clarify[1].key)
+        self.library.add(clarify)
+        reloaded = ExperienceLibrary(Path(self.tmp.name), LearningConfig.from_raw(RAW))
+        merged = [item for item in reloaded.entries if item.action_key == "clarify_before_implement"]
+        self.assertEqual(len(merged), 2)
+        self.assertNotIn("；", merged[0].lesson)     # 没有被拼接成一条
+
+    def test_same_symptom_reinforces_one_entry(self):
+        """同一功能点同一症状重复出现时仍然合并强化（去重键只细分不同症状）。"""
+        facts = {
+            "run_id": "run-x", "tags": ["订单"], "acceptance_failed": [], "negotiations": [],
+            "metrics": {"acceptance": False, "node_executions": 12, "bugs_total": 2},
+            "review_blocking": [],
+            "bug_patterns": [{"fp_id": "FP-03", "category": "boundary", "symptom": "1.3kg 运费错误",
+                              "fix_strategy": "向上取整", "count": 1}] * 2,
+        }
+        entries = [item for item in self.library.extract_from_events(facts)
+                   if item.action_key == "guard_FP-03__boundary"]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].key, entries[1].key)
+        self.library.add(entries)
+        kept = [item for item in self.library.entries if item.action_key == "guard_FP-03__boundary"]
+        self.assertEqual(len(kept), 1)
+        self.assertGreater(kept[0].confidence, 0.8)
+
     def test_metrics_report(self):
         self.library.record_metrics({"run_id": "r1", "node_executions": 12, "bugs_total": 4})
         self.library.record_metrics({"run_id": "r2", "node_executions": 7, "bugs_total": 0})

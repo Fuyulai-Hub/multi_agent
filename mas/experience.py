@@ -126,6 +126,7 @@ class Experience:
     lesson: str = ""
     action: str = ""
     action_key: str = ""
+    dedupe: str = ""            # 去重细分维度：同一 action_key 下按此字段再分桶
     confidence: float = 0.5
     hits: int = 0
     evidence_count: int = 0
@@ -147,7 +148,10 @@ class Experience:
 
     @property
     def key(self) -> str:
-        return _key_of(self.scope, self.action_key or _normalize(self.lesson))
+        # dedupe 参与去重键：同一 action_key（如 guard_FP-06__functional）下的不同症状/
+        # 不同歧义不再被合并成一条不断膨胀的 lesson（实测：cron 的 misfire 歧义与
+        # 电商的优惠券歧义被拼成一条，且 hits 累到 120、置信度 1.0，注入证据失真）。
+        return _key_of(self.scope, self.action_key or _normalize(self.lesson), self.dedupe)
 
 
 @dataclass
@@ -587,6 +591,7 @@ class ExperienceLibrary:
                 lesson=f"需求歧义「{item.get('question', '')}」经协商结论为：{item.get('answer', '')}",
                 action="编码前完成歧义澄清并把结论写入技术方案，测试按结论构造用例",
                 action_key="clarify_before_implement",
+                dedupe=str(item.get("question", "")),
                 confidence=0.65,
                 evidence_count=1,
                 source_refs=list(item.get("refs", [])),

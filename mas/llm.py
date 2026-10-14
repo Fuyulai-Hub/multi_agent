@@ -105,6 +105,11 @@ class LLMClient:
         self.max_tokens = int(config.llm.get("max_tokens", 3000))
         self.timeout = int(config.llm.get("timeout", 120))
         self.json_mode = bool(config.llm.get("json_mode", True))
+        # 流式输出（默认开）：本端点网关（openresty）proxy_read_timeout=300s 按"两次读之间
+        # 的间隔"计；非流式下模型生成完才吐首字节，300s 即被判超时断开（504），长生成
+        # （implement/optimize 全量代码）三次降级尝试全部空输出（实测 3×300s）。
+        # 流式下 TTFB <1s、chunk 间隔远小于 300s，长生成不再触发网关上限。
+        self.stream = bool(config.llm.get("stream", True))
         # function calling：tools 由运行时注入（ToolRunner）或 config.llm.tools 静态声明
         self.tool_choice = str(config.llm.get("tool_choice", "auto"))
         self.tool_max_rounds = max(1, int(config.llm.get("tool_max_rounds", 2)))
@@ -275,13 +280,109 @@ class LLMClient:
         self, payload: Dict[str, Any], api_key: str, base_url: str
     ) -> Generation:
         """发一次请求并解析为 Generation（不含任何降级逻辑）。"""
-        request = urllib.request.Request(
+        if self.stream:
+            return self._request_generation_stream(payload, api_key, base_url)
+        request = self._build_request(payload, api_key, base_url)
+        return self._parse_response(self._post_with_retry(request))
+
+    @staticmethod
+    def _build_request(payload: Dict[str, Any], api_key: str, base_url: str) -> urllib.request.Request:
+        return urllib.request.Request(
             f"{base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             method="POST",
         )
-        return self._parse_response(self._post_with_retry(request))
+
+    def _request_generation_stream(
+        self, payload: Dict[str, Any], api_key: str, base_url: str
+    ) -> Generation:
+        """流式（SSE）请求：逐 chunk 读取，规避网关 300s 非流式总时长上限。
+
+        重试语义与 _post_with_retry 一致（网络错误与 429/5xx 重试，4xx 立即失败）；
+        读完后按非流式响应结构组装 body，复用 _parse_response，保证字段口径一致。
+        容错：服务端忽略 stream=true 而返回普通 JSON 时（按 Content-Type 判定），
+        退化为一次性解析，行为与非流式路径相同。
+        """
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        request = self._build_request(stream_payload, api_key, base_url)
+        attempts = self.retry_max_attempts
+        last_error = ""
+        text_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+        finish_reason = ""
+        usage: Dict[str, Any] = {}
+        for attempt in range(1, attempts + 1):
+            text_parts, reasoning_parts, tool_calls_by_index = [], [], {}
+            finish_reason, usage = "", {}
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    content_type = str(response.headers.get("Content-Type") or "")
+                    if "text/event-stream" not in content_type:
+                        # 服务端未按 SSE 返回（如测试桩/不透流式的网关）：按普通 JSON 解析
+                        return self._parse_response(json.loads(response.read().decode("utf-8")))
+                    for raw_line in response:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        for choice in chunk.get("choices") or []:
+                            if choice.get("finish_reason"):
+                                finish_reason = str(choice["finish_reason"])
+                            delta = choice.get("delta") or {}
+                            if delta.get("content"):
+                                text_parts.append(str(delta["content"]))
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                            if reasoning:
+                                reasoning_parts.append(str(reasoning))
+                            for call in delta.get("tool_calls") or []:
+                                index = int(call.get("index") or 0)
+                                slot = tool_calls_by_index.setdefault(
+                                    index, {"id": "", "type": "function",
+                                            "function": {"name": "", "arguments": ""}}
+                                )
+                                if call.get("id"):
+                                    slot["id"] = str(call["id"])
+                                function = call.get("function") or {}
+                                if function.get("name"):
+                                    slot["function"]["name"] = str(function["name"])
+                                if function.get("arguments"):
+                                    slot["function"]["arguments"] += str(function["arguments"])
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:400]
+                last_error = f"LLM 调用失败 HTTP {exc.code}: {detail}"
+                retryable = exc.code == 429 or exc.code >= 500
+            except (TimeoutError, urllib.error.URLError) as exc:
+                # 与 _post_with_retry 同一语义：读阶段超时是 TimeoutError（非 URLError 子类）
+                last_error = f"LLM 超时/网络异常: {exc}"
+                retryable = True
+            if not retryable or attempt == attempts:
+                raise _RetryableLLMError(last_error) if retryable else AgentError(last_error)
+            time.sleep(self.retry_backoff_s * attempt)
+        message: Dict[str, Any] = {}
+        text = "".join(text_parts)
+        reasoning = "".join(reasoning_parts)
+        if text:
+            message["content"] = text
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if tool_calls_by_index:
+            message["tool_calls"] = [
+                tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
+            ]
+        body = {"choices": [{"message": message, "finish_reason": finish_reason}], "usage": usage}
+        return self._parse_response(body)
 
     def _parse_response(self, body: Dict[str, Any]) -> Generation:
         """解析响应：正文、思考链、tool_calls，以及 usage 里的输出预算明细。"""

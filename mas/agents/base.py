@@ -226,7 +226,10 @@ class BaseAgent:
     def perceive(self, task: NodeTask) -> Perception:
         names = self.ctx.config.collaboration.perception_of(self.role_id) or list(task.inputs)
         found, missing = self.ctx.blackboard.require(names)
-        brief = self.ctx.blackboard.brief(sorted(found.keys()))
+        # 感知段单产物字符预算：默认 900 会把 12 个功能点的需求规格截到只剩 3 个 FP 片段
+        # （attempt03 实测 implement/test 全程信息残缺）；由 runtime.prompt_artifact_max_chars 配置
+        max_chars = int(self.ctx.config.runtime.get("prompt_artifact_max_chars", 10000))
+        brief = self.ctx.blackboard.brief(sorted(found.keys()), max_chars_per_item=max_chars)
         digest = self.ctx.bus.digest(self.role_id)
         return Perception(found=found, missing=missing, artifacts_brief=brief, bus_digest=digest)
 

@@ -28,7 +28,8 @@ llm:
   base_url_env: "MAS_LLM_BASE_URL"
   api_key_env: "MAS_LLM_API_KEY"
   temperature: 0.2
-  max_tokens: 16000           # 推理模型（Qwen/DeepSeek/GLM）的思考链会抢占 token 预算，给足余量避免正文被截断
+  max_tokens: 64000          # 实现/测试类任务（多文件全量代码 + 用例）需 2~6 万输出 token；推理模型的思考链计入本预算，16000 会被思考链吃光导致正文为空/截断。流式下生成时长不受网关 300s 限制（客户端 timeout=600s 仍为单次尝试上限）
+  stream: true               # 必须流式：非流式下网关 300s 上限按请求总时长计，implement 长生成三次降级尝试全部 504（实测 3×300s 空输出）；流式 TTFB<1s、chunk 间隔远小于 300s
   # —— 思考预算治理 ——
   # 实测（本端点，GLM）：implement 长 JSON 任务思考链 60735 字符打满 max_tokens=16000 →
   # finish_reason=length、正文 0 字符、耗时 221s；下发 reasoning_effort=low 后同一任务
@@ -78,6 +79,7 @@ runtime:
   # 静态分析并行度（按文件并行，IO 等待型负载；不配则用默认 min(8, cpu+4)）
   sandbox_analyze_workers: null
   save_prompts: true              # 落盘每次 Prompt（含分层经验注入证据）
+  prompt_artifact_max_chars: 10000  # Prompt 感知段单产物最大字符数：默认 900 会把 12 功能点的需求规格截到只剩 3 个 FP 片段（研发/测试/审查全程信息残缺，实测根因之一）
   max_steps: 40                   # 单次运行最大状态推进步数（防死循环）
   run_id_format: "%Y%m%d-%H%M%S"
   fail_fast: false

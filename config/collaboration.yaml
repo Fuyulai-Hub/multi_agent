@@ -30,9 +30,11 @@ collaboration:
   # Agent 间协商：测试发现需求歧义 -> 向研发发起澄清 -> 结论作为验收证据
   negotiation:
     enabled: true
-    max_rounds: 2
+    max_rounds: 6              # 协商预算：每个入场问题一轮请求-应答（task02 实测 LLM 一次提 5 问，
+                               # 旧值 2 会使 3 问永远 open、门禁 negotiation.open==0 永久无法满足）
     requester_role: tester
     responder_role: developer
+    min_answer_chars: 8        # 应答正文短于此长度不算闭环（防止"空答复"被计成已闭环、门禁虚报通过）
     trigger: "ambiguity"
     require_closure: true          # 未闭环的歧义将阻塞验收（见 acceptance 门禁）
 

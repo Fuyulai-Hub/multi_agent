@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List
 
 from ..llm import Generation
@@ -133,7 +134,44 @@ class DeveloperAgent(BaseAgent):
             self.evidence(result, "file", path=str(file_item["path"]), chars=len(str(file_item["content"])))
         return written
 
-    def _self_check(self, package: str, task: NodeTask) -> Dict[str, Any]:
+    @staticmethod
+    def _self_check_label(check: Dict[str, Any]) -> str:
+        if check.get("not_applicable"):
+            return "导入自检不适用（非 Python 交付物）"
+        return "导入自检通过" if check.get("ok") else "导入自检失败"
+
+    def _package_importable_dir(self, package: str) -> bool:
+        """沙箱工作区里是否已存在该包（上一轮交付的 Python 包目录或同名 .py）。"""
+        sandbox = getattr(self.ctx, "sandbox", None)
+        root = getattr(sandbox, "root", None)
+        if not root or not package:
+            return False
+        root = Path(root)
+        return (root / package).is_dir() or (root / f"{package}.py").exists()
+
+    @staticmethod
+    def _is_test_file(name: str) -> bool:
+        """测试文件形态：tests/ 目录下或 test_*.py（它们不构成可导入的交付包）。"""
+        path = str(name).replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path.startswith("tests/") or path.rsplit("/", 1)[-1].startswith("test_")
+
+    def _self_check(self, package: str, task: NodeTask,
+                    files: Optional[List[str]] = None) -> Dict[str, Any]:
+        deliverable_py = [name for name in (files or [])
+                          if str(name).endswith(".py") and not self._is_test_file(name)]
+        if files is not None and not deliverable_py and not self._package_importable_dir(package):
+            # 非 Python 交付物没有可导入的包，`python -c import x` 必然 ModuleNotFoundError；
+            # 把它记成"导入自检失败"会让失败点失真（实测 task04：真正的边界在测试节点——
+            # 沙箱只能执行 Python，无法编译验证 C++）。此处如实标注"不适用"。
+            # 只看"交付包自身的 .py"：optimize 轮次会连带重写 tests/test_*.py（实测
+            # task04-cpp-probe-03 optimize#1 因这个纯测试文件被跑 import smartptr 而判失败）。
+            return {
+                "cmd": "", "exit_code": 0, "ok": True, "not_applicable": True,
+                "note": "非 Python 交付物：Python 导入自检不适用（沙箱只能执行 Python）",
+                "stdout_tail": "", "stderr_tail": "", "duration_ms": 0,
+            }
         check = self.sandbox_run(
             [self.ctx.sandbox.python, "-c", f"import {package}; print('import-ok')"],
             env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
@@ -159,7 +197,7 @@ class DeveloperAgent(BaseAgent):
             return
         written = self._write_files(files, task, result)
         package = data.get("package") or self.ctx.config.llm.get("offline", {}).get("package_name", "delivery")
-        self_check = self._self_check(package, task)
+        self_check = self._self_check(package, task, written)
         stats = self.ctx.sandbox.code_stats(written)
         manifest = {
             "package": package,
@@ -188,7 +226,7 @@ class DeveloperAgent(BaseAgent):
         result.status = "pass" if self_check.get("ok") else "fail"
         result.summary = (
             f"编码实现（{manifest['mode']}）：{len(written)} 个文件、{manifest['loc']} 行代码、"
-            f"功能点映射 {len(manifest['fp_mapping'])} 个；导入自检{'通过' if self_check.get('ok') else '失败'}"
+            f"功能点映射 {len(manifest['fp_mapping'])} 个；{self._self_check_label(self_check)}"
         )
         result.events = ["implementation_ready"]
         result.broadcast_payload = {
@@ -216,7 +254,7 @@ class DeveloperAgent(BaseAgent):
             return
         written = self._write_files(files, task, result)
         package = data.get("package") or (perception.found.get("code_manifest") or {}).get("package", "delivery")
-        self_check = self._self_check(package, task)
+        self_check = self._self_check(package, task, written)
 
         open_bugs = context.get("open_bugs") or []
         test_report = perception.found.get("test_report") or {}
@@ -245,6 +283,9 @@ class DeveloperAgent(BaseAgent):
                     "exit_code": regression.exit_code,
                     "failed": parsed.get("failed", regression.exit_code),
                     "stdout_tail": regression.stdout.strip()[-400:],
+                    # stderr 同样留痕：测试文件 import 崩溃（修复改坏公开接口）时
+                    # traceback 在 stderr，只有 stdout_tail 会看到空输出无法诊断
+                    "stderr_tail": regression.stderr.strip()[-400:],
                 }
                 item["regression_ok"] = bool(regression.ok)
                 all_ok = all_ok and bool(regression.ok)
@@ -307,7 +348,7 @@ class DeveloperAgent(BaseAgent):
         result.summary = (
             f"缺陷修复：处理 {len(fix_items)} 个缺陷（定向回归 "
             f"{sum(1 for item in fix_items if item['regression_ok'])}/{len(fix_items)} 通过），"
-            f"导入自检{'通过' if self_check.get('ok') else '失败'}；已产出回归自测报告"
+            f"{self._self_check_label(self_check)}；已产出回归自测报告"
         )
         result.events = ["bug_fixed"]
         result.broadcast_payload = {"summary": result.summary, "fixed": [item["bug_id"] for item in fix_items]}

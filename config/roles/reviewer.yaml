@@ -58,5 +58,9 @@ policies:
     line_too_long: "info"
     todo_comment: "info"
     unused_import: "minor"
+    network_import: "major"
+    sandbox_command_bypass: "major"   # 测试/生产代码内联调用白名单外可执行程序（如 g++）——绕过沙箱命令白名单
+    sandbox_command_unresolved: "minor"  # 外部程序名不是字面量，静态无法确认（如 CXX = os.environ.get("CXX","g++")）
+    json_not_imported: "critical"        # 用了 json.* 却从未 import json——运行到该行必 NameError（实测两次让结果回传静默失效）
   blocking_severities: ["critical", "major"]
   acceptance_severities: ["critical"]

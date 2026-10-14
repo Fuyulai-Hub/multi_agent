@@ -712,11 +712,17 @@ class Leader:
 
     def _is_rollback(self, source: str, target: str, iterations: Dict[str, int],
                      rollback_counts: Dict[str, int]) -> bool:
+        """是否构成回退（受回退策略与权限约束）。
+
+        只有 collaboration.rollback 显式声明的边才是回退。流程配置里的普通转发边
+        （optimize→test 的修复闭环、implement→review 的失败中转）重新进入已执行
+        节点属于迭代而非回退：attempt03 实测 optimize 修复后再测试被误判为回退，
+        而 developer 角色未声明回退权限 → permission_denied → 整条闭环被终止。
+        回退次数仍由三条显式回退边各自的 max_attempts 与全局上限约束，不会失控。
+        """
         if target in self.config.flow.terminal:
             return False
-        if source in self.config.collaboration.rollback:
-            return True          # 显式声明的回退边
-        return iterations.get(target, 0) > 0   # 重新进入已执行节点
+        return source in self.config.collaboration.rollback
 
     @staticmethod
     def _logger(events: EventLog):

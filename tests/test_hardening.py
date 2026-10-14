@@ -200,6 +200,154 @@ class SandboxIsolationTests(unittest.TestCase):
             rules = {finding.rule for finding in analysis.findings}
             self.assertIn("network_import", rules)
 
+    def test_sandbox_command_bypass_flagged(self):
+        """测试/生产代码内联调用白名单外程序（g++）→ 必须被静态分析检出。
+
+        实测 task04（C++ 需求）：LLM 生成的 Python harness 里 subprocess.run(["g++", ...])
+        绕过了 runtime.sandbox_command_policy（该白名单只校验框架自己发起的命令）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("h.py", '"""h。"""\nimport subprocess\n\n\ndef go():\n'
+                                       '    """go。"""\n    return subprocess.run(["g++", "-v"])\n')
+            findings = sandbox.analyze(["h.py"], {}).findings
+            hit = [item for item in findings if item.rule == "sandbox_command_bypass"]
+            self.assertEqual(len(hit), 1, [item.rule for item in findings])
+            self.assertIn("g++", hit[0].message)
+
+    def test_sys_executable_subprocess_not_flagged(self):
+        """`[sys.executable, "-m", "pkg.cli"]` 是测试 CLI 的合法写法（task01 验收套件在用），不得误报。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file(
+                "ok.py", '"""ok。"""\nimport subprocess\nimport sys\n\n\n'
+                         'def go():\n    """go。"""\n    return subprocess.run([sys.executable, "-m", "pkg.cli"])\n')
+            rules = {item.rule for item in sandbox.analyze(["ok.py"], {}).findings}
+            self.assertNotIn("sandbox_command_bypass", rules)
+
+    def test_os_system_literal_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("s.py", '"""s。"""\nimport os\n\n\ndef go():\n'
+                                       '    """go。"""\n    return os.system("cl /Xh main.cpp")\n')
+            rules = {item.rule for item in sandbox.analyze(["s.py"], {}).findings}
+            self.assertIn("sandbox_command_bypass", rules)
+
+    def test_variable_target_flagged_as_unresolved(self):
+        """目标不是字面量（无法证明在白名单内）→ 报 unresolved，不武断报 bypass。
+
+        实测 task04-cpp-probe-02：LLM 写成 `CXX = os.environ.get("CXX", "g++")`
+        再 `subprocess.run([CXX] + flags)`，只认字面量的 bypass 规则漏检，
+        32 条用例失败后根因显示为空。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("v.py", '"""v。"""\nimport subprocess\n\n\ndef go(cmd):\n'
+                                       '    """go。"""\n    return subprocess.run(cmd)\n')
+            findings = sandbox.analyze(["v.py"], {}).findings
+            rules = {item.rule for item in findings}
+            self.assertNotIn("sandbox_command_bypass", rules)
+            self.assertIn("sandbox_command_unresolved", rules)
+
+    def test_sys_executable_concat_not_flagged(self):
+        """`[sys.executable, "-m", "pkg.cli"] + args`（task01 验收套件真实写法）不得误报。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file(
+                "ok2.py", '"""ok2。"""\nimport subprocess\nimport sys\n\n\n'
+                          'def go(args):\n    """go。"""\n'
+                          '    return subprocess.run([sys.executable, "-m", "pkg.cli"] + args)\n')
+            rules = {item.rule for item in sandbox.analyze(["ok2.py"], {}).findings}
+            self.assertNotIn("sandbox_command_bypass", rules)
+            self.assertNotIn("sandbox_command_unresolved", rules)
+
+    def test_env_default_compiler_flagged_as_unresolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file(
+                "e.py", '"""e。"""\nimport os\nimport subprocess\n\nCXX = os.environ.get("CXX", "g++")\n\n\n'
+                        'def go(flags, src, exe):\n    """go。"""\n    return subprocess.run([CXX] + flags + [src, "-o", exe])\n')
+            hit = [item for item in sandbox.analyze(["e.py"], {}).findings
+                   if item.rule == "sandbox_command_unresolved"]
+            self.assertEqual(len(hit), 1, [item.rule for item in sandbox.analyze(["e.py"], {}).findings])
+            self.assertEqual(hit[0].severity, "minor")
+
+    def test_json_used_without_import_flagged(self):
+        """用了 json.* 却没 import json → 必抛 NameError，执行前静态就该检出。
+
+        task04-cpp-probe-03 iter01 实测：测试文件 `print(MARKER + json.dumps(summary))`
+        崩在 NameError，结果回传协议静默失效，框架只看到"0 用例、覆盖率 0"。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("m.py", '"""m。"""\n\n\ndef go(summary):\n    """go。"""\n'
+                                       '    return print("<<<MASS_RESULT>>>" + json.dumps(summary))\n')
+            hit = [item for item in sandbox.analyze(["m.py"], {}).findings
+                   if item.rule == "json_not_imported"]
+            self.assertEqual(len(hit), 1)
+            self.assertEqual(hit[0].severity, "major")        # 无策略时的默认级别
+            policies = dict(sandbox.config.role("reviewer").policies)
+            hit2 = [item for item in sandbox.analyze(["m.py"], policies).findings
+                    if item.rule == "json_not_imported"]
+            self.assertEqual(hit2[0].severity, "critical")    # reviewer 配置里升级为阻塞级
+
+    def test_sys_used_without_import_flagged(self):
+        """同一判定推广到其它标准库名：漏 `import sys` 与漏 `import json` 后果完全一样。
+
+        task02-eshop-attempt04 iter01 实测：测试文件末尾 `sys.exit(main())` 没有
+        `import sys`，崩在 NameError → marker 未输出 → 0 用例、覆盖率 0，
+        而执行前静态体检当时只盯 `json`，`preexec_findings` 是空的。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("s.py", '"""s。"""\n\n\ndef main():\n    """main。"""\n    return 0\n\n\n'
+                                       'sys.exit(main())\n')
+            hit = [item for item in sandbox.analyze(["s.py"], {}).findings
+                   if item.rule == "sys_not_imported"]
+            self.assertEqual(len(hit), 1)
+            self.assertEqual(hit[0].symbol, "sys")
+            sandbox.write_file("ok.py", '"""ok。"""\nimport sys\n\n\ndef main():\n    """main。"""\n'
+                                        '    return 0\n\n\nsys.exit(main())\n')
+            self.assertEqual([item.rule for item in sandbox.analyze(["ok.py"], {}).findings
+                              if item.rule.endswith("_not_imported")], [])
+
+    def test_json_bound_variants_not_flagged(self):
+        """import / 别名 / from-import / 局部 import / 赋值 / 形参 / 星号导入都不算缺陷。"""
+        bodies = [
+            '"""j。"""\nimport json\n\n\ndef go():\n    """go。"""\n    return json.dumps({})\n',
+            '"""j。"""\nimport json as j\n\n\ndef go():\n    """go。"""\n    return j.dumps({})\n',
+            '"""j。"""\nfrom json import dumps\n\n\ndef go():\n    """go。"""\n    return dumps({})\n',
+            '"""j。"""\n\n\ndef go():\n    """go。"""\n    import json\n    return json.dumps({})\n',
+            '"""j。"""\nfrom typing import *\n\n\ndef go():\n    """go。"""\n    return json.dumps({})\n',
+            '"""j。"""\n\n\ndef go(json):\n    """go。"""\n    return json.dumps({})\n',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            for index, body in enumerate(bodies):
+                name = f"j{index}.py"
+                sandbox.write_file(name, body)
+                rules = {item.rule for item in sandbox.analyze([name], {}).findings}
+                self.assertNotIn("json_not_imported", rules, name)
+
+    def test_json_module_attr_only_not_flagged_when_imported(self):
+        """`json` 只作为普通变量出现（未被用作模块）且未导入时同样检出，语义一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("u.py", '"""u。"""\n\n\ndef go():\n    """go。"""\n    return json\n')
+            rules = {item.rule for item in sandbox.analyze(["u.py"], {}).findings}
+            self.assertIn("json_not_imported", rules)
+
+    def test_code_stats_counts_non_python_files(self):
+        """非 Python 交付物的行数不得虚报为 0；total_loc 含全部语言，python_loc 只含 .py。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = self._sandbox(tmp)
+            sandbox.write_file("a.hpp", "// 注释行\nstruct A {\n  int x;\n};\n\n")
+            sandbox.write_file("b.py", '"""b。"""\nx = 1\n')
+            stats = sandbox.code_stats(["a.hpp", "b.py"])
+            self.assertEqual(stats["python_loc"], 2)      # 模块 docstring + x = 1
+            self.assertEqual(stats["total_loc"], 5)       # .hpp 3 行代码 + .py 2 行
+            self.assertEqual({item["language"] for item in stats["files"]}, {"hpp", "python"})
+
     def test_isolation_label_records_active_layers(self):
         with tempfile.TemporaryDirectory() as tmp:
             sandbox = self._sandbox(tmp)
@@ -442,6 +590,41 @@ class PermissionAndRetryTests(unittest.TestCase):
 
         agents_ok = {"developer": self._agent({"can_rollback": True})}
         self.assertTrue(leader._rollback_permitted("implement", node, "solution", agents_ok, events, 1))
+
+    def test_only_declared_rollback_edges_count_as_rollback(self):
+        """普通转发边（optimize→test 修复闭环、implement→review 失败中转）不是回退。
+
+        attempt03 实测：optimize 修复后再测试被 _is_rollback 误判为回退，
+        developer 无回退权限 → permission_denied → 闭环终止。修复后只有
+        collaboration.rollback 声明的边（review/test/acceptance）才走回退策略。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(PROJECT_ROOT / "config", workspace=Path(tmp) / "ws")
+            leader = Leader(config)
+            # optimize → test：修复闭环的再测试，是迭代不是回退
+            self.assertFalse(leader._is_rollback("optimize", "test", {"test": 1}, {}))
+            # implement → review：实现失败中转审查，是迭代不是回退
+            self.assertFalse(leader._is_rollback("implement", "review", {"review": 1}, {}))
+            # 三条显式回退边仍然是回退（次数受各自 max_attempts 约束）
+            self.assertTrue(leader._is_rollback("review", "implement", {}, {}))
+            self.assertTrue(leader._is_rollback("test", "optimize", {}, {}))
+            self.assertTrue(leader._is_rollback("acceptance", "optimize", {}, {}))
+            # 终止节点不是回退
+            self.assertFalse(leader._is_rollback("intake", "halt", {}, {}))
+
+    def test_perception_brief_budget_configurable(self):
+        """感知段单产物预算可配置：默认 900 会把多功能点规格截到信息残缺。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(PROJECT_ROOT / "config", workspace=Path(tmp) / "ws")
+            self.assertEqual(config.runtime.get("prompt_artifact_max_chars"), 10000)
+            blackboard = Blackboard(Path(tmp) / "artifacts")
+            blackboard._latest["big"] = {"payload": "x" * 5000}
+            blackboard._refs["big"] = [SimpleNamespace(version=1, producer="p")]
+            brief_default = blackboard.brief(["big"])
+            self.assertIn("截断", brief_default)          # 超过 900 仍截断
+            self.assertIn("共 5015 字符", brief_default)
+            brief_full = blackboard.brief(["big"], max_chars_per_item=10000)
+            self.assertNotIn("截断", brief_full)           # 预算内完整透传
 
     def test_permission_allows_helper(self):
         self.assertTrue(_permission_allows(self._agent({}), "can_block_acceptance"))

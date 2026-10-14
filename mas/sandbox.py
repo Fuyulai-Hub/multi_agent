@@ -177,22 +177,39 @@ class Sandbox:
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16] if path.exists() else ""
 
     def code_stats(self, files: List[str]) -> Dict[str, Any]:
+        """交付文件行数统计。
+
+        total_loc 统计全部文本交付文件（含 .hpp/.cpp 等非 Python），python_loc 只统计 .py；
+        原实现只认 .py，非 Python 交付物的 manifest 会谎报「2 个文件，0 行」（实测 task04）。
+        """
         total_loc = 0
+        python_loc = 0
         stats: List[Dict[str, Any]] = []
         for relative in files:
             path = self.resolve(relative)
-            if not path.exists() or path.suffix != ".py":
+            if not path.exists():
                 continue
-            lines = path.read_text(encoding="utf-8").splitlines()
-            code_lines = [line for line in lines if line.strip() and not line.strip().startswith("#")]
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue          # 二进制/不可读文件不计行
+            code_lines = [
+                line for line in lines
+                if line.strip() and not line.strip().startswith(("#", "//"))
+            ]
+            language = "python" if path.suffix == ".py" else (path.suffix.lstrip(".") or "text")
             total_loc += len(code_lines)
+            if language == "python":
+                python_loc += len(code_lines)
             stats.append({
                 "file": relative,
                 "loc": len(code_lines),
+                "language": language,
                 "sha256": self.sha256(relative),
                 "size": path.stat().st_size,
             })
-        return {"files": stats, "total_loc": total_loc, "file_count": len(stats)}
+        return {"files": stats, "total_loc": total_loc, "python_loc": python_loc,
+                "file_count": len(stats)}
 
     # ---------------------------------------------------------------- 执行
     def run(
@@ -537,6 +554,16 @@ class Sandbox:
                         message=f"导入网络模块 {root}（沙箱无网络隔离，属高危依赖，需审查确认）",
                     ))
 
+        # 命令白名单绕过检测：runtime.sandbox_command_policy 只约束框架自己发起的命令，
+        # 沙箱子进程内部再 fork 出的程序不经过 _check_command。实测 task04（C++ 需求）：
+        # LLM 生成的测试 harness 里直接 subprocess.run(["g++", ...])，绕过了白名单，
+        # 且失败只表现为 19 条用例全败（FileNotFoundError），看不出是"框架无法验证非 Python 交付物"。
+        findings.extend(self._command_bypass_findings(tree, relative, severity))
+
+        # 结果回传协议依赖 json.dumps，但 LLM 常漏写 import json（实测两次），
+        # 文件跑完即 NameError、一条用例都不回传，框架只能看到"用例数为 0"。
+        findings.extend(self._unbound_json_findings(tree, relative, severity))
+
         for name, lineno in imported_names.items():
             occurrences = len(re.findall(rf"\b{re.escape(name)}\b", source))
             if occurrences <= 1:
@@ -562,6 +589,163 @@ class Sandbox:
         }
 
     # ---------------------------------------------------------------- 便捷
+    _BYPASS_CALLS = {
+        "subprocess": {"run", "Popen", "call", "check_output", "check_call"},
+        "os": {"system", "popen", "execv", "execve", "execvp", "spawnv", "spawnvp"},
+    }
+
+    def _command_bypass_findings(
+        self, tree: ast.AST, relative: str, severity: Any
+    ) -> List["Finding"]:
+        """检出"测试/交付代码内联启动外部程序"的子进程调用。
+
+        字面量目标（`["g++", ...]` / `os.system("cl xx.cpp")`）报 `sandbox_command_bypass`；
+        非字面量目标报 `sandbox_command_unresolved`（无法证明它在白名单内）；
+        `[sys.executable, "-m", "pkg.cli"]` 可证明就是解释器自身，不报——这是测试 CLI 的合法写法。
+        """
+        findings: List[Finding] = []
+        if not self.command_policy_enabled:
+            return findings
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if not isinstance(node.func.value, ast.Name):
+                continue
+            module = node.func.value.id
+            method = node.func.attr
+            if method not in self._BYPASS_CALLS.get(module, set()):
+                continue
+            program = self._literal_program(node.args)
+            if program and self._executable_allowed(program):
+                continue
+            if program:
+                findings.append(Finding(
+                    rule="sandbox_command_bypass", severity=severity("sandbox_command_bypass", "major"),
+                    file=relative, line=getattr(node, "lineno", 0), symbol=f"{module}.{method}",
+                    message=(f"{module}.{method}() 直接调用未在沙箱白名单内的程序 `{program}`"
+                             "（沙箱命令白名单只校验框架发起的命令，子进程内部再起的程序会绕过它）"),
+                ))
+                continue
+            # 程序名不是字面量（`CXX = os.environ.get("CXX", "g++")` 后 `subprocess.run([CXX, ...])`）：
+            # 无法静态确认它在白名单内。`sys.executable` 是唯一可证明合法的动态目标（它就是 Python 自身）。
+            if self._is_interpreter_target(node.args):
+                continue
+            findings.append(Finding(
+                rule="sandbox_command_unresolved", severity=severity("sandbox_command_unresolved", "minor"),
+                file=relative, line=getattr(node, "lineno", 0), symbol=f"{module}.{method}",
+                message=(f"{module}.{method}() 启动的外部程序名不是字面量，静态分析无法确认它在沙箱白名单内"
+                         "（若该程序在本机不存在，测试失败属于环境问题而非交付物缺陷）"),
+            ))
+        return findings
+
+    # 测试 harness / 结果回传协议里最常被 LLM 忘记 import 的标准库模块名。
+    # 每个名字都走同一条保守判定（见 _unbound_json_findings）。
+    _UNBOUND_IMPORT_CHECKS = ("json", "sys", "os", "re", "time", "math", "subprocess",
+                              "itertools", "collections", "datetime", "hashlib", "uuid")
+
+    def _unbound_json_findings(
+        self, tree: ast.AST, relative: str, severity: Any
+    ) -> List["Finding"]:
+        """文件里用了某个标准库模块名，但整个模块从未绑定该名字 → 运行必抛 NameError。
+
+        实测三次：`json`（task04-cpp-probe-02 iter02、task04-cpp-probe-03 iter01）、
+        `sys`（task02-eshop-attempt04 iter01 的 `sys.exit(main())`）。LLM 按
+        execution_protocol 写 `print(MARKER + json.dumps(summary))` 却漏了 import，
+        测试文件跑完不回传结果，框架只看到"0 用例"、覆盖率 0，根因要人工翻 stderr 才知道。
+        判定保守：出现 `from x import *`、任何形式的该名字绑定（import/赋值/形参/
+        with-as/except-as/推导式目标）都视为已绑定、不报。
+        """
+        findings = []
+        for name in self._UNBOUND_IMPORT_CHECKS:
+            used_line = self._first_unbound_use(tree, name)
+            if not used_line or self._name_bound(tree, name):
+                continue
+            rule = f"{name}_not_imported"
+            findings.append(Finding(
+                rule=rule, severity=severity(rule, "major"),
+                file=relative, line=used_line, symbol=name,
+                message=f"使用 {name} 但整个文件没有任何 `import {name}`（或等价的 {name} 绑定），"
+                        "运行到该行必抛 NameError；测试文件里这会让结果回传协议静默失效、用例统计为 0",
+            ))
+        return findings
+
+    @staticmethod
+    def _first_unbound_use(tree: ast.AST, name: str) -> int:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+                    and node.value.id == name:
+                return node.lineno
+            if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
+                return node.lineno
+        return 0
+
+    @staticmethod
+    def _name_bound(tree: ast.AST, name: str) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any((a.asname or a.name).split(".")[0] == name for a in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == name or any((a.asname or a.name) == name for a in node.names):
+                    return True
+                if any(a.name == "*" for a in node.names):
+                    return True
+            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.For,
+                                   ast.comprehension, ast.NamedExpr)):
+                targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id == name:
+                        return True
+                    if isinstance(target, (ast.Tuple, ast.List)):
+                        if any(isinstance(e, ast.Name) and e.id == name for e in target.elts):
+                            return True
+            elif isinstance(node, ast.arg) and node.arg == name:
+                return True
+            elif isinstance(node, ast.withitem) and isinstance(node.optional_vars, ast.Name) \
+                    and node.optional_vars.id == name:
+                return True
+            elif isinstance(node, ast.ExceptHandler) and node.name == name:
+                return True
+            elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+                return True
+        return False
+
+    @staticmethod
+    def _is_interpreter_target(args: List[ast.expr]) -> bool:
+        """第一个实参是否可证明就是当前 Python 解释器（`[sys.executable, "-m", ...]`）。"""
+        if not args:
+            return False
+        first = args[0]
+        head = first.elts[0] if isinstance(first, (ast.List, ast.Tuple)) and first.elts else first
+        while isinstance(head, ast.BinOp):        # `[sys.executable, ...] + extra`
+            head = head.left
+            while isinstance(head, ast.List) and head.elts:
+                head = head.elts[0]
+        return (isinstance(head, ast.Attribute) and head.attr == "executable"
+                and isinstance(head.value, ast.Name) and head.value.id == "sys")
+
+    @staticmethod
+    def _literal_program(args: List[ast.expr]) -> str:
+        """取调用第一个实参里的可执行程序名；非字面量返回空串。"""
+        if not args:
+            return ""
+        first = args[0]
+        target: Optional[ast.expr] = None
+        if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+            target = first.elts[0]
+        elif isinstance(first, ast.Constant):
+            target = first
+        if not isinstance(target, ast.Constant) or not isinstance(target.value, str):
+            return ""
+        text = target.value.strip()
+        if not text:
+            return ""
+        head = text.split()[0]                    # os.system("g++ -std=c++17 a.cpp")
+        name = Path(head.replace("\\", "/")).name  # 绝对路径取 basename
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        return name.lower()
+
     def python_version(self) -> str:
         try:
             result = self.run([self.python, "-c", "import sys;print(sys.version.split()[0])"])

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import json
+from typing import Any, Dict, List
 
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
@@ -60,6 +61,60 @@ class ReviewerAgent(BaseAgent):
             "review_report": perception.found.get("review_report") or {},
             "bug_reports": perception.found.get("bug_reports") or {},
         }
+
+    # ---------------------------------------------------------------- Prompt 增强
+    def build_prompt(self, task: NodeTask, perception: Perception, experience: Any) -> Any:
+        """审查节点把「AST 静态证据 + 交付源码」补进 Prompt。
+
+        原实现只在 build_context 里计算 static_analysis，而 openai_compatible 路径的
+        _generate_openai 不消费 context——reviewer 只能看到黑板上的 manifest 清单，
+        拿不到任何源码正文，只能以「未提供可读取的源文件内容」驳回
+        （attempt03/04/05 实测，三轮同一措辞；attempt04 曾靠二次重做偶然过关）。
+        离线 Provider 读 context，不受本改动影响。
+        """
+        bundle = super().build_prompt(task, perception, experience)
+        if task.node_id != "review":
+            return bundle
+        manifest = perception.found.get("code_manifest") or {}
+        files = [str(item) for item in (manifest.get("files") or [])]
+        if not files:
+            return bundle
+        analysis = self.ctx.sandbox.analyze(files, dict(self.role.policies))
+        evidence = {
+            "loc": analysis.loc,
+            "classes": analysis.classes,
+            "functions": analysis.functions,
+            "syntax_errors": analysis.syntax_errors,
+            "findings": [finding.to_dict() for finding in analysis.findings],
+        }
+        sections = [
+            "## 静态分析证据（框架对沙箱真实文件执行的 AST 分析，确定性结果）",
+            json.dumps(evidence, ensure_ascii=False, indent=1)[:12000],
+        ]
+        sources: List[str] = []
+        budget = 40000
+        used = 0
+        for relative in files:
+            try:
+                content = self.ctx.sandbox.read_file(relative)
+            except Exception:  # noqa: BLE001 - 单文件读取失败不阻塞审查
+                continue
+            if used + len(content) > budget:
+                content = content[: max(0, budget - used)] + "\n...(源码超长，截断)"
+            sources.append(f"### {relative}\n{content}")
+            used += len(content)
+            if used >= budget:
+                break
+        if sources:
+            sections.append("## 交付源码（沙箱中的真实文件内容）\n" + "\n\n".join(sources))
+        bundle.user += "\n\n" + "\n\n".join(sections)
+        if bundle.path:
+            try:
+                with bundle.path.open("a", encoding="utf-8") as fh:
+                    fh.write("\n\n" + "\n\n".join(sections))
+            except OSError:
+                pass  # 留痕失败不影响审查
+        return bundle
 
     def apply(
         self,

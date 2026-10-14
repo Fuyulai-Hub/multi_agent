@@ -50,7 +50,16 @@ class _StubHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         type(self).requests.append(payload)
         index = min(len(type(self).requests) - 1, len(type(self).script) - 1)
-        result = type(self).script[index](payload)
+        item = type(self).script[index]
+        result = item(payload) if callable(item) else item
+        if isinstance(result, _SSEResponse):
+            data = result.body()
+            self.send_response(result.status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         # 脚本项可返回 (状态码, body) 以模拟网关 504 / 4xx
         status, body = result if isinstance(result, tuple) else (200, result)
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -86,6 +95,61 @@ TRUNCATED_USAGE = {"prompt_tokens": 1961, "completion_tokens": 16000, "total_tok
 
 def _truncated(payload):
     return _resp(None, finish_reason="length", usage=TRUNCATED_USAGE, reasoning="让我想想…" * 2000)
+
+
+# ---------------------------------------------------------------- SSE 桩（流式端点）
+class _SSEResponse:
+    """脚本项：按 text/event-stream 返回（模拟真实流式端点）。"""
+
+    def __init__(self, lines, status: int = 200):
+        self.lines = lines
+        self.status = status
+
+    def body(self) -> bytes:
+        return "".join(self.lines).encode("utf-8")
+
+
+def _sse_chunk(*, content=None, reasoning=None, finish_reason=None, usage=None):
+    delta: dict = {}
+    if content is not None:
+        delta["content"] = content
+    if reasoning is not None:
+        delta["reasoning_content"] = reasoning
+    choice: dict = {"delta": delta}
+    if finish_reason:
+        choice["finish_reason"] = finish_reason
+    chunk: dict = {"choices": [choice]}
+    if usage:
+        chunk["usage"] = usage
+    return chunk
+
+
+def _sse(*parts, reasoning=None, usage=None, finish_reason="stop"):
+    """把若干内容块组装成 SSE 响应（末块带 finish_reason 与 usage，末尾 [DONE]）。"""
+    chunks = []
+    if reasoning:
+        chunks.append(_sse_chunk(reasoning=reasoning))
+    chunks.extend(_sse_chunk(content=part) for part in parts)
+    if not chunks:
+        chunks.append(_sse_chunk())
+    lines = []
+    for index, chunk in enumerate(chunks):
+        if index == len(chunks) - 1:
+            chunk["choices"][0]["finish_reason"] = finish_reason
+            if usage:
+                chunk["usage"] = usage
+        lines.append(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
+    lines.append("data: [DONE]\n\n")
+    return _SSEResponse(lines)
+
+
+def _sse_truncated():
+    """流式形态的空正文 + length：思考链一块、正文空块截断。"""
+    return _SSEResponse([
+        f"data: {json.dumps(_sse_chunk(reasoning='让我想想…' * 2000), ensure_ascii=False)}\n\n",
+        f"data: {json.dumps(_sse_chunk(finish_reason='length', usage=TRUNCATED_USAGE), ensure_ascii=False)}\n\n",
+        "data: [DONE]\n\n",
+    ])
 
 
 def _ok_json(payload):
@@ -362,6 +426,54 @@ class TokenBudgetTests(unittest.TestCase):
         with self.assertRaises(AgentError):
             LLMClient(self.config).generate("implementation", self._bundle(), {})
         self.assertEqual(len(_StubHandler.requests), 1)
+
+    # ---------------------------------------------------------------- 9 流式（SSE）
+    def test_stream_request_carries_stream_flag_and_parses_sse(self):
+        """默认流式：请求带 stream=true，SSE 分块正确组装（正文/usage/finish_reason）。"""
+        _StubHandler.script = [_sse('{"mode": "first", "package": "timersys"}', usage=DEEPSEEK_USAGE)]
+        gen = LLMClient(self.config).generate("implementation", self._bundle(), {})
+        self.assertTrue(_StubHandler.requests[0].get("stream"))
+        self.assertEqual(gen.text, '{"mode": "first", "package": "timersys"}')
+        self.assertEqual(gen.data, {"mode": "first", "package": "timersys"})
+        self.assertEqual(gen.finish_reason, "stop")
+        self.assertEqual(gen.reasoning_tokens, 40)
+        self.assertEqual(gen.completion_tokens, 43)
+        self.assertFalse(gen.degraded)
+
+    def test_stream_assembles_multi_chunk_content_and_reasoning(self):
+        """多 chunk 的正文与思考链分别累加，不丢块不乱序。"""
+        _StubHandler.script = [_sse("hello ", "world", reasoning="思考链", usage=DEEPSEEK_USAGE)]
+        gen = LLMClient(self.config).generate("implementation", self._bundle(), {})
+        self.assertEqual(gen.text, "hello world")
+        self.assertEqual(gen.reasoning, "思考链")
+
+    def test_stream_truncation_enters_downgrade_chain(self):
+        """流式下 length 截断同样触发降级链（流式只解网关 300s 墙，不增预算）。"""
+        _StubHandler.script = [_sse_truncated(), _sse('{"mode": "first"}', usage=DEEPSEEK_USAGE)]
+        gen = LLMClient(self.config).generate("implementation", self._bundle(), {})
+        self.assertEqual(self._efforts(), [None, "low"])
+        self.assertTrue(gen.degraded)
+        self.assertEqual(gen.data, {"mode": "first"})
+        self.assertTrue(_StubHandler.requests[1].get("stream"))   # 降级重发仍是流式
+
+    def test_stream_non_sse_json_response_falls_back(self):
+        """服务端忽略 stream=true 返回普通 JSON（Content-Type 判定）→ 退化为一次性解析。
+
+        现有全部非流式桩测试即走此路径：stream 默认开启不得破坏既有行为。
+        """
+        _StubHandler.script = [lambda p: _resp("{}", "stop", DEEPSEEK_USAGE)]
+        gen = LLMClient(self.config).generate("implementation", self._bundle(), {})
+        self.assertTrue(_StubHandler.requests[0].get("stream"))
+        self.assertEqual(gen.text, "{}")
+        self.assertEqual(gen.finish_reason, "stop")
+
+    def test_stream_disabled_by_config_uses_plain_post(self):
+        """llm.stream=false 时回到非流式 POST（不透流式的端点可显式关闭）。"""
+        self.config.llm["stream"] = False
+        _StubHandler.script = [lambda p: _resp("{}", "stop", DEEPSEEK_USAGE)]
+        gen = LLMClient(self.config).generate("implementation", self._bundle(), {})
+        self.assertNotIn("stream", _StubHandler.requests[0])
+        self.assertEqual(gen.text, "{}")
 
     # ---------------------------------------------------------------- 6 offline 不受影响
     def test_offline_provider_untouched(self):
