@@ -24,6 +24,10 @@ from .errors import SandboxError
 
 __all__ = ["ExecResult", "AnalysisResult", "Sandbox", "Finding"]
 
+# Web 服务生命周期规则（docs/15 补丁 3/4）：默认全部不启用，只有 reviewer 按交付形态
+# 把它们写进 severity_map 时才检出。这样 backend_only 任务的 finding 集合与改造前完全一致。
+_WEB_LIFECYCLE_RULES = frozenset({"web_service_lifecycle", "web_port_literal", "web_service_not_daemon"})
+
 # 网络相关模块：沙箱无网络隔离（标准库无跨平台网络命名空间方案），
 # 对 LLM 生成的交付代码做静态检测，让 reviewer 能显式拦截高危外连依赖。
 _NETWORK_MODULES = {
@@ -564,6 +568,13 @@ class Sandbox:
         # 文件跑完即 NameError、一条用例都不回传，框架只能看到"用例数为 0"。
         findings.extend(self._unbound_json_findings(tree, relative, severity))
 
+        # Web 服务生命周期（docs/15 补丁 3/4）：仅在 full_stack_* 形态下由 reviewer 经
+        # severity_map 显式开启。developer.py 的 import 自检会执行 `python -c "import pkg"`，
+        # 模块级 serve_forever() 会把这次自检挂到 180s 超时——这条规则把约束从"靠 prompt 自觉"
+        # 变成确定性检查。
+        if _WEB_LIFECYCLE_RULES & set(severity_map):
+            findings.extend(self._web_lifecycle_findings(tree, relative, severity))
+
         for name, lineno in imported_names.items():
             occurrences = len(re.findall(rf"\b{re.escape(name)}\b", source))
             if occurrences <= 1:
@@ -637,6 +648,248 @@ class Sandbox:
                          "（若该程序在本机不存在，测试失败属于环境问题而非交付物缺陷）"),
             ))
         return findings
+
+    # ---------------------------------------------------------------- Web 服务生命周期
+    @staticmethod
+    def _is_main_guard(test: ast.AST) -> bool:
+        """``if __name__ == "__main__":`` 的条件（两种书写顺序都认）。"""
+
+        def is_name(node: ast.AST, value: str) -> bool:
+            return isinstance(node, ast.Name) and node.id == value
+
+        def is_const(node: ast.AST, value: str) -> bool:
+            return isinstance(node, ast.Constant) and node.value == value
+
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+            return False
+        left, right = test.left, test.comparators[0]
+        return ((is_name(left, "__name__") and is_const(right, "__main__"))
+                or (is_const(left, "__main__") and is_name(right, "__name__")))
+
+    @classmethod
+    def _module_level_calls(cls, tree: ast.AST) -> List[ast.Call]:
+        """模块级调用：不在函数/类体内，也不在 ``if __name__ == "__main__":`` 分支内。
+
+        Web 服务允许在这两处启动（模块被当脚本跑 / 显式 start()），除此之外一律视为违规。
+        """
+        protected: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                for sub in ast.walk(node):
+                    protected.add(id(sub))
+            elif isinstance(node, ast.If) and cls._is_main_guard(node.test):
+                for sub in ast.walk(node):
+                    protected.add(id(sub))
+        return [node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and id(node) not in protected]
+
+    def _web_lifecycle_findings(
+        self, tree: ast.AST, relative: str, severity: Any
+    ) -> List["Finding"]:
+        """Web 服务的三条约東（docs/15 补丁 3/4），只在 full_stack_* 形态下启用。
+
+        - ``web_service_lifecycle``：模块级（非函数/if-main 内）启动服务，会把
+          ``python -c "import pkg"`` 的导入自检挂死到沙箱超时；
+        - ``web_port_literal``：端口写死非 0，并行 run 会端口冲突，必须由 OS 分配；
+        - ``web_service_not_daemon``：服务线程非 daemon，进程退出时会挂住不退出。
+        """
+        findings: List[Finding] = []
+        module_calls = self._module_level_calls(tree)
+
+        for node in module_calls:
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "serve_forever":
+                findings.append(Finding(
+                    rule="web_service_lifecycle",
+                    severity=severity("web_service_lifecycle", "major"),
+                    file=relative, line=getattr(node, "lineno", 0), symbol="serve_forever",
+                    message="模块级调用 serve_forever()：导入自检（python -c \"import 包\"）会在此挂死到沙箱超时；"
+                            "监听必须放进 if __name__ == \"__main__\": 或显式 start() 函数",
+                ))
+            elif isinstance(func, ast.Attribute) and func.attr == "start" and self._is_thread_expr(func.value):
+                findings.append(Finding(
+                    rule="web_service_lifecycle",
+                    severity=severity("web_service_lifecycle", "major"),
+                    file=relative, line=getattr(node, "lineno", 0), symbol="Thread.start",
+                    message="模块级启动服务线程：导入自检会连带启动常驻服务；"
+                            "线程启动必须放进 if __name__ == \"__main__\": 或测试进程的 setUp/tearDown",
+                ))
+
+        # 端口与服务线程：整棵树都查（函数内写死端口同样会冲突）
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if str(name).endswith("Server"):
+                port = self._literal_port(node)
+                if port is not None and port != 0:
+                    findings.append(Finding(
+                        rule="web_port_literal", severity=severity("web_port_literal", "major"),
+                        file=relative, line=getattr(node, "lineno", 0), symbol=str(name),
+                        message=f"服务绑定了字面量端口 {port}：并行运行会端口冲突，必须绑 0 由 OS 分配，"
+                                "再从 server.server_address[1] 读取实际端口",
+                    ))
+            if str(name) == "Thread" and not any(kw.arg == "daemon" for kw in node.keywords):
+                findings.append(Finding(
+                    rule="web_service_not_daemon", severity=severity("web_service_not_daemon", "major"),
+                    file=relative, line=getattr(node, "lineno", 0), symbol="Thread",
+                    message="服务线程未声明 daemon=True：进程退出时线程会挂住不退出，"
+                            "应写 threading.Thread(target=..., daemon=True)",
+                ))
+        return findings
+
+    @staticmethod
+    def _is_thread_expr(node: ast.AST) -> bool:
+        """表达式是否为 threading.Thread(...)（含变量名形如 *thread* 的赋值目标）。"""
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            return str(name) == "Thread"
+        if isinstance(node, ast.Name):
+            return "thread" in node.id.lower()
+        return False
+
+    @staticmethod
+    def _literal_port(node: ast.Call) -> Optional[int]:
+        """服务构造调用里的字面量端口；绑 0 或非字面量返回 None。"""
+        for arg in node.args:
+            if isinstance(arg, (ast.Tuple, ast.List)) and len(arg.elts) >= 2:
+                port_node = arg.elts[1]
+                if isinstance(port_node, ast.Constant) and isinstance(port_node.value, int):
+                    return int(port_node.value)
+        return None
+
+    # ---------------------------------------------------------------- 前端产物静态证据
+    # 只做文本级弱检查：`sandbox._analyzable` 只认 .py，HTML/CSS/JS 落盘后进得了 manifest，
+    # 却没有任何质量证据。这里与 Python AST 分析器分开实现——两者不是一类东西（docs/15 补丁 5）。
+    _WEB_ASSET_SUFFIXES = {".html", ".htm", ".css", ".js"}
+    _HTML_PAIR_TAGS = ("div", "form", "ul", "ol", "li", "table", "thead", "tbody", "tr", "td",
+                       "span", "p", "section", "header", "footer", "main", "nav")
+    _PLACEHOLDER_PATTERNS = (
+        re.compile(r"\{\{.+?\}\}"),                  # Jinja / Mustache 风格
+        re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}"),   # {title} 风格（不匹配 CSS 的空 {} ）
+    )
+    _ASSET_ATTR_PATTERN = re.compile(
+        r"""<(?:link|script|img)\b[^>]*?(?:href|src)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+    def analyze_web_assets(self, files: List[str], policies: Dict[str, Any]) -> List["Finding"]:
+        """前端产物（HTML/CSS/JS）的静态证据；不依赖 node，强度在 message 里如实标注。"""
+        severity_map: Dict[str, str] = dict(policies.get("severity_map") or {})
+
+        def severity(rule: str, default: str) -> str:
+            return severity_map.get(rule, default)
+
+        findings: List[Finding] = []
+        for relative in files:
+            try:
+                path = self.resolve(relative)
+            except SandboxError:
+                continue
+            if not path.exists() or path.suffix.lower() not in self._WEB_ASSET_SUFFIXES:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            if path.suffix.lower() == ".js":
+                findings.extend(self._js_balance_findings(relative, source, severity))
+                continue
+            findings.extend(self._html_findings(relative, source, severity))
+        return findings
+
+    def _asset_exists(self, html_relative: str, ref: str) -> bool:
+        """HTML 引用的相对路径资源是否存在。
+
+        相对路径以**引用它的 HTML 文件所在目录**为基准（``webapp/page.html`` 里的
+        ``style.css`` 应解析到 ``webapp/style.css``）；再退回包根一带同年成名 assets/ 的常见写法。
+        """
+        base = Path(html_relative).parent
+        candidates = [str(base / ref), ref, f"assets/{ref}"]
+        for candidate in candidates:
+            try:
+                if self.resolve(candidate).exists():
+                    return True
+            except SandboxError:
+                continue
+        return False
+
+    def _html_findings(self, relative: str, source: str, severity: Any) -> List["Finding"]:
+        findings: List[Finding] = []
+
+        for pattern in self._PLACEHOLDER_PATTERNS:
+            match = pattern.search(source)
+            if match:
+                line = source[:match.start()].count("\n") + 1
+                findings.append(Finding(
+                    rule="html_placeholder_unresolved",
+                    severity=severity("html_placeholder_unresolved", "major"),
+                    file=relative, line=line, symbol=match.group(0)[:40],
+                    message=f"模板残留未替换的占位符 `{match.group(0)[:40]}`："
+                            "服务端渲染必须在返回前把所有占位符替换成真实内容",
+                ))
+                break
+
+        for match in self._ASSET_ATTR_PATTERN.finditer(source):
+            ref = match.group(1).strip()
+            if not ref or ref.startswith(("http://", "https://", "//", "data:", "#", "{")):
+                continue
+            relative_ref = ref.split("?")[0].split("#")[0]
+            if not relative_ref or self._asset_exists(relative, relative_ref):
+                continue
+            line = source[:match.start()].count("\n") + 1
+            findings.append(Finding(
+                rule="html_asset_missing", severity=severity("html_asset_missing", "major"),
+                file=relative, line=line, symbol=ref[:60],
+                message=f"引用的资源 `{ref[:60]}` 在交付物中不存在：页面会缺样式/脚本或图片裂图",
+            ))
+
+        lowered = source.lower()
+        for tag in self._HTML_PAIR_TAGS:
+            opened = len(re.findall(rf"<{tag}\b", lowered))
+            closed = lowered.count(f"</{tag}>")
+            if opened > closed:
+                findings.append(Finding(
+                    rule="html_tag_unclosed", severity=severity("html_tag_unclosed", "minor"),
+                    file=relative, line=0, symbol=tag,
+                    message=f"<{tag}> 开标签 {opened} 个、闭标签 {closed} 个：可能存在未闭合标签"
+                            "（弱检查：不解析嵌套与自闭合语法，需人工确认）",
+                ))
+        return findings
+
+    def _js_balance_findings(self, relative: str, source: str, severity: Any) -> List["Finding"]:
+        """JS 只能做括号配平——本机无 node，没有真正的语法/语义检查，强度必须如实写明。"""
+        pairs = {")": "(", "]": "[", "}": "{"}
+        stack: List[str] = []
+        line = 1
+        index = 0
+        stripped = re.sub(r"//[^\n]*", "", source)
+        stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
+        for char in stripped:
+            if char == "\n":
+                line += 1
+                index += 1
+                continue
+            if char in "([{":
+                stack.append((char, line))
+            elif char in pairs and stack and stack[-1][0] == pairs[char]:
+                stack.pop()
+            elif char in pairs:
+                return [Finding(
+                    rule="js_syntax_error", severity=severity("js_syntax_error", "info"),
+                    file=relative, line=line, symbol=char,
+                    message=f"括号配平失败：第 {line} 行的 `{char}` 没有对应的 `{pairs[char]}`。"
+                            "注意：本机无 node，这只是括号配平级别的弱检查，不构成完整语法检查",
+                )]
+            index += 1
+        if stack:
+            return [Finding(
+                rule="js_syntax_error", severity=severity("js_syntax_error", "info"),
+                file=relative, line=stack[-1][1], symbol=stack[-1][0],
+                message=f"括号未闭合：第 {stack[-1][1]} 行的 `{stack[-1][0]}` 没有对应的右括号。"
+                        "注意：本机无 node，这只是括号配平级别的弱检查，不构成完整语法检查",
+            )]
+        return []
 
     # 测试 harness / 结果回传协议里最常被 LLM 忘记 import 的标准库模块名。
     # 每个名字都走同一条保守判定（见 _unbound_json_findings）。

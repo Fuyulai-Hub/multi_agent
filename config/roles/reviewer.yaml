@@ -24,6 +24,7 @@ prompt:
     - "审查结论必须逐条给出：文件、位置、严重级别、依据、修复建议"
     - "阻塞级问题（critical/major）必须拦截，非阻塞问题只记录不拦截"
     - "禁止主观猜测，所有问题必须能从代码本身印证"
+    - "requirement_spec.delivery_shape 非 backend_only（前后端交付）时，network_import 已由框架降为 info：HTTP 服务依赖 http/socket/threading 是需求本身，不得据此判阻塞（INFO 级同样不计入 blocking）"
   quality_bar:
     - "每个功能点都有实现映射检查结果"
     - "阻塞问题数为 0 才允许通过"
@@ -62,5 +63,14 @@ policies:
     sandbox_command_bypass: "major"   # 测试/生产代码内联调用白名单外可执行程序（如 g++）——绕过沙箱命令白名单
     sandbox_command_unresolved: "minor"  # 外部程序名不是字面量，静态无法确认（如 CXX = os.environ.get("CXX","g++")）
     json_not_imported: "critical"        # 用了 json.* 却从未 import json——运行到该行必 NameError（实测两次让结果回传静默失效）
+    # 以下四条由 reviewer 按 delivery_shape 动态注入（docs/15 补丁 3/4/5），写在这里只作默认值：
+    # 只有非纯后端形态才开启，backend_only 任务的 finding 集合与 niet 改造前完全一致。
+    web_service_lifecycle: "major"       # 模块级 serve_forever()/Thread.start()：会把 import 自检挂到沙箱超时
+    web_port_literal: "major"            # 服务绑了字面量端口：并行运行必端口冲突，应绑 0 由 OS 分配
+    web_service_not_daemon: "major"      # 服务线程非 daemon：进程退出时挂住不退出
+    html_placeholder_unresolved: "major" # SSR 模板残留未替换的占位符
+    html_asset_missing: "major"          # 页面引用的相对路径资源不存在
+    html_tag_unclosed: "minor"           # 标签疑似未闭合（弱检查，需人工确认）
+    js_syntax_error: "info"              # 无 node 环境下只能做括号配平，属弱证据
   blocking_severities: ["critical", "major"]
   acceptance_severities: ["critical"]

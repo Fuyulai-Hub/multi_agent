@@ -86,7 +86,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = _load(args)
     _apply_credential_overrides(config, args)
     leader = Leader(config)
-    summary = leader.run(args.requirement, as_text=args.text, run_id=args.run_id)
+    summary = leader.run(args.requirement, as_text=args.text, run_id=args.run_id,
+                         images=args.image or None)
     print(json.dumps({
         "run_id": summary.run_id,
         "verdict": summary.verdict,
@@ -409,6 +410,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--profile", default=None, help="配置 Profile（strict / lean）")
     run_p.add_argument("--workspace", default=None, help="工作区目录（默认 workspace）")
     run_p.add_argument("--run-id", default=None, help="指定运行 ID")
+    run_p.add_argument("--image", action="append", default=[],
+                       help="需求附图（可重复；后缀限 png/jpg/jpeg/webp/gif，单张 ≤5MB）")
     run_p.add_argument("--api-key", default=None, help="覆盖 API Key（等价环境变量 OPENAI_API_KEY，优先级更高）")
     run_p.add_argument("--base-url", default=None, help="覆盖 BASE_URL（等价环境变量 OPENAI_BASE_URL，优先级更高）")
     run_p.set_defaults(func=cmd_run)

@@ -213,6 +213,10 @@ class TokenBudgetTests(unittest.TestCase):
         self.config.llm["model"] = "stub-model"
         self.config.llm["timeout"] = 10
         self.config.llm["max_tokens"] = 16000
+        # 本文件锁定的是「降级链」语义（504/超时/length → 换 reasoning_effort 重发），
+        # 与网络重试层（llm.retry，默认 max_attempts=3）是两层：把重试钉回单次，
+        # 避免请求计数被重试层放大（重试分类本身由 tests/test_llm_retry.py 锁定）。
+        self.config.llm["retry"] = {"max_attempts": 1, "backoff_s": 0}
         self.config.llm_overrides = {"api_key": "stub-key", "base_url": self.base_url}
 
     def tearDown(self):

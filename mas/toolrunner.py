@@ -29,7 +29,8 @@ class ToolRunner:
     def __init__(self, config: SystemConfig) -> None:
         self.config = config
         self._schemas: List[Dict[str, Any]] = []
-        self._owner: Dict[str, str] = {}          # tool_name -> server_name
+        self._owner: Dict[str, str] = {}          # tool_name -> server_name（""=静态/本地）
+        self._local: Dict[str, Any] = {}          # tool_name -> 本地执行器（无需 MCP 服务）
         self._clients: Dict[str, MCPClient] = {}  # server_name -> 已连接客户端
         self._counter = 0
 
@@ -76,6 +77,31 @@ class ToolRunner:
                 self._owner[name] = ""
                 self._schemas.append(tool)
 
+    def register_local(
+        self,
+        name: str,
+        fn: Any,
+        *,
+        description: str = "",
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """注册本地执行器（docs/16 的 05 文档 路径 B）：``_call_one`` 先查 ``_local`` 直接调用。
+
+        与静态声明的区别：静态声明无可执行后端，本地执行器有真实函数可执行（如 web_search）。
+        """
+        if not name or name in self._owner:
+            return
+        self._owner[name] = ""
+        self._local[name] = fn
+        self._schemas.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters or {"type": "object", "properties": {}},
+            },
+        })
+
     @property
     def schemas(self) -> List[Dict[str, Any]]:
         return list(self._schemas)
@@ -114,6 +140,14 @@ class ToolRunner:
         return call_id, name, raw_args
 
     def _call_one(self, name: str, arguments: Dict[str, Any]) -> str:
+        # 本地执行器优先（docs/16 的 05 文档 路径 B）：直接调用并把返回值 JSON 序列化回传
+        local = self._local.get(name)
+        if local is not None:
+            try:
+                result = local(**(arguments if isinstance(arguments, dict) else {}))
+            except Exception as exc:  # noqa: BLE001 - 与 MCP 工具失败同约定：错误作为 tool 内容回传
+                return f"错误：工具 {name} 执行失败（{type(exc).__name__}: {exc}）"
+            return json.dumps(result, ensure_ascii=False, default=str)
         server_name = self._owner.get(name)
         if server_name is None:
             return f"错误：未知工具 {name}（可用: {sorted(self._owner)}）"

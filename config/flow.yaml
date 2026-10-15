@@ -56,8 +56,8 @@ flow:
       role: tester
       kind: task
       iterable: true
-      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report"]
-      outputs: ["test_report", "bug_reports"]
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report", "env_probe"]
+      outputs: ["test_report", "bug_reports", "ui_evidence"]
       transitions: { pass: acceptance, fail: optimize }
 
     # ---------- 6. 研发 Agent：缺陷修复与优化（修复后重新测试） ----------
@@ -76,7 +76,7 @@ flow:
       role: reviewer
       kind: gate
       iterable: true
-      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports"]
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "ui_evidence"]
       outputs: ["acceptance_opinion", "acceptance_gate"]
       gate:
         criteria:
@@ -96,6 +96,15 @@ flow:
             expr: "solution_design.evaluation.selected != ''"
           - id: "待澄清问题均已闭环"
             expr: "test_report.negotiation.open == 0"
+          # docs/15 §6：仅 full_stack_spa（B 档）形态要求浏览器级 UI 证据，其余形态左支为 True 直接通过。
+          # 两条前置缺一不可，否则老任务会被批量误伤（expr.py 的 BoolOp 不短路求值，
+          # 引用了缺失字段的 criterion 整条判失败）：
+          #   1) requirement_spec.delivery_shape 由框架注入默认值（mas/intent.py L3 校验）；
+          #   2) ui_evidence 在任何形态下都被发布（tester.apply 第 6.5 步）。
+          - id: "Web UI 断言无失败（仅 SPA 形态要求）"
+            expr: "requirement_spec.delivery_shape != 'full_stack_spa' or ui_evidence.failed_asserts == 0"
+          - id: "Web UI 证据非空（SPA 形态下不得证据不足）"
+            expr: "requirement_spec.delivery_shape != 'full_stack_spa' or len(ui_evidence.asserts) > 0"
       transitions: { pass: report, fail: optimize }
 
     # ---------- 8. 报告 Agent：证据统计 + 验收报告 ----------

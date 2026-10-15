@@ -1,0 +1,32 @@
+# =============================================================================
+# 输入能力配置（飞书在线文档 / 文档上传解析 / 联网搜索）
+#
+# 按需加载：mas/sources.py 与 mas/websearch.py 直接读取本文件，
+# 不经 mas/config.py 的 bundle 白名单（新顶层配置段会被静默丢弃）。
+# ${VAR} 在运行时从环境变量展开，变量未设置即报错并指出变量名（不静默拿空串），
+# 故本文件只放占位符，不落明文凭据。详见 docs/16-五项能力扩展最小改动技术方案。
+# =============================================================================
+
+# 飞书在线文档（docs/16 的 03 文档）：需求输入支持直接粘贴飞书链接
+feishu:
+  enabled: true
+  api_base: "https://open.feishu.cn"      # 国际版 Lark 填 https://open.larksuite.com
+  app_id: "${FEISHU_APP_ID}"
+  app_secret: "${FEISHU_APP_SECRET}"
+  timeout_s: 15
+
+# 文档解析 MCP 服务（docs/16 的 04 / 06 文档）：仅 PDF/pptx/xlsx 等非 stdlib 格式走此通道
+document_parse:
+  server: "docparse"                      # config/mcp.yaml 中的服务名
+  tool: "convert_file"                    # 工具名（以 `mcp check` 实测为准）
+  path_arg: "file_path"                   # 文件路径参数名（以实测为准）
+  formats: [".pdf", ".pptx", ".xlsx", ".html", ".epub", ".zip"]
+
+# 联网搜索（docs/16 的 05 文档）：路径 B 本地工具 + 路径 C 确定性预检索
+websearch:
+  enabled: false                          # 默认关闭，行为与现状一致
+  pre_enrich: false                       # 路径 C：Leader 入口预检索（默认关）
+  provider: "bing"                        # bing | tavily | serpapi
+  api_key: "${WEBSEARCH_API_KEY}"
+  max_results: 5
+  timeout_s: 15

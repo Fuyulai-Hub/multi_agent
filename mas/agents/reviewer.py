@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
+from ..intent import resolve_delivery_shape, shape_family
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
 from .base import BaseAgent, Perception
@@ -37,21 +38,102 @@ class ReviewerAgent(BaseAgent):
         "default": {},
     }
 
+    # 只有非纯后端形态才开启的规则：Web 服务生命周期（docs/15 补丁 3/4）与前端产物静态证据
+    # （补丁 5）。backend_only 下 severity_map 不含这些键 → sandbox 不检出，行为零变更。
+    _WEB_ONLY_SEVERITY = {
+        "web_service_lifecycle": "major",
+        "web_port_literal": "major",
+        "web_service_not_daemon": "major",
+        "html_placeholder_unresolved": "major",
+        "html_asset_missing": "major",
+        "html_tag_unclosed": "minor",
+        "js_syntax_error": "info",
+    }
+
+    def _analysis_policies(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """按交付形态调整审查策略（docs/15 补丁 1 / 3 / 4 / 5）。
+
+        ``delivery_shape != backend_only`` 时：
+        - ``network_import`` 降为 info：HTTP 服务 import http/socket 是需求本身，不是高危外连；
+        - 开启 Web 服务生命周期与前端产物规则，补齐这两类此前完全空白的静态证据。
+
+        豁免与新增都只覆盖上表这些规则，``eval_usage`` / ``sandbox_command_bypass`` 等不动。
+        backend_only（默认）任务会把上表这些键从 severity_map **剔除**：sandbox 以「规则键是否在
+        severity_map 里」作为开关，留着默认值会让这类 finding 在全形态下都产出，破坏验收标准 #1。
+        """
+        policies = dict(self.role.policies)
+        shape, _, _ = resolve_delivery_shape(spec)
+        severity_map = dict(policies.get("severity_map") or {})
+        if shape_family(shape) == "full_stack":
+            severity_map["network_import"] = "info"
+            for rule, default in self._WEB_ONLY_SEVERITY.items():
+                severity_map.setdefault(rule, default)   # role YAML 已声明时以其为准
+        else:
+            for rule in self._WEB_ONLY_SEVERITY:
+                severity_map.pop(rule, None)
+        policies["severity_map"] = severity_map
+        return policies
+
+    def _emit_exemption_trace(
+        self, task: NodeTask, spec: Dict[str, Any], findings: List[Dict[str, Any]]
+    ) -> None:
+        """豁免留痕（docs/15 补丁 1）：降级了哪几条规则必须能在事件里查到。
+
+        否则线上只能看到"这次 import socket 没被拦"，却查不出是需求形态触发的豁免、
+        还是配置被人改过——这两者的处置方式完全不同。
+        """
+        shape, source, _ = resolve_delivery_shape(spec)
+        if shape_family(shape) != "full_stack":
+            return
+        relaxed = [item for item in findings if item.get("rule") == "network_import"]
+        self.ctx.events.emit(
+            "network_finding_relaxed", agent=self.role_id, node=task.node_id,
+            iteration=task.iteration,
+            payload={"delivery_shape": shape, "delivery_shape_source": source,
+                     "rule": "network_import", "from": "major", "to": "info",
+                     "count": len(relaxed),
+                     "note": "前后端交付形态下 HTTP 依赖属需求本身，已降为提示级，不计入 blocking"},
+        )
+
+    def _web_asset_findings(self, manifest: Dict[str, Any], policies: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """前端产物静态证据（docs/15 补丁 5）：Python AST 分析器只认 .py，这里单独分析。"""
+        files = [str(item) for item in (manifest.get("files") or [])]
+        if not files:
+            return []
+        try:
+            findings = self.ctx.sandbox.analyze_web_assets(files, policies)
+        except Exception:                       # noqa: BLE001 - 证据采集失败不应拖垮审查
+            return []
+        return [item.to_dict() for item in findings]
+
     def build_context(self, task: NodeTask, perception: Perception) -> Dict[str, Any]:
         manifest = perception.found.get("code_manifest") or {}
         if task.node_id == "review":
-            analysis = self.ctx.sandbox.analyze(list(manifest.get("files", [])), dict(self.role.policies))
+            policies = self._analysis_policies(perception.spec)
+            analysis = self.ctx.sandbox.analyze(list(manifest.get("files", [])), policies)
+            findings = [finding.to_dict() for finding in analysis.findings]
+            self._emit_exemption_trace(task, perception.spec, findings)
+            web_findings = self._web_asset_findings(manifest, policies)
+            if web_findings:
+                findings.extend(web_findings)
+                self.ctx.events.emit(
+                    "web_static_evidence", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration,
+                    payload={"delivery_shape": resolve_delivery_shape(perception.spec)[0],
+                             "rules": sorted({item["rule"] for item in web_findings}),
+                             "count": len(web_findings)},
+                )
             return {
                 "spec": perception.spec,
                 "code_manifest": manifest,
                 "static_analysis": {
-                    "findings": [finding.to_dict() for finding in analysis.findings],
+                    "findings": findings,
                     "loc": analysis.loc,
                     "functions": analysis.functions,
                     "classes": analysis.classes,
                     "syntax_errors": analysis.syntax_errors,
                 },
-                "policies": dict(self.role.policies),
+                "policies": policies,
             }
         if task.node_id == "solution_review":
             return {"spec": perception.spec, "solution_design": perception.found.get("solution_design") or {}}
@@ -79,7 +161,10 @@ class ReviewerAgent(BaseAgent):
         files = [str(item) for item in (manifest.get("files") or [])]
         if not files:
             return bundle
-        analysis = self.ctx.sandbox.analyze(files, dict(self.role.policies))
+        # 第二处 analyze（docs/15 补丁 1 强调两处都要改）：只改 build_context 的话，
+        # build_prompt 仍会把 major 级别的 network_import 塞进 Prompt，LLM 照样判阻塞。
+        policies = self._analysis_policies(perception.spec)
+        analysis = self.ctx.sandbox.analyze(files, policies)
         evidence = {
             "loc": analysis.loc,
             "classes": analysis.classes,
@@ -87,6 +172,9 @@ class ReviewerAgent(BaseAgent):
             "syntax_errors": analysis.syntax_errors,
             "findings": [finding.to_dict() for finding in analysis.findings],
         }
+        web_findings = self._web_asset_findings(manifest, policies)
+        if web_findings:
+            evidence["findings"].extend(web_findings)
         sections = [
             "## 静态分析证据（框架对沙箱真实文件执行的 AST 分析，确定性结果）",
             json.dumps(evidence, ensure_ascii=False, indent=1)[:12000],

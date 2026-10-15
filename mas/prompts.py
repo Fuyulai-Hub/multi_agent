@@ -90,6 +90,7 @@ class PromptBuilder:
             missing=missing,
             experience_text=experience.text,
             contract=contract,
+            images=list((context or {}).get("images") or []),
         )
         bundle = PromptBundle(
             role=role.id,
@@ -160,6 +161,7 @@ class PromptBuilder:
         missing: List[str],
         experience_text: str,
         contract: Dict[str, Any],
+        images: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         lines: List[str] = [
             "# 任务",
@@ -179,6 +181,29 @@ class PromptBuilder:
             lines.append(f"- 缺失产物（请勿臆造，按缺失处理）：{', '.join(missing)}")
         lines += ["", artifacts_brief, ""]
         lines += ["## 协作消息摘要", bus_digest, ""]
+        if images:
+            names = "、".join(str(item.get("name") or item.get("path") or "") for item in images)
+            # 措辞必须与 llm.vision.enabled 对齐（唯一事实来源）：开启时图片以 image_url
+            # parts 真正进入请求体；关闭时图片只存档到运行目录、内容从不发送——若仍告知
+            # 模型"图片随请求一并提供"，模型可能假装看过图并臆造功能点（实测该类需求
+            # 的文字常是"识别图片中内容……"，看不到图时必须走澄清而不是编造）。
+            vision_enabled = bool(dict(self.config.llm.get("vision") or {}).get("enabled", False))
+            if vision_enabled:
+                lines += [
+                    "# 附带图片",
+                    f"- 本次需求附带 {len(images)} 张图片（{names}），图片随请求一并提供（多模态输入）。",
+                    "- 图片仅作需求理解依据，不得据此臆造文本中未声明的功能点。",
+                    "",
+                ]
+            else:
+                lines += [
+                    "# 附带图片（已存档，但不在本次请求中）",
+                    f"- 本次需求附带 {len(images)} 张图片（{names}），已存档到运行目录（留痕可审查）。",
+                    "- 当前未开启多模态输入（llm.vision.enabled=false），图片内容未随请求发送，你无法看到图片。",
+                    "- 不得声称看过图片或据此臆造功能点；若需求理解依赖图片内容，"
+                    "请在 open_questions 中提出澄清问题。",
+                    "",
+                ]
         if experience_text:
             lines += ["# 经验注入（按层级注入历史运行沉淀的经验）", experience_text, ""]
         lines += [

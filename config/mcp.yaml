@@ -29,3 +29,13 @@ servers: []
 #     headers:
 #       Authorization: "Bearer ${MCP_SEARCH_TOKEN}"
 #     timeout_s: 15
+#   # 文档解析 MCP 服务（docs/16 的 06 文档）：PDF/pptx/xlsx 等非 stdlib 格式走此通道。
+#   # 接入前置：先过选型冒烟
+#   #   python -m mas mcp check docparse --call convert_file --params '{"file_path": "C:/path/real.pdf"}'
+#   # 通过后取消注释；工具名/入参名以 tools/list 实测为准（config/inputs.yaml 的 document_parse）。
+#   - name: docparse
+#     transport: stdio
+#     enabled: true
+#     command: markitdown-mcp
+#     args: []
+#     timeout_s: 120                      # 必须显式调大：默认 10s 不够 PDF 解析（mcp.py 按行等待）

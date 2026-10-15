@@ -177,15 +177,24 @@ class Blackboard:
     def names(self) -> List[str]:
         return sorted(self._latest)
 
-    def brief(self, names: Optional[List[str]] = None, max_chars_per_item: int = 900) -> str:
-        """生成紧凑的产物摘要，供 Prompt 的“上游感知”段落使用。"""
+    def brief(self, names: Optional[List[str]] = None, max_chars_per_item: int = 900,
+              data: Optional[Dict[str, Any]] = None) -> str:
+        """生成紧凑的产物摘要，供 Prompt 的“上游感知”段落使用。
+
+        ``data`` 可选：name→payload 覆盖映射（上下文压缩后的产物，docs/16 的 02 文档）。
+        只影响「进 Prompt 的文本」，不改黑板上已发布的 artifact 数据；未传时行为与原来一致。
+        """
         chunks: List[str] = []
         for name in names or self.names():
-            if name not in self._latest:
+            if data is not None and name in data:
+                value = data[name]
+            elif name in self._latest:
+                value = self._latest[name]
+            else:
                 continue
             refs = self._refs.get(name, [])
             version = refs[-1].version if refs else 1
-            payload = json.dumps(self._latest[name], ensure_ascii=False, default=str)
+            payload = json.dumps(value, ensure_ascii=False, default=str)
             if len(payload) > max_chars_per_item:
                 payload = payload[:max_chars_per_item] + f"...(截断, 共 {len(payload)} 字符)"
             producer = refs[-1].producer if refs else "-"

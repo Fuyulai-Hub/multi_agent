@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional, Optional
 
+from ..errors import SandboxError
+from ..intent import resolve_delivery_shape, shape_family
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
 from .base import BaseAgent, Perception
@@ -12,6 +15,9 @@ from .base import BaseAgent, Perception
 __all__ = ["TesterAgent"]
 
 _SEVERITY = {"functional": "critical", "exception": "major", "boundary": "major"}
+
+#: 沙箱唯一可执行的验证语言（证据通道固定为 `python <测试文件>`）
+_EXECUTABLE_LANGUAGE = "python"
 
 # 测试文件结果回传的参考实现（与离线 Provider 模板同源，已在生产验证）。
 # 关键点：用自定义 TestResult 的 startTest/addFailure/addError 钩子收集记录，
@@ -100,6 +106,68 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())'''
 
+# Web 交付执行协议（A 档）：delivery_shape == full_stack_ssr 时由 build_prompt 注入。
+# 设计依据 docs/15 补丁 4/A3：证据通道保持"单命令 python 测试文件 → exit_code"不变，
+# 服务在测试进程内起停（端口 0 由 OS 分配），UI 功能点用响应体断言映射进覆盖率门禁。
+_WEB_PROTOCOL = '''## Web 交付执行协议（delivery_shape={shape}，框架按需求规格注入）
+
+被测交付物是 HTTP 服务。测试必须采用「同进程服务生命周期」模板：在测试进程内启动服务、
+发真实请求、断言响应、finally 关停——禁止假设服务已在运行，禁止留下常驻进程。
+
+```python
+import threading
+import http.client
+from http.server import ThreadingHTTPServer
+from {package_hint} import build_handler   # 被测包公开的处理器工厂（返回 BaseHTTPRequestHandler 子类）
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), build_handler())
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+try:
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    conn.request("GET", "/")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8")
+    assert resp.status == 200 and "期望片段" in body
+finally:
+    srv.shutdown()
+    srv.server_close()
+```
+
+规则（与 execution_protocol 的既有要求叠加，冲突时以本段为准）：
+1. 端口一律绑定 0（OS 分配），避免与并行 run 冲突；每个测试类自建自拆服务，或用
+   setUpClass/tearDownClass 共享一个服务实例。
+2. 页面/UI 功能点的用例 = 对 HTTP 响应的断言：状态码 + SSR 响应体片段
+   （如 `assert "购物车: 2 件" in body`）。需求样例中「GET /path → 200 且 body 含 …」
+   即是这类用例的期望值来源；禁止读取实现代码反推 HTML 结构。
+3. 本模式下测试文件 import http/socket/threading 属需求本身（框架已按需求声明对该类
+   依赖做审查豁免）；其余仍仅用标准库。
+4. reference_runner、<<<MASS_RESULT>>> 标记、test_{{category}}_{{op}}_{{name}} 命名、fp_id 回填、
+   exit code 约定全部不变；整个测试文件须在沙箱超时（默认 180 秒）内完成。
+5. files 只写 tests/ 下的测试文件：本角色无写实现代码的权限，写 serve.py/app.py 这类文件
+   会让整个测试节点因权限被拒而失败；服务必须在测试进程内起停，不落成独立文件。
+6. **全部功能点的用例必须写在同一个测试文件里**（如 tests/test_all.py），且每个功能点都要有
+   functional / exception / boundary 三类用例。框架只执行一个测试文件，分散到多个文件会让
+   覆盖率按单文件统计，其余功能点计为未覆盖，覆盖率门禁必然不达标。
+'''
+
+# 浏览器级检查（B 档）：仅 full_stack_spa 形态注入。
+# 不能无条件下发——ui_service_cmd 的默认值是 `python serve.py`，会诱导模型在 files 里
+# 输出 `serve.py`，而 tester 的 can_write_code=false，写入即抛 SandboxError 让整个节点崩溃
+# （web_todo_app 真实运行实测：test 节点 iter1/iter2 都栽在这里）。
+_BROWSER_PROTOCOL = '''
+浏览器级检查（full_stack_spa 形态必需，否则节点按"缺浏览器级证据"判失败）：
+6. ui_service_cmd：单条命令启动被测服务（默认 ["python", "serve.py"]）。服务绑定端口 0，
+   监听成功后必须在 stdout 打印一行 `MAS_UI_PORT=<实际端口>`，随后持续服务直至被外部终止。
+   注意：本角色没有写实现代码的权限，不要试图新建这个文件——它应由研发交付；
+   只在这里声明启动命令。
+7. ui_checks：列表，每项形如
+   {{"name": "新增任务出现在列表页",
+     "steps": [{{"tool": "browser_navigate", "arguments": {{"url": "{{{{base_url}}}}/"}}}}],
+     "expect": {{"contains": "买牛奶"}}}}
+   tool 为浏览器 MCP 服务注册的工具名；arguments 中 {{{{base_url}}}} 占位符由框架替换为真实
+   服务地址；expect.contains 对最后一个 step 的文本结果做子串断言（唯一允许的断言方式）。
+'''
+
 
 class TesterAgent(BaseAgent):
     role_id = "tester"
@@ -115,6 +183,9 @@ class TesterAgent(BaseAgent):
             "case_count": {"total": 0, "functional": 0, "exception": 0, "boundary": 0},
             "negotiation": {"questions": [], "answers": [], "open": 0, "status": "pending"},
             "derived_from": "",
+            # ui_service_cmd / ui_checks 不写进静态契约：它们只在 full_stack_spa（B 档）
+            # 形态下才有意义，无条件下发会诱导模型输出 `serve.py`，而 tester 无写实现代码权限
+            # （实测导致测试节点直接崩溃）。改为在 _BROWSER_PROTOCOL 里按形态注入。
             "execution_protocol": {
                 "note": "测试文件必须是可独立执行的 Python 脚本，并按本协议回传结果；沙箱按 <<<MASS_RESULT>>> 标记解析 stdout，缺失任一要素将导致用例统计为 0、覆盖率门禁必然失败",
                 "run_cmd": "python tests/test_xxx.py [--only 名称子串,名称子串]",
@@ -154,6 +225,32 @@ class TesterAgent(BaseAgent):
             "policies": dict(self.role.policies),
         }
 
+    def build_prompt(self, task: NodeTask, perception: Perception, experience: Any) -> Any:
+        """full_stack_* 需求把「Web 交付执行协议」补进 Prompt（docs/15 补丁 4）。
+
+        与 reviewer 的源码增强同一模式：契约是静态类属性，按需求规格的 delivery_shape
+        动态追加协议段并同步落盘留痕；backend_only 任务 Prompt 不变。
+        """
+        bundle = super().build_prompt(task, perception, experience)
+        shape, _, _ = resolve_delivery_shape(perception.spec)
+        if shape_family(shape) != "full_stack":
+            return bundle
+        manifest = perception.found.get("code_manifest") or {}
+        section = _WEB_PROTOCOL.format(
+            shape=shape,
+            package_hint=str(manifest.get("package") or "被测包"),
+        )
+        if shape == "full_stack_spa":
+            section += _BROWSER_PROTOCOL
+        bundle.user += "\n\n" + section
+        if bundle.path:
+            try:
+                with bundle.path.open("a", encoding="utf-8") as fh:
+                    fh.write("\n\n" + section)
+            except OSError:
+                pass  # 留痕失败不影响测试生成
+        return bundle
+
     # ---------------------------------------------------------------- 执行
     def apply(
         self,
@@ -173,9 +270,21 @@ class TesterAgent(BaseAgent):
         for file_item in data.get("files", []):
             if not isinstance(file_item, dict) or not file_item.get("path"):
                 continue          # 契约外防御：跳过结构非法的文件项，不让整个节点崩溃
-            self.sandbox_write(str(file_item["path"]), str(file_item["content"]))
-            if str(file_item["path"]).startswith("tests/"):
-                test_file = str(file_item["path"])
+            path = str(file_item["path"])
+            try:
+                self.sandbox_write(path, str(file_item["content"]))
+            except SandboxError as exc:
+                # 权限守卫拒绝（如契约诱导模型输出 tests/ 之外的 serve.py）：单文件写不进去
+                # 不该让整个测试节点崩掉——跳过后继续写其余测试文件，并在事件里如实记账。
+                self.ctx.events.emit(
+                    "test_file_write_denied", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="error",
+                    payload={"path": path, "error": str(exc),
+                             "note": "测试角色只能写 tests/ 下的文件；该文件被跳过，未写入沙箱"},
+                )
+                continue
+            if path.startswith("tests/"):
+                test_file = path
                 self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
         if not test_file:
             result.status, result.error = "fail", "测试套件未生成测试文件"
@@ -200,7 +309,10 @@ class TesterAgent(BaseAgent):
 
         # 2.5) 验证口径与选型语言的一致性：非 Python 选型下，沙箱执行的 Python 测试文件
         # 不构成对交付物的证据（实测 probe-02 因此拿到 8 项门禁全绿）。
-        verification = self._verification_gap(perception.found.get("solution_design") or {})
+        shape, _, _ = resolve_delivery_shape(spec)
+        env_probe = perception.found.get("env_probe") or {}
+        verification = self._verification_gap(
+            perception.found.get("solution_design") or {}, env_probe, spec)
         if verification["gap"]:
             self.ctx.events.emit(
                 "test_verification_gap", agent=self.role_id, node=task.node_id,
@@ -298,10 +410,33 @@ class TesterAgent(BaseAgent):
         self.publish("bug_reports", bugs, task, summary=f"缺陷总数 {bugs['total']}（open {bugs['open']}）")
         result.artifacts["test_report"] = test_report
         result.artifacts["bug_reports"] = bugs
+
+        # 6.5) UI 证据（docs/15 前置 1 / B2）：**任何形态都发布**，值随形态变化。
+        # 不发布会让门禁里引用 ui_evidence 的 criterion 因字段缺失判失败（expr BoolOp
+        # 不短路），backend_only 的老任务被批量误伤——这是改动前 13 个用例失败的直接根因。
+        ui_evidence = self._collect_ui_evidence(data, summary, env_probe, verification, shape)
+        self.publish(
+            "ui_evidence", ui_evidence, task,
+            summary=(f"UI 证据（{ui_evidence.get('mode')}，形态 {shape}）：失败断言 "
+                     f"{ui_evidence.get('failed_asserts', 0)}，"
+                     f"断言 {len(ui_evidence.get('asserts') or [])} 条"),
+        )
+        result.artifacts["ui_evidence"] = ui_evidence
+        if ui_evidence.get("error"):
+            self.ctx.events.emit(
+                "test_ui_evidence_incomplete", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"delivery_shape": shape, "mode": ui_evidence.get("mode"),
+                         "failed_asserts": ui_evidence.get("failed_asserts", 0),
+                         "error": ui_evidence["error"]},
+            )
+
         # 无证据不得判通过：total==0（测试文件崩溃/未按协议回传）时 failed 也为 0，
         # 原实现据此判 pass 并把 32 个缺陷自动闭环（task04-cpp-probe-02 iter02 实测）。
         result.status = ("pass" if summary["total"] > 0 and summary["failed"] == 0
-                         and negotiation["open"] == 0 and not verification["gap"] else "fail")
+                         and negotiation["open"] == 0 and not verification["gap"]
+                         and int(ui_evidence.get("failed_asserts", 0)) == 0
+                         else "fail")
         if verification["gap"]:
             result.error = verification["note"]
         result.summary = (
@@ -311,6 +446,10 @@ class TesterAgent(BaseAgent):
             f"歧义协商 {negotiation['closed']}/{negotiation['total']} 闭环"
             + (f"；根因：{test_report['root_cause_note']}" if preexec_findings else "")
             + (f"；验证口径缺口：{verification['note']}" if verification["gap"] else "")
+            + (f"；交付形态 {shape}"
+               + (f"；UI 证据失败断言 {int(ui_evidence.get('failed_asserts', 0))} 条"
+                  f"（{ui_evidence.get('error') or ui_evidence.get('mode')}）"
+                  if int(ui_evidence.get("failed_asserts", 0)) else ""))
             + ("" if summary["total"] else "；无执行证据：本轮没有一条用例回传结果，判失败（见 protocol_note 与 test_runs/iter*/stderr.txt）")
         )
         result.events = ["test_passed" if result.status == "pass" else "test_failed"]
@@ -414,22 +553,161 @@ class TesterAgent(BaseAgent):
         return (f"【交付物无法验证】{detail}。沙箱命令白名单只校验框架发起的命令，"
                 "测试文件内部再起的程序会绕过它，非 Python 交付物因此无法被真实验证")
 
-    def _verification_gap(self, solution_design: Dict[str, Any]) -> Dict[str, Any]:
-        """选型语言不是 Python 时，本轮执行不构成对交付物的验证证据。
+    @staticmethod
+    def _language_tokens(language: str) -> List[str]:
+        """把选型语言串切成语言分片：``"React + Python"`` -> ``["react","python"]``。
 
-        沙箱只能用 `python <测试文件>` 执行证据。task04-cpp-probe-02 实测：C++ 需求在回退压力下
-        由研发补一份 Python 复刻 + Python 测试套件，25 条用例全过、三类覆盖率 1.0，8 项门禁全绿并
-        签署"验收通过"——而被验收的 `.hpp` 从未被编译过。此处把"验证口径与选型语言不一致"写成
+        按语言分片而不是整串子串匹配，是为了让判定不依赖字符串巧合——文档 §4 补丁 2 指出，
+        ``"python" in language`` 对 ``"React + Python"`` 侥幸通过、对 ``"TypeScript + React"``
+        一律判失败，两种结果都不可靠。
+        """
+        return [token.lower() for token in re.split(r"[^0-9A-Za-z]+", str(language or "")) if token]
+
+    def _verification_gap(self, solution_design: Dict[str, Any],
+                          env_probe: Optional[Dict[str, Any]] = None,
+                          spec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """选型语言超出可执行范围（或缺少所需证据通道）时，本轮执行不构成验据。
+
+        沙箱能用 `python <测试文件>`（以及白名单内的 node）执行证据。
+        task04-cpp-probe-02 实测：C++ 需求在回退压力下由研发补一份 Python 复刻 +
+        Python 测试套件，25 条用例全过、三类覆盖率 1.0，8 项门禁全绿并签署"验收通过"——
+        而被验收的 `.hpp` 从未被编译过。此处把"验证口径与选型语言不一致"写成
         可判定的事实，交由测试节点如实报失败（与 F17/F19 一样修在证据源，不改门禁表达式）。
+
+        docs/15 AB 档：判定按交付形态分叉——
+        - ``backend_only``：维持原行为（语言串未声明或含 python 分片即通过）；
+        - ``full_stack_ssr``：验证通道是 Python 测试，同样按语言分片判定；
+        - ``full_stack_spa``：额外要求浏览器证据通道；通道未接入**如实报 gap=1**，
+          绝不允许退化成"Python 测试全过就放行"（与教材/ui evidence 的诚实性底线一致）。
         """
         language = str(((solution_design or {}).get("tech_choice") or {}).get("language", "")).strip()
-        if not language or "python" in language.lower():
-            return {"design_language": language, "executable_languages": ["python"],
-                    "gap": 0, "note": ""}
+        probe = dict(env_probe or {})
+        shape, _, _ = resolve_delivery_shape(spec or {})
+        tokens = self._language_tokens(language)
+        has_python = any(token.startswith(_EXECUTABLE_LANGUAGE) for token in tokens)
+        has_js = any(token in ("javascript", "typescript", "js", "ts") for token in tokens)
+        executable = [_EXECUTABLE_LANGUAGE]
+        if has_js and probe.get("javascript_ready"):
+            executable.append("javascript")
+        base = {"design_language": language, "executable_languages": executable,
+                "delivery_shape": shape}
+
+        if shape == "full_stack_spa":
+            return {
+                **base, "gap": 1,
+                "note": ("交付形态为 full_stack_spa（浏览器前端），需要浏览器级证据通道才能验证；"
+                         "当前通道未接入（config/runtime.ui_probe 未启用或浏览器 MCP 未就绪），"
+                         "本轮 Python 用例不构成对该形态交付物的完整验证——如实判失败，不降级放行"),
+            }
+        if not tokens or has_python:
+            if has_js and not probe.get("javascript_ready"):
+                return {
+                    **base, "gap": 1,
+                    "note": (f"选型语言为 {language}，但环境探测显示 node 不可用"
+                             f"（{probe.get('node', {}).get('reason', '未探测')}）："
+                             "JS 部分无法被执行验证，属环境或构建问题，需补齐工具链后重跑"),
+                }
+            return {**base, "gap": 0, "note": ""}
         return {
-            "design_language": language, "executable_languages": ["python"], "gap": 1,
+            **base, "gap": 1,
             "note": (f"选型语言为 {language}，沙箱只能执行 Python：本轮用例全过验证的是 Python 测试"
                      "文件自身，不是该语言的交付物（补齐工具链或改用可验证的交付形态后才能验收）"),
+        }
+
+    def _ui_evidence_disabled(self, shape: str, note: str) -> Dict[str, Any]:
+        """不需要浏览器通道的形态：发布「已明确不适用」而不是不发布。
+
+        expr.py 的 BoolOp **不短路求值**（``values = [self.visit(v) for v in node.values]``
+        先求全部值再 any/all）：门禁里写 ``delivery_shape != 'full_stack_spa' or
+        ui_evidence.failed_asserts == 0`` 时，只要 ``ui_evidence`` 这个 artifact 不存在，
+        ``_lookup`` 就抛 ``_MissingField``，整条 criterion 判失败——连 backend_only 的
+        老任务都会被误伤（实测改动前 13 个用例失败的根因）。所以任何形态都必须发布。
+        """
+        return {"enabled": False, "mode": "disabled", "delivery_shape": shape,
+                "channel": "", "asserts": [], "checks": [], "screenshots": [],
+                "console_errors": [], "failed_asserts": 0, "error": "", "note": note}
+
+    def _collect_ui_evidence(self, data: Dict[str, Any], summary: Dict[str, Any],
+                             env_probe: Dict[str, Any], verification: Dict[str, Any],
+                             shape: str) -> Dict[str, Any]:
+        """按交付形态产出 ui_evidence（docs/15 前置 1 / B2），四种结果都必须可判定。
+
+        1. ``backend_only`` → disabled：无前端产物，UI 证据不适用；
+        2. ``full_stack_ssr`` → ssr：UI 验证已由测试套件的 HTTP 响应体断言承担，
+           failed_asserts 与用例失败数同源，不谎报采集过浏览器证据；
+        3. ``full_stack_spa`` + 浏览器就绪 → browser：UiProber 真实采集，断言逐条入账；
+        4. ``full_stack_spa`` + 浏览器不可得 → browser + failed_asserts=1：
+           SSR 响应体断言验证不了客户端渲染，放行就是 F23 式假通过，必须判失败。
+        """
+        if shape_family(shape) != "full_stack":
+            return self._ui_evidence_disabled(shape, "纯后端形态无前端产物，UI 证据不适用")
+
+        probe_cfg = dict(self.ctx.config.runtime.get("ui_probe") or {})
+        checks = [item for item in (data.get("ui_checks") or []) if isinstance(item, dict)]
+        browser_ready = bool(probe_cfg.get("enabled")) and bool(env_probe.get("browser_ui_ready"))
+
+        if shape == "full_stack_spa":
+            if not browser_ready:
+                return {
+                    "enabled": True, "mode": "browser", "delivery_shape": shape, "channel": "",
+                    "asserts": [], "checks": [], "screenshots": [], "console_errors": [],
+                    "failed_asserts": 1,
+                    "error": ("full_stack_spa 需要浏览器级 UI 证据，当前不可得（"
+                              + ("runtime.ui_probe 未启用" if not probe_cfg.get("enabled")
+                                 else f"浏览器 MCP 未就绪：{env_probe.get('ui_server', {}).get('reason', '')}")
+                              + "）：断言数为 0 时按证据不足判失败，不允许空证据通过"),
+                }
+            if not checks:
+                return {
+                    "enabled": True, "mode": "browser", "delivery_shape": shape, "channel": "",
+                    "asserts": [], "checks": [], "screenshots": [], "console_errors": [],
+                    "failed_asserts": 1,
+                    "error": "测试契约未提供 ui_checks：SPA 形态无可执行文件清单，按证据不足判失败",
+                }
+            return self._run_ui_prober(data, shape, checks)
+
+        baseline = self._ui_evidence_disabled(
+            shape, "SSR 形态的 UI 验证由测试套件的 HTTP 响应体断言承担，未启用浏览器级采集")
+        baseline.update({
+            "enabled": True, "mode": "ssr",
+            "failed_asserts": int(summary.get("failed", 0)),
+            "note": ("UI 验证由测试套件的 HTTP 响应体断言承担"
+                     + ("" if probe_cfg.get("enabled")
+                        else "（runtime.ui_probe 未启用，跳过浏览器级采集）")),
+        })
+        return baseline
+
+    def _run_ui_prober(self, data: Dict[str, Any], shape: str,
+                       checks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """经 Playwright MCP 真实采集浏览器证据；采集器返回结构归一化为 ui_evidence 契约。"""
+        from ..uiprober import UiProber
+
+        prober = UiProber(self.ctx.config, self.ctx.sandbox, self.ctx.run_dir, self.ctx.events)
+        service_cmd = data.get("ui_service_cmd") or [self.ctx.sandbox.python, "serve.py"]
+        if not isinstance(service_cmd, list):
+            service_cmd = [str(service_cmd)]
+        raw = prober.collect(service_cmd=[str(part) for part in service_cmd], checks=checks)
+        checks_done = [item for item in (raw.get("checks") or []) if isinstance(item, dict)]
+        asserts = [
+            {"fp_id": str(item.get("fp_id", "")), "category": str(item.get("category", "functional")),
+             "name": str(item.get("name", "")),
+             "status": "passed" if item.get("passed") else "failed",
+             "message": str(item.get("detail", ""))[:300]}
+            for item in checks_done
+        ]
+        failed = int(raw.get("failed_asserts", 0)) or sum(
+            1 for item in asserts if item["status"] != "passed")
+        # -browser 通道不可用/未产生任何断言时一律按失败计：这不构成"空证据的 pass"
+        if not asserts and failed == 0:
+            failed = 1
+        return {
+            "enabled": True, "mode": "browser", "delivery_shape": shape,
+            "channel": f"mcp:{raw.get('server', '')}" if raw.get("server") else "mcp",
+            "base_url": str(raw.get("base_url", "")),
+            "asserts": asserts, "checks": asserts, "screenshots": list(raw.get("screenshots") or []),
+            "console_errors": [], "failed_asserts": failed,
+            "error": str(raw.get("error", "")),
+            "note": "浏览器级 UI 断言（UiProber 经 MCP 采集，证据落在 evidence/ui/）",
         }
 
     # ---------------------------------------------------------------- 协商

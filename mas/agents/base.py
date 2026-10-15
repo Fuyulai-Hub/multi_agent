@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .. import compress
 from ..config import NodeConfig
 from ..errors import SandboxError
 from ..llm import Generation, LLMClient
@@ -93,13 +94,26 @@ class BaseAgent:
         return result
 
     # ---------------------------------------------------------------- function calling
-    def _tool_schemas(self) -> Optional[List[Dict[str, Any]]]:
-        """当前可用的 tools schema（无 ToolRunner 或无工具时返回 None，走原有单轮生成）。"""
+    def _tool_schemas(self, task: NodeTask) -> Optional[List[Dict[str, Any]]]:
+        """当前可用的 tools schema（无 ToolRunner / 无工具 / 节点不在 tools_nodes 白名单时返回 None）。
+
+        节点隔离（docs/16 的 05 文档 §4.2）：``llm.tools_nodes`` 为空或未配置=全部节点（改造前行为）；
+        配置为非空列表时只对列表内节点下发 tools，使下游节点保持 ``response_format`` 的 JSON 强制约束。
+        """
         runner = getattr(self.ctx, "tools", None)
         if runner is None:
             return None
         schemas = getattr(runner, "schemas", None)
-        return list(schemas) if schemas else None
+        if not schemas:
+            return None
+        llm_cfg = getattr(getattr(self.ctx, "config", None), "llm", None)
+        if isinstance(llm_cfg, dict):
+            nodes = llm_cfg.get("tools_nodes")
+            if nodes is not None:
+                allowed = [str(node) for node in nodes]
+                if allowed and task.node_id not in allowed:
+                    return None
+        return list(schemas)
 
     def _generate_with_tools(
         self, task: NodeTask, bundle: PromptBundle, context: Dict[str, Any], result: AgentResult,
@@ -108,7 +122,7 @@ class BaseAgent:
 
         轮数上限 llm.tool_max_rounds（默认 2）；无工具配置时退化为单轮 generate，行为不变。
         """
-        tools = self._tool_schemas()
+        tools = self._tool_schemas(task)
         if tools is None:
             try:
                 return self.ctx.llm.generate(self.task_kind_for(task), bundle, context)
@@ -137,7 +151,13 @@ class BaseAgent:
             # OpenAI 协议要求：tool 消息之前必须有一条携带 tool_calls 的 assistant 消息，
             # 否则严格实现的端点会因 tool_call_id 找不到归属而报 400。
             extra_messages.append(self._assistant_tool_message(generation))
-            extra_messages.extend(runner.execute(generation.tool_calls))
+            tool_messages = runner.execute(generation.tool_calls)
+            # tool 结果统一截断（docs/16 的 02 文档）：0=不截断，默认行为与现状一致
+            runtime = getattr(self.ctx.config, "runtime", None) or {}
+            tool_max_chars = int(runtime.get("tool_result_max_chars", 0) or 0)
+            if tool_max_chars > 0:
+                tool_messages = compress.truncate_tool_results(tool_messages, max_chars=tool_max_chars)
+            extra_messages.extend(tool_messages)
             result.metrics["tool_rounds"] = round_index
         return generation
 
@@ -229,9 +249,26 @@ class BaseAgent:
         # 感知段单产物字符预算：默认 900 会把 12 个功能点的需求规格截到只剩 3 个 FP 片段
         # （attempt03 实测 implement/test 全程信息残缺）；由 runtime.prompt_artifact_max_chars 配置
         max_chars = int(self.ctx.config.runtime.get("prompt_artifact_max_chars", 10000))
-        brief = self.ctx.blackboard.brief(sorted(found.keys()), max_chars_per_item=max_chars)
+        # 上下文压缩（docs/16 的 02 文档）：enabled=false 时恒等返回，行为与现状逐字节一致。
+        # 压缩只改「进 Prompt 的内容」，黑板 artifact 数据不变（门禁求值走 snapshot，完全隔离）。
+        compression = dict(self.ctx.config.runtime.get("context_compression") or {})
+        enabled = bool(compression.get("enabled", False))
+        result = compress.found_artifacts(
+            found,
+            enabled=enabled,
+            per_item_chars=int(compression.get("per_item_chars", max_chars) or max_chars),
+            total_chars=int(compression.get("total_chars", 32000) or 32000),
+        )
+        if enabled:
+            self.ctx.events.emit(
+                "context_compressed", agent=self.role_id, node=task.node_id, iteration=task.iteration,
+                payload={"before_chars": result.before_chars, "after_chars": result.after_chars,
+                         "compressed": result.compressed, "untouched": result.untouched},
+            )
+        brief = self.ctx.blackboard.brief(sorted(result.artifacts.keys()),
+                                          max_chars_per_item=max_chars, data=result.artifacts)
         digest = self.ctx.bus.digest(self.role_id)
-        return Perception(found=found, missing=missing, artifacts_brief=brief, bus_digest=digest)
+        return Perception(found=result.artifacts, missing=missing, artifacts_brief=brief, bus_digest=digest)
 
     # ---------------------------------------------------------------- 经验
     def retrieve_experience(self, task: NodeTask, perception: Perception) -> RetrievalResult:
@@ -275,7 +312,12 @@ class BaseAgent:
             missing=perception.missing,
             experience=experience,
             contract=self.contract_for(task),
-            context={"perception": sorted(perception.found.keys()), "missing": perception.missing},
+            context={
+                "perception": sorted(perception.found.keys()),
+                "missing": perception.missing,
+                # 附图留痕（docs/16 的 01 文档）：artifact 里只存元数据，Prompt 只加一段文字说明
+                "images": (perception.found.get("requirement_source") or {}).get("images") or [],
+            },
         )
 
     # ---------------------------------------------------------------- 便捷

@@ -10,7 +10,10 @@ API：
     GET /api/metrics                 每轮效果指标
     GET /api/learning-report         自学习效果报告（Markdown）
     GET /api/llm                     当前 LLM 配置与凭据（Key 脱敏/回显、来源标注）
-    POST /api/llm                    保存 provider/model 到 system.yaml，凭据到 credentials.yaml
+    POST /api/run                     发起一次流水线（requirement 文字 / requirement_path 上传文件，二选一；可另带 images 附图路径数组）
+    POST /api/upload                  上传需求文档（base64 JSON，落盘 workspace/uploads/）
+    POST /api/upload_image            上传对话附图（base64 JSON，图片后缀白名单，落盘 workspace/uploads/）
+    POST /api/llm                     保存 provider/model 到 system.yaml，凭据到 credentials.yaml
     POST /api/llm/test               用给定凭据探测 BASE_URL 的 /models，验证 Key 是否可用
 静态文件：/ 直接映射本目录（index.html / app.js / style.css）
 """
@@ -112,6 +115,18 @@ def _running_summary(run_dir: Path, run_id: str) -> dict:
     }
 
 
+def _run_sort_key(run: dict) -> tuple:
+    """运行列表排序键：按开始时间倒序，run_id 仅作兜底。
+
+    不能按 run_id 字符串排序：历史运行存在两套命名——CLI 演示运行是
+    ``task01-...``~``task06-...``，面板/流水线运行是 ``20261016-HHMMSS-xxxx``。
+    字符串倒序下 ``'t' > '2'``，17 条 task0x 旧运行会全部压在两套格式的最新运行之上，
+    刚产生的运行被埋到列表中段（45 条列表里排到第 18/19 位），用户翻不到即误判"未写入"。
+    ``ts`` 取 run_summary.metrics.ts（运行开始时间，ISO 8601，同格式字符串可比）。
+    """
+    return (str(run.get("ts") or ""), str(run.get("run_id") or ""))
+
+
 def load_runs(workspace: Path) -> list[dict]:
     runs_dir = workspace / "runs"
     if not runs_dir.exists():
@@ -147,7 +162,7 @@ def load_runs(workspace: Path) -> list[dict]:
             })
         elif (run_dir / "events.jsonl").exists():
             runs.append(_running_summary(run_dir, run_id))
-    runs.sort(key=lambda r: r.get("run_id") or "", reverse=True)
+    runs.sort(key=_run_sort_key, reverse=True)
     return runs
 
 
@@ -174,6 +189,10 @@ def load_run_detail(workspace: Path, run_id: str) -> dict | None:
 
 
 VALID_PROVIDERS = {"offline", "openai_compatible"}
+
+# 对话窗口附图上传的单张大小上限：与 config/system.yaml 的 llm.vision.max_image_bytes
+# 默认值（5MB）一致；进入流水线时 mas/sources.py 的 prepare_images 会按配置再校验一次。
+IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 
 SYSTEM_YAML = PROJECT_ROOT / "config" / "system.yaml"
@@ -302,12 +321,21 @@ def start_run(
     workspace: Path,
     profile: str | None,
     requirement_text: str,
+    requirement_path: str | None = None,
     provider: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
+    images: list[str] | None = None,
 ) -> str:
-    """在后台线程中启动一次流水线，返回预分配的 run_id。"""
+    """在后台线程中启动一次流水线，返回预分配的 run_id。
+
+    ``requirement_path`` 非空时走 CLI 同款文件通道（``as_text=False``），
+    为空时行为与现状逐字节一致（文字需求 ``as_text=True``）。
+    ``images`` 为对话窗口上传的附图路径数组（经 ``POST /api/upload_image`` 落盘），
+    透传给 ``Leader.run(images=...)``：校验/复制/元数据发布由 ``sources.prepare_images`` 负责，
+    不传或为空时与改造前逐字节一致。
+    """
     from mas.config import load_config
     from mas.leader import Leader
 
@@ -332,7 +360,10 @@ def start_run(
 
     def worker() -> None:
         try:
-            Leader(config).run(requirement_text, as_text=True, run_id=run_id)
+            if requirement_path:
+                Leader(config).run(requirement_path, as_text=False, run_id=run_id, images=images)
+            else:
+                Leader(config).run(requirement_text, as_text=True, run_id=run_id, images=images)
         except Exception as exc:  # 后台线程异常落盘，便于排查
             (workspace / "runs").mkdir(parents=True, exist_ok=True)
             (workspace / "runs" / f"{run_id}.error.log").write_text(str(exc), encoding="utf-8")
@@ -412,7 +443,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802（标准库命名）
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/run", "/api/llm", "/api/llm/test"):
+        if parsed.path not in ("/api/run", "/api/upload", "/api/upload_image", "/api/llm", "/api/llm/test"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -421,6 +452,12 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw)
         except json.JSONDecodeError:
             self._send_json({"error": "请求体不是合法 JSON"}, 400)
+            return
+        if parsed.path == "/api/upload":
+            self._handle_upload(data)
+            return
+        if parsed.path == "/api/upload_image":
+            self._handle_upload_image(data)
             return
         if parsed.path == "/api/llm/test":
             self._send_json(
@@ -448,9 +485,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, 400)
             return
         requirement = str(data.get("requirement") or "").strip()
-        if not requirement:
-            self._send_json({"error": "requirement 不能为空"}, 400)
+        requirement_path = str(data.get("requirement_path") or "").strip()
+        # 两段式上传（docs/16 的 04 文档）：requirement_path 走文件通道，与文字需求二选一
+        if requirement and requirement_path:
+            self._send_json({"error": "requirement 与 requirement_path 只能二选一"}, 400)
             return
+        if not requirement and not requirement_path:
+            self._send_json({"error": "requirement 不能为空（图片为附图，需与需求文字/文档一同发送）"}, 400)
+            return
+        # 对话附图（docs/16 的 01 文档）：images 为 /api/upload_image 落盘后的路径数组。
+        # 只做类型校验；后缀/大小/张数语义由 prepare_images 在流水线内校验（单一事实来源），
+        # 其 ConfigError 会以 run_failed 事件 + fail 摘要呈现在运行详情里。
+        raw_images = data.get("images")
+        images: list[str] | None = None
+        if raw_images is not None:
+            if not isinstance(raw_images, list) or not all(
+                isinstance(item, str) and item.strip() for item in raw_images
+            ):
+                self._send_json(
+                    {"error": "images 必须是文件路径字符串数组（先经 POST /api/upload_image 上传）"}, 400)
+                return
+            images = [item.strip() for item in raw_images] or None
         profile = data.get("profile") or None
         provider = (data.get("provider") or "").strip() or None
         model = (data.get("model") or "").strip() or None
@@ -458,13 +513,53 @@ class Handler(BaseHTTPRequestHandler):
         base_url = (data.get("base_url") or "").strip() or None
         try:
             run_id = start_run(
-                self.workspace, profile, requirement,
-                provider=provider, model=model, api_key=api_key, base_url=base_url,
+                self.workspace, profile, requirement, requirement_path=requirement_path or None,
+                provider=provider, model=model, api_key=api_key, base_url=base_url, images=images,
             )
         except Exception as exc:
             self._send_json({"error": f"启动失败：{exc}"}, 400)
             return
         self._send_json({"run_id": run_id, "status": "started"})
+
+    def _handle_upload(self, data: dict) -> None:
+        """POST /api/upload：base64 JSON 通道（绕开 Python 3.13 起已移除的 cgi multipart 解析）。"""
+        from mas.errors import ConfigError
+        from mas.sources import save_upload
+
+        filename = str(data.get("filename") or "").strip()
+        content_base64 = data.get("content_base64") or ""
+        if not filename:
+            self._send_json({"error": "filename 不能为空"}, 400)
+            return
+        try:
+            self._send_json(save_upload(self.workspace, filename, content_base64))
+        except ConfigError as exc:
+            self._send_json({"error": str(exc)}, 400)
+
+    def _handle_upload_image(self, data: dict) -> None:
+        """POST /api/upload_image：对话窗口附图上传（base64 JSON，落盘 workspace/uploads/）。
+
+        与 ``/api/upload``（需求文档）分工：后者走需求文档后缀白名单（不含图片），
+        本路由走图片后缀白名单 ``mas.sources.IMAGE_SUFFIXES`` 与单张 5MB 上限
+        （与 system.yaml ``llm.vision.max_image_bytes`` 默认值一致；进入流水线时
+        ``prepare_images`` 还会按配置复核后缀/大小/张数）。返回体与 /api/upload 同构，
+        ``kind`` 恒为 ``"image"``（save_upload 的 kind 面向需求文档路由，对图片无意义）。
+        """
+        from mas.errors import ConfigError
+        from mas.sources import IMAGE_SUFFIXES, save_upload
+
+        filename = str(data.get("filename") or "").strip()
+        content_base64 = data.get("content_base64") or ""
+        if not filename:
+            self._send_json({"error": "filename 不能为空"}, 400)
+            return
+        try:
+            meta = save_upload(self.workspace, filename, content_base64,
+                               allowed_suffixes=set(IMAGE_SUFFIXES), max_bytes=IMAGE_MAX_BYTES)
+            meta["kind"] = "image"
+            self._send_json(meta)
+        except ConfigError as exc:
+            self._send_json({"error": str(exc)}, 400)
 
 
 def main() -> int:

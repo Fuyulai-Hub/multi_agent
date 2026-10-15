@@ -631,13 +631,19 @@ class PermissionAndRetryTests(unittest.TestCase):
         self.assertFalse(_permission_allows(self._agent({"can_block_acceptance": False}),
                                             "can_block_acceptance"))
 
-    def test_llm_retry_defaults_to_single_attempt(self):
+    def test_llm_retry_defaults_to_three_attempts(self):
+        # 2026-10-16 起默认值从 1 调到 3：实测两次运行在 intake 首调即遭 TCP 级失败
+        # （WinError 10054/10061），单次尝试下瞬时端点抖动一次致命（整轮 6 秒判 fail）。
+        # 连接类异常已纳入可重试分类（见 mas/llm.py 与 tests/test_llm_retry.py）。
         with tempfile.TemporaryDirectory() as tmp:
             config = load_config(PROJECT_ROOT / "config", workspace=Path(tmp) / "ws")
             client = LLMClient(config)
-            self.assertEqual(client.retry_max_attempts, 1)      # 默认不重试，行为不变
-            config.llm["retry"] = {"max_attempts": 3, "backoff_s": 0.1}
-            self.assertEqual(LLMClient(config).retry_max_attempts, 3)
+            self.assertEqual(client.retry_max_attempts, 3)
+            self.assertEqual(client.retry_backoff_s, 3.0)
+            config.llm["retry"] = {"max_attempts": 1, "backoff_s": 0.1}
+            client = LLMClient(config)
+            self.assertEqual(client.retry_max_attempts, 1)     # 显式配置仍可关回单次
+            self.assertEqual(client.retry_backoff_s, 0.1)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ const state = {
   selectedRun: null,
   experience: [],
   tierFilter: "all",
+  upload: null,          // 已上传待发起的需求文档：{path, name}
+  images: [],            // 已上传待发送的需求附图：[{path, name, bytes, dataUrl}]
   // 当前生效的 LLM 配置：模型列表按 API Key 动态获取
   llm: {
     provider: "offline", model: "", models: [],
@@ -13,6 +15,13 @@ const state = {
     apiKeySet: false, apiKeyMasked: "", notice: "",
   },
 };
+
+/* 附图上传约束：与后端 mas/sources.py 的 IMAGE_SUFFIXES / MAX_IMAGES、
+   frontend/server.py 的 IMAGE_MAX_BYTES（对齐 system.yaml vision.max_image_bytes 默认 5MB）一致；
+   前端只做fail-fast，后端为最终校验方 */
+const IMAGE_SUFFIXES = [".png", ".jpg", ".jpeg", ".webp", ".gif"];
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGES = 4;
 
 /* ---------------- 视图切换 ---------------- */
 document.querySelectorAll(".tab").forEach((btn) => {
@@ -59,8 +68,8 @@ async function loadRuns() {
 /* 一条用户消息 + 一条对应的运行记录气泡；点击气泡跳转该运行详情 */
 const chatMessages = [];
 
-function pushChatMessage(text, runId) {
-  chatMessages.push({ kind: "user", text, ts: new Date() });
+function pushChatMessage(text, runId, images = []) {
+  chatMessages.push({ kind: "user", text, ts: new Date(), images });
   chatMessages.push({ kind: "run", runId, ts: new Date() });
   renderChat();
 }
@@ -78,8 +87,14 @@ function renderChat() {
   box.innerHTML = chatMessages
     .map((m) => {
       if (m.kind === "user") {
+        const imgs = (m.images || []).length
+          ? `<div class="msg-imgs">${m.images
+              .map((im) => `<img class="msg-img" src="${im.dataUrl}" alt="${escapeHtml(im.name)}"
+                        title="${escapeHtml(im.name)}（点击查看大图）">`)
+              .join("")}</div>`
+          : "";
         return `<div class="msg user">
-          <div class="bubble">${escapeHtml(m.text)}</div>
+          <div class="bubble">${escapeHtml(m.text)}${imgs}</div>
           <span class="msg-time">${fmtTime(m.ts)}</span>
         </div>`;
       }
@@ -105,6 +120,11 @@ function renderChat() {
 }
 
 $("#chat-messages").addEventListener("click", (ev) => {
+  const img = ev.target.closest(".msg-img");
+  if (img && img.src) {
+    window.open(img.src, "_blank");   // dataUrl 直接在新标签页放大查看
+    return;
+  }
   const el = ev.target.closest(".run-msg");
   if (el && el.dataset.run) selectRun(el.dataset.run);
 });
@@ -553,8 +573,10 @@ function setComposerStatus(text, cls) {
 
 async function startRun() {
   const requirement = $("#new-requirement").value.trim();
-  if (!requirement) {
-    setComposerStatus("请先输入需求描述", "error");
+  const upload = state.upload;
+  const images = state.images;
+  if (!requirement && !upload) {
+    setComposerStatus("请先输入需求描述或上传需求文档（图片作为附图随需求一起发送）", "error");
     return;
   }
   const provider = state.llm.provider || "offline";
@@ -567,7 +589,10 @@ async function startRun() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        requirement,
+        // 上传文档与文字需求二选一（后端对「都给/都空」返回 400）；图片为附图，两者都可兼带
+        requirement: upload ? "" : requirement,
+        requirement_path: upload ? upload.path : null,
+        images: images.length ? images.map((i) => i.path) : null,
         profile: $("#new-profile").value || null,
         provider,
         model: provider === "openai_compatible" ? model : null,
@@ -579,7 +604,13 @@ async function startRun() {
       return;
     }
     $("#new-requirement").value = "";                 // 发送后清空输入框
-    pushChatMessage(requirement, data.run_id);        // 消息进入对话区
+    pushChatMessage(upload ? `［上传文档］${upload.name}` : requirement, data.run_id, images);
+    state.upload = null;
+    state.images = [];
+    $("#upload-doc").value = "";
+    $("#upload-image").value = "";
+    setUploadName("");
+    renderImageTray();
     state.selectedRun = data.run_id;
     activeRuns.add(data.run_id);
     await loadRuns();
@@ -633,6 +664,194 @@ $("#load-example").addEventListener("click", async () => {
     setComposerStatus("已载入示例需求模板，可直接发起或在此基础上修改", "");
   } else {
     setComposerStatus("未找到示例文件", "error");
+  }
+});
+
+/* ---------------- 需求文档上传（两段式：/api/upload → /api/run 带 requirement_path） ---------------- */
+function setUploadName(text, cls) {
+  const el = $("#upload-name");
+  el.textContent = text || "";
+  el.className = `composer-status ${cls || ""}`;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      resolve(result.slice(result.indexOf(",") + 1));   // 去掉 data:...;base64, 前缀
+    };
+    reader.onerror = () => reject(new Error("读取文件失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/* File → /api/upload（base64 JSON）→ state.upload（发送时走 requirement_path 文件通道）。
+   nameOverride 供粘贴场景使用：剪贴板文件的 name 可能为空（截图等途径），
+   此时由调用方按 MIME 补一个带后缀的名字，避免后端以「文件名非法」明确拒绝。 */
+async function uploadDocFile(file, nameOverride) {
+  const name = nameOverride || file.name;
+  if (file.size > 10 * 1024 * 1024) {
+    setUploadName("文件超过 10MB 上限", "error");
+    return false;
+  }
+  setUploadName(`正在上传 ${name} ……`, "running");
+  try {
+    const content_base64 = await fileToBase64(file);
+    const res = await fetch("/api/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: name, content_base64 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      state.upload = null;
+      setUploadName(data.error || "上传失败", "error");
+      return false;
+    }
+    state.upload = { path: data.path, name: data.name };
+    setUploadName(`已选择：${data.name}（${data.kind}，发送时将替代输入框内容）`, "done");
+    return true;
+  } catch (err) {
+    state.upload = null;
+    setUploadName(`上传失败：${err.message}`, "error");
+    return false;
+  }
+}
+
+$("#upload-doc").addEventListener("change", async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = "";   // 同一文件可重复选择（与 #upload-image 一致）
+  if (!file) return;
+  await uploadDocFile(file);
+});
+
+/* ---------------- 需求附图上传（两段式：/api/upload_image → /api/run 带 images） ---------------- */
+/* 图片是需求文字/文档的附图：随需求进入流水线（存档 + requirement_images_attached 事件），
+   单独发送图片不构成可执行需求，因此发送前仍要求有文字或文档（见 startRun 的守卫）。 */
+function renderImageTray() {
+  const tray = $("#image-tray");
+  tray.hidden = !state.images.length;
+  tray.innerHTML = state.images
+    .map((img, i) => `
+      <div class="img-chip" title="${escapeHtml(img.name)}（${img.bytes} 字节，随需求一起发送）">
+        <img src="${img.dataUrl}" alt="${escapeHtml(img.name)}">
+        <button type="button" data-idx="${i}" title="移除该图片">✕</button>
+      </div>`)
+    .join("");
+}
+
+$("#image-tray").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-idx]");
+  if (!btn) return;
+  state.images.splice(Number(btn.dataset.idx), 1);
+  renderImageTray();
+});
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取文件失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/* File → /api/upload_image → state.images + 缩略图托盘（随需求一起进入流水线）。
+   nameOverride 供粘贴场景使用（见 uploadDocFile 同名参数说明）。
+   返回 false 表示该文件未入队（校验失败/上传出错），调用方据此中止整批（与改造前一致）。 */
+async function uploadImageFile(file, nameOverride) {
+  const name = nameOverride || file.name;
+  const suffix = "." + (name.split(".").pop() || "").toLowerCase();
+  if (!IMAGE_SUFFIXES.includes(suffix)) {
+    setUploadName(`不支持的图片格式 ${suffix || "(无后缀)"}：允许 png/jpg/jpeg/webp/gif`, "error");
+    return false;
+  }
+  if (file.size > IMAGE_MAX_BYTES) {
+    setUploadName(`${name} 超过单张 5MB 上限`, "error");
+    return false;
+  }
+  if (state.images.length >= MAX_IMAGES) {
+    setUploadName(`最多上传 ${MAX_IMAGES} 张附图`, "error");
+    return false;
+  }
+  setUploadName(`正在上传 ${name} ……`, "running");
+  try {
+    const dataUrl = await fileToDataUrl(file);
+    const res = await fetch("/api/upload_image", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: name,
+        content_base64: dataUrl.slice(dataUrl.indexOf(",") + 1),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setUploadName(data.error || "上传失败", "error");
+      return false;
+    }
+    state.images.push({ path: data.path, name: data.name, bytes: data.bytes, dataUrl });
+    return true;
+  } catch (err) {
+    setUploadName(`上传失败：${err.message}`, "error");
+    return false;
+  }
+}
+
+$("#upload-image").addEventListener("change", async (ev) => {
+  const files = Array.from(ev.target.files || []);
+  ev.target.value = "";   // 同一文件可重复选择
+  if (!files.length) return;
+  for (const file of files) {
+    if (!(await uploadImageFile(file))) return;   // 出错即中止整批（与改造前一致）
+  }
+  renderImageTray();
+  setUploadName(`已选择 ${state.images.length} 张附图（随需求一起发送，可点 ✕ 移除）`, "done");
+});
+
+/* ---------------- 对话窗口直接粘贴（截图 / 剪贴板文件） ---------------- */
+/* 粘贴只是新增一个「文件来源」，复用按钮上传的同两条通道，后端零改动：
+   图片（截图、复制的图片文件）→ uploadImageFile → /api/upload_image → 需求附图；
+   其他文件（复制的需求文档）→ uploadDocFile → /api/upload → 需求文档。
+   校验 / 落盘 / 入流水线仍由后端既有链路负责（save_upload → Leader.run → prepare_images），
+   本段只做「取文件 → 分类 → 转交」。clipboardData 无文件时放行默认行为（纯文本正常粘贴）。 */
+function clipboardFiles(data) {
+  const direct = Array.from(data.files || []);
+  if (direct.length) return direct;
+  // 兜底：个别浏览器 files 为空但 items 里有文件项
+  return Array.from(data.items || [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+}
+
+/* 剪贴板文件的 name 可能为空（截图、部分复制途径）：按 MIME 补一个带后缀的名字，
+   否则后端会以「文件名非法 / 不支持的后缀」明确拒绝（明确失败而非静默）。 */
+function pastedFileName(file, fallbackExt) {
+  if (file.name && /\.[A-Za-z0-9]+$/.test(file.name)) return file.name;
+  const ext = ((file.type || "").split("/")[1] || fallbackExt || "")
+    .replace(/[^a-z0-9]/gi, "");
+  return ext ? `pasted-${Date.now()}.${ext}` : `pasted-${Date.now()}`;
+}
+
+$("#new-requirement").addEventListener("paste", async (ev) => {
+  const files = clipboardFiles(ev.clipboardData);
+  if (!files.length) return;   // 无文件：默认行为，纯文本正常插入输入框
+  ev.preventDefault();
+  let imagesAdded = 0;
+  for (const file of files) {
+    // 分类：MIME 或后缀任一指向图片即走附图通道（剪贴板截图常只有 MIME 可靠）
+    const isImage = (file.type || "").startsWith("image/")
+      || IMAGE_SUFFIXES.includes("." + (file.name.split(".").pop() || "").toLowerCase());
+    const ok = isImage
+      ? await uploadImageFile(file, pastedFileName(file, "png"))
+      : await uploadDocFile(file, pastedFileName(file, ""));
+    if (ok && isImage) imagesAdded += 1;
+  }
+  renderImageTray();   // 与按钮路径一致：粘贴的图片也要进托盘可见、可移除
+  if (imagesAdded) {
+    setUploadName(`已选择 ${state.images.length} 张附图（随需求一起发送，可点 ✕ 移除）`, "done");
   }
 });
 

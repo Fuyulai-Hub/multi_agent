@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import SystemConfig, resolve_credentials
@@ -125,6 +127,12 @@ class LLMClient:
         # 距网关 300s 上限余量大），low 仍不可用时兜底 high（实测 115s，余量较小但能收敛）。
         # 兼容单值写法（"low" / ["low"]），也支持逗号分隔或列表。
         self.downgrade_ladder = self._parse_ladder(config.llm.get("downgrade_reasoning_effort") or "low,high")
+        # 图片输入（docs/16 的 01 文档）：默认关闭；开启且 payload 带图时 user content 改 parts 数组。
+        # 端点是否接受 image_url 属未验证项，故默认 false；收到 400 且详情提及 image 时自动去图重发。
+        vision = dict(config.llm.get("vision") or {})
+        self.vision_enabled = bool(vision.get("enabled", False))
+        self.vision_max_image_bytes = int(vision.get("max_image_bytes", 5242880))
+        self.vision_url_style = str(vision.get("url_style", "data_uri"))
         self._offline: Any = None
 
     @staticmethod
@@ -149,7 +157,9 @@ class LLMClient:
         if self.provider == "offline":
             generation = self._generate_offline(task_kind, bundle, context)
         elif self.provider == "openai_compatible":
-            generation = self._generate_openai(task_kind, bundle, tools=tools, extra_messages=extra_messages)
+            generation = self._generate_openai(
+                task_kind, bundle, context=context, tools=tools, extra_messages=extra_messages,
+            )
         else:
             raise AgentError(f"未知的 llm.provider: {self.provider}")
         generation.latency_ms = int((time.time() - started) * 1000)
@@ -180,6 +190,7 @@ class LLMClient:
         task_kind: str,
         bundle: PromptBundle,
         *,
+        context: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         extra_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Generation:
@@ -195,12 +206,24 @@ class LLMClient:
                 f"② 环境变量 {api_key_env}；③ 前端表单 / CLI --api-key。"
                 "如需无 Key 运行请把配置切回 provider=offline"
             )
-        payload = self._build_payload(bundle, tools=tools, extra_messages=extra_messages)
+        payload = self._build_payload(bundle, context=context, tools=tools, extra_messages=extra_messages)
         # json_mode 与 tools 互斥（见 _build_payload）：仅在真下了 response_format 时才校验可解析性
         expect_json = bool(self.json_mode and not tools)
         ladder = self.downgrade_ladder[: self.empty_output_retry]
 
-        generation = self._attempt(payload, api_key, base_url)
+        try:
+            generation = self._attempt(payload, api_key, base_url)
+        except AgentError as exc:
+            # 图片降级（docs/16 的 01 文档 §3.2）：端点拒绝 image parts（400 且详情提及
+            # image/multimodal/vision）时去图重发一次，节点不失败，degraded 标记随 trace 留痕。
+            if self._payload_has_images(payload) and self._is_vision_error(str(exc)):
+                bare_payload = self._build_payload(
+                    bundle, context=None, tools=tools, extra_messages=extra_messages
+                )
+                generation = self._attempt(bare_payload, api_key, base_url)
+                generation.degraded = True
+            else:
+                raise
         step = 0
         # 降级链：首次结果不可用 → 按 ladder 逐级换 reasoning_effort 重发。
         # 不可用 = 被预算截断 / 网关超时，或（降级档）正文为空、解析失败。
@@ -251,13 +274,14 @@ class LLMClient:
         self,
         bundle: PromptBundle,
         *,
+        context: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         extra_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """组装 /chat/completions 请求体（token 预算与思考强度集中在此，便于审计）。"""
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": bundle.system},
-            {"role": "user", "content": bundle.user},
+            {"role": "user", "content": self._user_content(bundle, context)},
         ]
         messages.extend(extra_messages or [])
         payload: Dict[str, Any] = {
@@ -275,6 +299,53 @@ class LLMClient:
             payload["tools"] = tools
             payload["tool_choice"] = self.tool_choice
         return payload
+
+    # ---------------------------------------------------------------- 图片输入
+    def _user_content(self, bundle: PromptBundle, context: Optional[Dict[str, Any]]) -> Any:
+        """user content：默认纯文本；images 非空且 vision.enabled 时改 parts 数组（唯一组装点）。
+
+        base64 读取与大小二次校验都在这里完成（Leader 已校验过一次，这里是防线）。
+        """
+        images = list((context or {}).get("images") or [])
+        if not images or not self.vision_enabled:
+            return bundle.user
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": bundle.user}]
+        for item in images:
+            part = self._image_part(item)
+            if part:
+                parts.append(part)
+        # 所有图片都不可用时退回纯文本，不阻断节点（图片只进 intake，缺图不影响下游）
+        return parts if len(parts) > 1 else bundle.user
+
+    def _image_part(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        path = Path(str(item.get("path") or ""))
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise AgentError(f"读取附图失败（{path}）: {exc}") from exc
+        if len(data) > self.vision_max_image_bytes:
+            raise AgentError(
+                f"附图 {path.name} 超过单张上限 {self.vision_max_image_bytes // 1024}KB"
+            )
+        mime = str(item.get("mime") or "image/png")
+        encoded = base64.b64encode(data).decode("ascii")
+        url = f"data:{mime};base64,{encoded}" if self.vision_url_style == "data_uri" else encoded
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    @staticmethod
+    def _payload_has_images(payload: Dict[str, Any]) -> bool:
+        for message in payload.get("messages") or []:
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url" for part in content
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _is_vision_error(detail: str) -> bool:
+        lowered = str(detail).lower()
+        return any(word in lowered for word in ("image", "multimodal", "vision"))
 
     def _request_generation(
         self, payload: Dict[str, Any], api_key: str, base_url: str
@@ -363,8 +434,12 @@ class LLMClient:
                 detail = exc.read().decode("utf-8", errors="replace")[:400]
                 last_error = f"LLM 调用失败 HTTP {exc.code}: {detail}"
                 retryable = exc.code == 429 or exc.code >= 500
-            except (TimeoutError, urllib.error.URLError) as exc:
-                # 与 _post_with_retry 同一语义：读阶段超时是 TimeoutError（非 URLError 子类）
+            except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+                # 与 _post_with_retry 同一语义：读阶段超时是 TimeoutError（非 URLError 子类）；
+                # 连接建立 / 响应头读取阶段被对端 RST 或拒连时，urlopen 抛的是裸
+                # ConnectionResetError / ConnectionRefusedError（WinError 10054 / 10061，
+                # 同样不是 URLError 子类）——实测这两类异常会绕过本 except 直接穿透到
+                # Agent 层把节点判死，瞬时网络抖动因此一次致命，必须一并按可重试处理。
                 last_error = f"LLM 超时/网络异常: {exc}"
                 retryable = True
             if not retryable or attempt == attempts:
@@ -437,10 +512,12 @@ class LLMClient:
                 detail = exc.read().decode("utf-8", errors="replace")[:400]
                 last_error = f"LLM 调用失败 HTTP {exc.code}: {detail}"
                 retryable = exc.code == 429 or exc.code >= 500
-            except (TimeoutError, urllib.error.URLError) as exc:
+            except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
                 # 网关在 300s 处强制断开（openresty 504）；客户端读超时是同一语义。
                 # 原实现只捕 URLError，而 urlopen 读阶段抛的是 TimeoutError（非 URLError 子类），
                 # 导致这类超时光既不重试也未被归类，直接穿透。
+                # 连接建立 / 响应头读取阶段的裸 ConnectionResetError / ConnectionRefusedError
+                # （WinError 10054 / 10061）同理，一并纳入可重试（与流式路径同一分类口径）。
                 last_error = f"LLM 超时/网络异常: {exc}"
                 retryable = True
             if not retryable or attempt == attempts:

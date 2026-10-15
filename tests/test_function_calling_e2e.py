@@ -152,6 +152,10 @@ class FunctionCallingE2ETests(unittest.TestCase):
         # 真实配置（项目 config），config_dir 指向临时目录并写入 mcp.yaml
         self.config = load_config(PROJECT_ROOT / "config", workspace=self.root / "workspace")
         self.config.runtime["verbose"] = False
+        # 本文件验证的是 function calling 线上协议（节点=implement）；节点隔离（tools_nodes）
+        # 默认只对 intake 生效，此处显式放开为「全部节点」，使协议验证独立于该默认值。
+        # 节点隔离本身的断言见 tests/test_websearch.py。
+        self.config.llm["tools_nodes"] = []
         self.config.config_dir = self.root / "config"
         (self.root / "config").mkdir(parents=True, exist_ok=True)
         (self.root / "config" / "mcp.yaml").write_text(json.dumps({"servers": [{

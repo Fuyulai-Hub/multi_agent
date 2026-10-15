@@ -49,9 +49,23 @@
           </div>
         </div>
         <textarea id="new-requirement" rows="9"
-          placeholder="输入你的需求……&#10;&#10;离线 Provider 需使用结构化 Markdown（点下方「载入示例模板」查看格式）；&#10;配置真实 LLM 后可直接输入任意自然语言。"></textarea>
+          placeholder="输入你的需求……&#10;&#10;离线 Provider 需使用结构化 Markdown（点下方「载入示例模板」查看格式）；&#10;配置真实 LLM 后可直接输入任意自然语言；&#10;支持直接粘贴截图 / 图片，或粘贴复制的文档文件（与上方按钮上传同链路）。"></textarea>
+        <div id="image-tray" class="image-tray" hidden></div>
         <div class="composer-bar">
           <button id="load-example" class="ghost-btn">载入示例模板</button>
+          <label id="upload-doc-btn" class="ghost-btn"
+            title="上传需求文档：md/txt/markdown/csv/json/yaml/docx 可直接解析；PDF/pptx/xlsx 需先在 config/mcp.yaml 配置文档解析 MCP 服务">
+            上传需求文档
+            <input id="upload-doc" type="file" hidden
+              accept=".md,.markdown,.txt,.text,.csv,.json,.yaml,.yml,.rst,.docx,.pdf,.pptx,.xlsx">
+          </label>
+          <label id="upload-image-btn" class="ghost-btn"
+            title="上传需求附图：png/jpg/jpeg/webp/gif，单张 ≤5MB、最多 4 张；图片随需求文字一起进入流水线并存档到运行目录（读图需在 config/system.yaml 开启 llm.vision，默认关闭）">
+            上传图片
+            <input id="upload-image" type="file" hidden multiple
+              accept="image/png,image/jpeg,image/webp,image/gif">
+          </label>
+          <span id="upload-name" class="composer-status"></span>
           <div id="context-usage" class="ctx" title="当前所选运行的单次调用上下文峰值占用">
             <div class="ctx-bar"><div class="ctx-fill"></div></div>
             <span class="ctx-text">上下文 --</span>
@@ -64,7 +78,7 @@
       <div class="chat">
         <div class="panel-title">
           <h2>对话</h2>
-          <span class="chat-hint">Enter 发送 · Shift+Enter 换行 · 上一个任务进行中也可继续发送新需求</span>
+          <span class="chat-hint">Enter 发送 · Shift+Enter 换行 · 可直接粘贴截图 / 复制的文件 · 上一个任务进行中也可继续发送新需求</span>
         </div>
         <div id="chat-messages" class="chat-messages"></div>
       </div>
