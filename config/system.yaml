@@ -100,7 +100,35 @@ runtime:
     server: "playwright"          # mcp.yaml 中已注册且 enabled 的服务名
     timeout: 300                  # 单次 UI 探测总超时（秒），独立于 sandbox_timeout
   save_prompts: true              # 落盘每次 Prompt（含分层经验注入证据）
-  prompt_artifact_max_chars: 10000  # Prompt 感知段单产物最大字符数：默认 900 会把 12 功能点的需求规格截到只剩 3 个 FP 片段（研发/测试/审查全程信息残缺，实测根因之一）
+  # 技能注入（config/skills/*/SKILL.md → 节点 Prompt）：默认开启。
+  # 关闭时 Prompt 与改造前逐字节一致；开启后每个节点执行前做确定性匹配（规则见 mas/skills.py 的 score_skill）：
+  #   trigger.requires_artifacts 对黑板实际产物、trigger.nodes/roles 对当前节点/角色、
+  #   trigger.keywords 对需求文本、trigger.intents 对节点标签集合。
+  # 命中即把该技能 SKILL.md 的**全文**注入 user prompt（# 技能注入 段，位于交付契约之前）：
+  # front-matter 的 steps/checkpoints/error_handling 作为提要索引在前，正文全文在后，
+  # 与通用 Agent 宿主「技能命中即加载整份文档」的做法一致。
+  # 同时落skill_matched 事件（含每篇 body_chars 与是否截断）+ prompts/*.md 头部的 skills=[...] 证据。
+  # 目录里 sp-* 前缀的 15 个技能适配自 github.com/obra/superpowers（v7.0.0, commit bb92a77），
+  # 由 `python tools/import_superpowers_skills.py` 生成（幂等），见 docs/29。
+  skills:
+    enabled: true
+    # 技能工具（function calling）：把声明了 `tool.script` 的技能注册为 `skill_<id>` 工具，
+    # 模型发起 tools/call 时由沙箱（root=技能目录）执行技能自带脚本，stdout 回灌给模型续跑。
+    # 与上面的文本注入相互独立：文本注入约束「怎么做」（方法本体全文），工具调用提供
+    # 「可执行动作」（scripts/*.py）；方法本体无法变成调用，只能走文本路径。
+    # 开启后需配合 llm.tools_nodes 决定哪些节点下发工具（tools 与 response_format 互斥）。
+    tools_enabled: false
+    tools_timeout_s: 60           # 单次技能脚本执行超时（秒），独立于 sandbox_timeout
+    max_items: 3                  # 单节点最多注入几个技能（按匹配度降序）
+    min_score: 1                  # 匹配度阈值：1=作用域命中即注入
+    # 注入段总字符预算。全文注入要求文档完整到达，因此按「满配不截断」取值：
+    # max_items=3 时可能命中的正文最大的三篇（subagent-driven-development 32958 +
+    # writing-skills 27148 + executing-plans 20789）合计 80895 字符，留出段头与索引
+    # 开销后取 88000。0=不截断（自行承担上下文增长）。
+    # 参照量级：模型上下文窗口 131072 token 起（DeepSeek），英文正文约 4 字符/token，
+    # 故满配注入约占窗口 1/4 以内；实际各节点按绑定技能注入，实测 4.6k~39k 字符。
+    max_chars: 88000
+  prompt_artifact_max_chars: 10000  # Prompt 感知段单产物最大字符数：调高前的历史默认 900 会把 12 功能点的需求规格截到只剩 3 个 FP 片段（研发/测试/审查全程信息残缺，实测根因之一）；代码未配置时默认同为 10000
   # 上下文压缩（docs/16 的 02 文档）：默认关闭，enabled=false 时恒等返回，行为与现状逐字节一致。
   # 开启后按白名单策略做结构化压缩（保 FP 的 id/title/rules、丢 samples/parameters 等明细），
   # 并向上游事件流发 context_compressed（含 before/after 字符数）；压缩不改黑板 artifact 数据。
@@ -110,6 +138,50 @@ runtime:
     total_chars: 32000           # 感知段总量预算；超出时按优先级裁剪低优先级明细
     llm_summary: false           # 可选 LLM 摘要（默认关：每次新增 LLM 调用都叠加网关超时风险）
   tool_result_max_chars: 4000    # tool 结果统一截断（头 60% + 尾 40%），0=不截断
+  # 数据存储后端（docs/25）：MySQL=索引/结构层（经验库/运行索引/产物索引），
+  # Redis=跨进程协调层（运行注册表+心跳+取消键）。enabled=false 时全部走既有
+  # jsonl/内存路径，行为与现状逐字节一致；任一后端连接失败也自动降级不报错。
+  # 连接参数优先级：环境变量 > config/credentials.yaml 的 store 段 > 此处默认值
+  # （密码只从环境变量/凭据文件注入，不写进本文件）。
+  store:
+    enabled: true
+    mysql:
+      enabled: true
+      host: "127.0.0.1"            # 本机 Docker 容器 mas-mysql（-p 3306:3306）
+      port: 3306
+      user: "mas"
+      database: "multi_agent"
+      host_env: "MAS_MYSQL_HOST"
+      port_env: "MAS_MYSQL_PORT"
+      user_env: "MAS_MYSQL_USER"
+      password_env: "MAS_MYSQL_PASSWORD"
+      database_env: "MAS_MYSQL_DB"
+    redis:
+      enabled: true
+      url: "redis://127.0.0.1:6379/0"   # 本机 Docker 容器 mas-redis（-p 6379:6379）
+      url_env: "MAS_REDIS_URL"
+      heartbeat_ttl_s: 90          # 运行心跳 TTL：Leader 每个节点边界续期，到期=中断
+      cache_ttl_s: 15              # 读缓存 TTL（当前仅 /api/store/status 之外的预留给后续接入）
+  # 消息队列（Redis Streams；连接复用 runtime.store.redis，故 store 不可用时自动降级）。
+  # 解决两个真实问题：① API 与运行生命周期解耦（任务队列 + 独立 worker）；
+  # ② Agent 消息走 broker 投递（每角色独立消费组，ACK + PEL 认领 + 重试 + 死信）。
+  # mode: auto=优先独立 worker，无 worker 时 API 内嵌一个消费线程；queue=只入队；
+  #       thread=完全走改造前的进程内线程（默认值之外的兼容通道）。
+  mq:
+    enabled: true
+    mode: "auto"
+    stream_prefix: "mas:mq"
+    consumer_group: "mas-workers"
+    max_attempts: 3                  # 失败重投上限，达到后进 DLQ（mas:mq:dlq:runs）
+    visibility_timeout_ms: 600000    # worker 崩溃后，其 PEL 消息被其他消费者认领的空闲门槛
+    retry_backoff_s: [5, 30, 120]    # 退避阶梯（秒）
+    dedup_ttl_s: 86400               # 生产端幂等键 TTL（同一 run_id 不重复入队）
+    stream_maxlen: 20000             # 单 Stream 近似上限，防止无限增长
+    stream_ttl_s: 604800             # 7 天：按 run 隔离的 agent/events 流自动回收
+    queue_ttl_s: 3600                # 排队中的运行注册键 TTL（取消按钮在领取前也生效）
+    poll_ms: 1000                    # worker XREADGROUP 阻塞时长
+    agent_bus:
+      enabled: true                  # Agent 消息写 Redis Stream；关闭后只保留 jsonl 主路径
   max_steps: 40                   # 单次运行最大状态推进步数（防死循环）
   run_id_format: "%Y%m%d-%H%M%S"
   fail_fast: false

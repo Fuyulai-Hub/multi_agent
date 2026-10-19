@@ -1,7 +1,7 @@
 """前端数据服务：仅依赖 Python 标准库。
 
 用法：
-    python frontend/server.py [--port 8000] [--workspace workspace]
+    python frontend/server.py [--host 127.0.0.1] [--port 8000] [--workspace workspace]
 
 API：
     GET /api/runs                    运行列表（含摘要指标）
@@ -10,11 +10,18 @@ API：
     GET /api/metrics                 每轮效果指标
     GET /api/learning-report         自学习效果报告（Markdown）
     GET /api/llm                     当前 LLM 配置与凭据（Key 脱敏/回显、来源标注）
+    GET /api/skills                  技能开关（runtime.skills.enabled / tools_enabled，与 system.yaml 同名同义）
+    GET /api/store/status            MySQL/Redis 存储后端健康报告（docs/25）
+    GET /api/mq/status               消息队列健康：运行流积压 / PEL / DLQ / worker（docs/26）
     POST /api/run                     发起一次流水线（requirement 文字 / requirement_path 上传文件，二选一；可另带 images 附图路径数组）
+                                       runtime.mq 启用时只入队（返回 status=queued），由 worker 消费执行
+    POST /api/run/cancel              终止进行中的运行（置取消信号，Leader 在当前节点执行完毕后协作式退出）
     POST /api/upload                  上传需求文档（base64 JSON，落盘 workspace/uploads/）
+    POST /api/upload/remove           取消一次已上传的需求文档（删除 uploads/ 内暂存文件）
     POST /api/upload_image            上传对话附图（base64 JSON，图片后缀白名单，落盘 workspace/uploads/）
     POST /api/llm                     保存 provider/model 到 system.yaml，凭据到 credentials.yaml
     POST /api/llm/test               用给定凭据探测 BASE_URL 的 /models，验证 Key 是否可用
+    POST /api/skills                 保存技能开关到 system.yaml（下一次运行生效，无需重启服务）
 静态文件：/ 直接映射本目录（index.html / app.js / style.css）
 """
 
@@ -66,6 +73,26 @@ def read_jsonl(path: Path) -> list[dict]:
 # 避免这类记录在列表里长期停在"进行中"（正常跑的流水线每隔几秒就有新事件）
 RUN_STALE_SECONDS = 600
 
+# 本服务进程内「进行中运行」注册表：run_id -> 取消信号（threading.Event）。
+# POST /api/run/cancel 在此设置信号；Leader 在下一个节点边界检查到后退出并收尾
+# （run_summary.canceled=true）。只登记本进程 POST /api/run 发起的运行——
+# CLI 或其他进程启动的运行不在此表，接口对这类请求如实报错（不伪造成送达）。
+RUNNING_TASKS: dict[str, threading.Event] = {}
+
+# 存储后端与运行注册表（docs/25）：由 main() 启动时构建，None = 未接入/不可用。
+# 不做 import 时自动构建——测试与脚本直接调用 load_runs/start_run 时零外部依赖，
+# 行为与改造前逐字节一致。REGISTRY 非 None 时：
+# - Redis 可用 → RedisRunRegistry（CLI 等跨进程发起的运行在本面板可见、可终止）；
+# - 否则 → MemoryRunRegistry(events_map=RUNNING_TASKS)（与上表共享，同进程路径不变）。
+BACKENDS: object | None = None
+REGISTRY: object | None = None
+
+# 消息队列（docs/26）：main() 启动时装配；None = 未启用/不可用，POST /api/run 走既有线程路径。
+# RUN_QUEUE 非 None 时运行任务只入队；mode=auto 时本进程内嵌一个 worker（独立进程见 mas worker）。
+RUN_QUEUE: object | None = None
+MQ_SETTINGS: dict = {}
+WORKER: object | None = None
+
 
 def run_finished(run_dir: Path, run_id: str) -> bool:
     """判定一次运行是否已结束：产出 run_summary，或异常终止（error.log / 事件长期无新增）。"""
@@ -82,8 +109,20 @@ def run_finished(run_dir: Path, run_id: str) -> bool:
         return True
 
 
+def read_queued(run_dir: Path) -> dict:
+    """读取排队标记（MQ 入队时写入）：队列中的运行在 worker 领取前也能在列表里看到。"""
+    path = run_dir / "queued.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _running_summary(run_dir: Path, run_id: str) -> dict:
-    """尚无 run_summary.json 的运行：从事件日志推导实时摘要（运行中或已中断）。"""
+    """尚无 run_summary.json 的运行：从事件日志推导实时摘要（排队/运行中/已中断）。"""
     title = ""
     steps = 0
     ts = None
@@ -96,6 +135,10 @@ def _running_summary(run_dir: Path, run_id: str) -> dict:
         if event.get("type") == "node_start":
             steps += 1
     ended = run_finished(run_dir, run_id)   # True = 已中断结束（无验收结论，按未通过计）
+    queued = read_queued(run_dir)
+    is_queued = bool(queued) and steps == 0 and not ended
+    title = title or str(queued.get("title") or "")
+    ts = ts or queued.get("queued_at")
     return {
         "run_id": run_id,
         "requirement_title": title,
@@ -107,10 +150,12 @@ def _running_summary(run_dir: Path, run_id: str) -> dict:
         "bugs_fixed": 0,
         "duration_s": None,
         "injected_experiences": None,
-        "profile": None,
+        "profile": queued.get("profile"),
         "ts": ts,
         "finished": ended,            # False = 进行中
-        "status": "已完成" if ended else "进行中",
+        "status": "已完成" if ended else ("排队中" if is_queued else "进行中"),
+        "queued": is_queued,
+        "canceled": False,            # 取消标记只由 Leader 收尾写入 run_summary.canceled
         "error": ended,
     }
 
@@ -143,6 +188,7 @@ def load_runs(workspace: Path) -> list[dict]:
             except (json.JSONDecodeError, OSError):
                 continue
             metrics = data.get("metrics") or {}
+            canceled = bool(data.get("canceled"))
             runs.append({
                 "run_id": data.get("run_id") or run_id,
                 "requirement_title": data.get("requirement_title"),
@@ -157,7 +203,8 @@ def load_runs(workspace: Path) -> list[dict]:
                 "profile": metrics.get("profile"),
                 "ts": metrics.get("ts"),
                 "finished": True,
-                "status": "已完成",
+                "status": "已终止" if canceled else "已完成",
+                "canceled": canceled,
                 "error": False,
             })
         elif (run_dir / "events.jsonl").exists():
@@ -177,10 +224,17 @@ def load_run_detail(workspace: Path, run_id: str) -> dict | None:
     timeline_path = run_dir / "timeline.md"
     # 无 run_summary.json 即仍在运行（error.log / 事件长期无新增视为已中断结束）
     finished = run_finished(run_dir, run_id)
+    canceled = bool((summary or {}).get("canceled"))
+    queued = read_queued(run_dir)
+    is_queued = bool(queued) and not finished and not read_jsonl(events_path)
     return {
+        "run_id": run_id,             # 终止按钮需要 run_id（运行中 summary 不存在，不能从 summary 取）
         "summary": summary,
         "finished": finished,
-        "status": "已完成" if finished else "进行中",
+        "canceled": canceled,
+        "queued": is_queued,
+        "status": "已终止" if canceled else (
+            "已完成" if finished else ("排队中" if is_queued else "进行中")),
         "events": read_jsonl(events_path),
         "llm_traces": read_jsonl(run_dir / "llm_traces.jsonl"),
         "report": report_path.read_text(encoding="utf-8") if report_path.exists() else "",
@@ -284,8 +338,116 @@ def save_llm_defaults(
             elif key == "context_window" and context_window:
                 line = f"  context_window: {context_window}"
         out.append(line)
-    SYSTEM_YAML.write_text("\n".join(out) + "\n", encoding="utf-8")
+    SYSTEM_YAML.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
     return load_llm_defaults()
+
+
+# ---------------- 技能开关（runtime.skills.enabled / tools_enabled）----------------
+# 与「模型配置」同一模式：读取走 load_config、写回走 system.yaml 的行级替换（保留注释与格式）。
+# 生效方式：面板服务与 /api/run 均不缓存配置——每次 POST /api/run 都在 start_run() 里
+# 重新 load_config()，因此保存后「下一次运行」即生效，无需重启面板或 CLI；
+# 正在运行中的流水线其 config 已在启动时构建，不受此次变更影响。
+
+
+def load_skills_switch() -> dict:
+    """读取技能开关（字段名与 system.yaml 的 runtime.skills 子键完全一致）。"""
+    from mas.config import load_config
+
+    config = load_config(PROJECT_ROOT / "config")
+    skills = dict(config.runtime.get("skills") or {})
+    return {
+        "enabled": bool(skills.get("enabled", False)),
+        "tools_enabled": bool(skills.get("tools_enabled", False)),
+    }
+
+
+def load_mq_status(run_id: str | None = None) -> dict:
+    """消息队列健康报告：运行流积压/PEL、DLQ、延迟重试、在线 worker、Agent 事件流。"""
+    try:
+        from mas.config import load_config
+        from mas.mq import mq_status
+
+        config = load_config(PROJECT_ROOT / "config", workspace=str(Handler.workspace))
+        report = mq_status(config, PROJECT_ROOT / "config", run_id=run_id)
+        report["embedded_worker"] = WORKER.status() if WORKER is not None else None
+        return report
+    except Exception as exc:  # noqa: BLE001 - 状态接口永不 500
+        return {"enabled": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def load_store_status() -> dict:
+    """MySQL/Redis 存储后端健康报告（docs/25；供面板展示接入状态）。
+
+    只读探测：不影响任何进行中的运行；任何异常都收敛成 ``ok=False`` 的报告项，
+    不向面板抛 500（面板应始终能渲染）。
+    """
+    try:
+        from mas.config import load_config
+        from mas.store import store_status
+
+        config = load_config(PROJECT_ROOT / "config", workspace=str(Handler.workspace))
+        return store_status(config, PROJECT_ROOT / "config")
+    except Exception as exc:  # noqa: BLE001 - 状态接口永不 500
+        return {
+            "enabled": False,
+            "mysql": {"ok": False, "reason": f"{type(exc).__name__}: {exc}"},
+            "redis": {"ok": False, "reason": f"{type(exc).__name__}: {exc}"},
+        }
+
+
+def _rewrite_skills_switches(text: str, enabled: bool, tools_enabled: bool) -> str:
+    """行级替换 runtime.skills 下的两个开关，保留注释与其余内容原样。
+
+    必须跟踪三层缩进定位（runtime → skills → 键）后精确替换，不能只按
+    「4 空格缩进的 enabled」匹配：llm.vision.enabled、runtime.ui_probe.enabled、
+    runtime.context_compression.enabled 等同名键在其他段同样存在，误改任意一个
+    都会造成不可预期的行为变化。目标键缺失时报 ValueError（不猜测插入位置）。
+    """
+    import re
+
+    found = {"enabled": False, "tools_enabled": False}
+    out: list[str] = []
+    top = ""       # 当前顶层键（无缩进）
+    second = ""    # 当前二级键（2 空格缩进）
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):       # 注释行不改变层级状态
+            out.append(line)
+            continue
+        m_top = re.match(r"^([^\s#][^:]*):", line)
+        m_second = re.match(r"^  ([^\s#][^:]*):", line)
+        m_third = re.match(r"^    ([^\s#][^:]*):", line)
+        if m_top:
+            top, second = m_top.group(1), ""
+        elif m_second:
+            second = m_second.group(1)
+        elif m_third and top == "runtime" and second == "skills":
+            key = m_third.group(1)
+            if key in found:
+                value = enabled if key == "enabled" else tools_enabled
+                line = f"    {key}: {str(value).lower()}"
+                found[key] = True
+        out.append(line)
+    missing = [key for key, hit in found.items() if not hit]
+    if missing:
+        raise ValueError(f"config/system.yaml 的 runtime.skills 缺少字段: {', '.join(missing)}")
+    return "\n".join(out) + "\n"
+
+
+def save_skills_switch(enabled: bool, tools_enabled: bool) -> dict:
+    """把两个开关写回 system.yaml（写回后下一次运行生效，无需重启，见本节注释）。
+
+    ``newline="\\n"``：Windows 下 ``Path.write_text`` 默认会把 ``\\n`` 转成 ``\\r\\n``，
+    整份配置文件的换行符会因此被改写（git 全文件 diff）。写回承诺是「只改目标行、
+    其余逐字节保留」，必须显式关闭换行转换（save_llm_defaults 同款修复）。
+    """
+    if not isinstance(enabled, bool) or not isinstance(tools_enabled, bool):
+        raise ValueError("enabled / tools_enabled 必须是布尔值（true/false）")
+    original = SYSTEM_YAML.read_text(encoding="utf-8")
+    SYSTEM_YAML.write_text(
+        _rewrite_skills_switches(original, enabled, tools_enabled),
+        encoding="utf-8", newline="\n",
+    )
+    return load_skills_switch()
 
 
 def test_llm_connection(api_key: str | None = None, base_url: str | None = None) -> dict:
@@ -327,6 +489,7 @@ def start_run(
     api_key: str | None = None,
     base_url: str | None = None,
     images: list[str] | None = None,
+    registry: object | None = None,
 ) -> str:
     """在后台线程中启动一次流水线，返回预分配的 run_id。
 
@@ -335,6 +498,13 @@ def start_run(
     ``images`` 为对话窗口上传的附图路径数组（经 ``POST /api/upload_image`` 落盘），
     透传给 ``Leader.run(images=...)``：校验/复制/元数据发布由 ``sources.prepare_images`` 负责，
     不传或为空时与改造前逐字节一致。
+
+    每次运行创建独立取消信号并登记进 ``RUNNING_TASKS``（``POST /api/run/cancel`` 置位），
+    线程结束时注销——注册表只覆盖本进程发起、且仍在运行中的任务。
+
+    ``registry``（docs/25 协调层，默认 None 行为不变）：非 None 时透传给
+    ``Leader.run(registry=...)``，使本次运行在 Redis 后端下跨进程可见、可被
+    CLI/其他终端取消；Leader 自己在 run() 的 finally 里注销，此处只提前登记。
     """
     from mas.config import load_config
     from mas.leader import Leader
@@ -358,18 +528,153 @@ def start_run(
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "events.jsonl").touch(exist_ok=True)
 
+    cancel_event = threading.Event()
+    RUNNING_TASKS[run_id] = cancel_event
+    if registry is not None:
+        try:
+            registry.register(run_id)   # 幂等；Redis 后端即跨进程心跳 + 可取消
+        except Exception:  # noqa: BLE001 - 协调层不可用不影响本进程取消通道
+            pass
+
     def worker() -> None:
         try:
             if requirement_path:
-                Leader(config).run(requirement_path, as_text=False, run_id=run_id, images=images)
+                Leader(config).run(requirement_path, as_text=False, run_id=run_id, images=images,
+                                   cancel_event=cancel_event, registry=registry)
             else:
-                Leader(config).run(requirement_text, as_text=True, run_id=run_id, images=images)
+                Leader(config).run(requirement_text, as_text=True, run_id=run_id, images=images,
+                                   cancel_event=cancel_event, registry=registry)
         except Exception as exc:  # 后台线程异常落盘，便于排查
             (workspace / "runs").mkdir(parents=True, exist_ok=True)
             (workspace / "runs" / f"{run_id}.error.log").write_text(str(exc), encoding="utf-8")
+        finally:
+            RUNNING_TASKS.pop(run_id, None)   # 线程结束即注销（成功/异常/终止均走到这里）
 
     threading.Thread(target=worker, daemon=True).start()
     return run_id
+
+
+def enqueue_run(
+    workspace: Path,
+    profile: str | None,
+    requirement_text: str,
+    requirement_path: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    images: list[str] | None = None,
+    registry: object | None = None,
+    queue: object | None = None,
+) -> dict:
+    """把一次运行投递到 Redis Stream（任务队列），不在 HTTP 进程内执行。
+
+    - API Key 存 Redis 一次性键（``mas:mq:secret:<run_id>``，TTL=queue_ttl_s），
+      任务 payload 只带 run_id 等非秘密字段，共享队列里永远看不到明文 Key；
+    - 排队即注册（registry，TTL 覆盖排队时长），因此「终止任务」在 worker 领取前也生效；
+    - 幂等：同一 run_id 的 dedup 键保证重复提交只入队一次。
+    """
+    from mas.config import load_config
+    from mas.mq import build_run_queue
+
+    config = load_config(PROJECT_ROOT / "config", profile=profile, workspace=str(workspace))
+    if provider:
+        if provider not in VALID_PROVIDERS:
+            raise ValueError(f"provider 非法: {provider}（{' | '.join(sorted(VALID_PROVIDERS))}）")
+    active_queue = queue or RUN_QUEUE or build_run_queue(config, PROJECT_ROOT / "config")
+    if active_queue is None:
+        raise ValueError("MQ 未启用或 Redis 不可用（见 GET /api/mq/status）")
+    stamp = datetime.now().strftime(str(config.runtime.get("run_id_format", "%Y%m%d-%H%M%S")))
+    run_id = f"{stamp}-{secrets.token_hex(2)}"
+    payload = {
+        "source": "frontend",
+        "requirement": requirement_text,
+        "as_text": not bool(requirement_path),
+        "workspace": str(Path(workspace).resolve()),
+        "profile": profile or config.profile,
+        "images": list(images or []),
+    }
+    if requirement_path:
+        payload["requirement_path"] = str(requirement_path)
+    if provider:
+        payload["provider"] = provider
+    if model:
+        payload["model"] = model
+    if base_url:
+        payload["base_url"] = base_url
+    if registry is not None:
+        try:
+            active_queue.register_queued_run(registry, run_id)   # 先注册：排队期间即可取消
+        except Exception:  # noqa: BLE001 - 协调层故障不影响入队
+            pass
+    try:
+        if api_key:
+            active_queue.mq.store_secret(run_id, api_key, ttl_s=active_queue.queue_ttl_s)
+        result = active_queue.enqueue(payload, run_id=run_id)
+    except Exception:
+        if registry is not None:
+            try:
+                registry.unregister(run_id)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    if not result.get("duplicate"):
+        # 队列中的运行在列表里可见：空事件文件满足 detail 端点，queued.json 提供标题/排队时间
+        run_dir = Path(workspace) / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "events.jsonl").touch(exist_ok=True)
+        title = Path(requirement_path).stem if requirement_path else requirement_text.strip()[:60]
+        (run_dir / "queued.json").write_text(json.dumps({
+            "run_id": run_id, "title": title, "queued_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "source": "frontend", "profile": profile or config.profile,
+            "transport": "redis-stream", "stream": result.get("stream"),
+            "entry_id": result.get("_stream_id"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "run_id": run_id,
+        "status": "duplicate" if result.get("duplicate") else "queued",
+        "transport": "redis-stream",
+        "stream": result.get("stream"),
+        "entry_id": result.get("_stream_id"),
+    }
+
+
+def cancel_run(run_id: str) -> dict:
+    """请求终止一次运行：置取消信号，Leader 在当前节点执行完毕后协作式退出。
+
+    返回 ``{"run_id", "status": "canceling"}``（异步语义：信号已送达，退出在下个边界发生）。
+    先查本进程 ``RUNNING_TASKS``（快路径）；未命中再查 ``REGISTRY``——Redis 后端下
+    CLI/其他进程发起的运行同样可在此终止。两者都没有时抛 ``ValueError``——
+    已完成，或从未注册（如实报错，不伪造送达）。
+    """
+    event = RUNNING_TASKS.get(run_id)
+    if event is not None:
+        event.set()
+        return {"run_id": run_id, "status": "canceling"}
+    registry = REGISTRY
+    if registry is not None:
+        try:
+            if registry.request_cancel(run_id):
+                return {"run_id": run_id, "status": "canceling"}
+        except Exception:  # noqa: BLE001 - 协调层异常按「不在运行中」处理
+            pass
+    raise ValueError(f"运行 {run_id} 不在本服务进行中（可能已完成，或由 CLI/其他进程启动）")
+
+
+def remove_upload(workspace: Path, path: str) -> dict:
+    """取消一次已上传但尚未发送的需求文档：删除 ``workspace/uploads/`` 内的暂存文件。
+
+    只允许删 uploads 目录内文件（resolve 后做目录校验，拒绝路径穿越）；文件不存在时
+    幂等返回 ``removed=False``（重复点击/并发取消不报错）。
+    """
+    uploads_dir = (workspace / "uploads").resolve()
+    target = Path(path).resolve()
+    if target != uploads_dir and uploads_dir not in target.parents:
+        raise ValueError(f"只能移除 uploads 目录内的文件: {path}")
+    existed = target.is_file()
+    if existed:
+        target.unlink()
+    return {"removed": existed, "path": str(target)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -434,6 +739,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(path.read_text(encoding="utf-8") if path.exists() else "")
         elif route == "/api/llm":
             self._send_json(load_llm_defaults())
+        elif route == "/api/skills":
+            self._send_json(load_skills_switch())
+        elif route == "/api/store/status":
+            self._send_json(load_store_status())
+        elif route == "/api/mq/status":
+            self._send_json(load_mq_status((query.get("run_id") or [None])[0]))
         elif route == "/api/example":
             # 离线 Provider 只识别结构化 Markdown（### FP-xx 功能点），提供示例作为输入模板
             path = PROJECT_ROOT / "examples" / "requirements" / "order_pricing_service.md"
@@ -443,7 +754,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802（标准库命名）
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/run", "/api/upload", "/api/upload_image", "/api/llm", "/api/llm/test"):
+        if parsed.path not in ("/api/run", "/api/run/cancel", "/api/upload", "/api/upload/remove",
+                               "/api/upload_image", "/api/llm", "/api/llm/test", "/api/skills"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -452,6 +764,26 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw)
         except json.JSONDecodeError:
             self._send_json({"error": "请求体不是合法 JSON"}, 400)
+            return
+        if parsed.path == "/api/run/cancel":
+            run_id = str(data.get("run_id") or "").strip()
+            if not run_id:
+                self._send_json({"error": "run_id 不能为空"}, 400)
+                return
+            try:
+                self._send_json(cancel_run(run_id))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 404)
+            return
+        if parsed.path == "/api/upload/remove":
+            path = str(data.get("path") or "").strip()
+            if not path:
+                self._send_json({"error": "path 不能为空"}, 400)
+                return
+            try:
+                self._send_json(remove_upload(self.workspace, path))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
             return
         if parsed.path == "/api/upload":
             self._handle_upload(data)
@@ -484,6 +816,18 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as exc:
                 self._send_json({"error": str(exc)}, 400)
             return
+        if parsed.path == "/api/skills":
+            enabled = data.get("enabled")
+            tools_enabled = data.get("tools_enabled")
+            if not isinstance(enabled, bool) or not isinstance(tools_enabled, bool):
+                self._send_json(
+                    {"error": "enabled / tools_enabled 必须是布尔值（true/false）"}, 400)
+                return
+            try:
+                self._send_json(save_skills_switch(enabled, tools_enabled))
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+            return
         requirement = str(data.get("requirement") or "").strip()
         requirement_path = str(data.get("requirement_path") or "").strip()
         # 两段式上传（docs/16 的 04 文档）：requirement_path 走文件通道，与文字需求二选一
@@ -511,10 +855,24 @@ class Handler(BaseHTTPRequestHandler):
         model = (data.get("model") or "").strip() or None
         api_key = (data.get("api_key") or "").strip() or None
         base_url = (data.get("base_url") or "").strip() or None
+        if RUN_QUEUE is not None:
+            # MQ 路径：HTTP 线程只负责入队（毫秒级），长任务由 worker 消费执行
+            try:
+                result = enqueue_run(
+                    self.workspace, profile, requirement, requirement_path=requirement_path or None,
+                    provider=provider, model=model, api_key=api_key, base_url=base_url,
+                    images=images, registry=REGISTRY, queue=RUN_QUEUE,
+                )
+            except Exception as exc:
+                self._send_json({"error": f"入队失败：{exc}"}, 400)
+                return
+            self._send_json(result)
+            return
         try:
             run_id = start_run(
                 self.workspace, profile, requirement, requirement_path=requirement_path or None,
                 provider=provider, model=model, api_key=api_key, base_url=base_url, images=images,
+                registry=REGISTRY,
             )
         except Exception as exc:
             self._send_json({"error": f"启动失败：{exc}"}, 400)
@@ -575,12 +933,64 @@ def main() -> int:
         return 2
     Handler.workspace = workspace
 
+    # 存储后端 + 运行注册表（docs/25）：任何失败都降级为 None，面板按既有路径工作。
+    # Redis 可用 → 跨进程注册表（CLI 发起的运行在本面板可见、可终止）；
+    # 否则 → 内存版共享 RUNNING_TASKS（同进程取消路径逐字节不变）。
+    global BACKENDS, REGISTRY, RUN_QUEUE, MQ_SETTINGS, WORKER
+    try:
+        from mas.config import load_config
+        from mas.runhub import MemoryRunRegistry, RedisRunRegistry
+        from mas.store import build_backends
+
+        config = load_config(PROJECT_ROOT / "config", workspace=str(workspace))
+        BACKENDS = build_backends(config, PROJECT_ROOT / "config")
+        if BACKENDS.redis is not None:
+            REGISTRY = RedisRunRegistry(BACKENDS.redis)
+        else:
+            REGISTRY = MemoryRunRegistry(events_map=RUNNING_TASKS)
+
+        # 消息队列（docs/26）：mode=thread 保持旧行为；auto/queue 走 Redis Stream 入队。
+        # auto 额外在本进程内嵌一个 worker（独立进程仍可横向扩容，消费组自动分摊）。
+        from mas.mq import build_run_queue, resolve_mq_settings
+
+        MQ_SETTINGS = resolve_mq_settings(config, PROJECT_ROOT / "config")
+        if MQ_SETTINGS.get("enabled") and MQ_SETTINGS.get("mode") != "thread":
+            RUN_QUEUE = build_run_queue(config, PROJECT_ROOT / "config", settings=MQ_SETTINGS)
+            if RUN_QUEUE is not None and MQ_SETTINGS.get("mode", "auto") == "auto":
+                from mas.worker import RunWorker
+
+                WORKER = RunWorker(config, queue=RUN_QUEUE, registry=REGISTRY)
+                WORKER.start()
+    except Exception:  # noqa: BLE001 - 存储/MQ 不可用不影响面板启动
+        BACKENDS, REGISTRY, RUN_QUEUE, WORKER = None, None, None, None
+
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"前端面板：http://{args.host}:{args.port}  （数据目录：{workspace}）")
+    if BACKENDS is not None and BACKENDS.any_enabled:
+        print(f"存储后端：MySQL={'已连接' if BACKENDS.mysql is not None else '未连接'}，"
+              f"Redis={'已连接' if BACKENDS.redis is not None else '未连接'}"
+              f"（注册表：{'跨进程' if REGISTRY.__class__.__name__ == 'RedisRunRegistry' else '进程内'}）")
+    elif BACKENDS is not None:
+        print("存储后端：未启用或连接失败（store.enabled / 服务状态见 GET /api/store/status），"
+              "流水线按既有 jsonl/内存路径运行")
+    if RUN_QUEUE is not None:
+        mode = str(MQ_SETTINGS.get("mode") or "auto")
+        print(f"消息队列：Redis Streams｜mode={mode}"
+              f"｜stream={RUN_QUEUE.mq.stream_key(RUN_QUEUE.STREAM)}｜group={RUN_QUEUE.group}")
+        if WORKER is not None:
+            print(f"内嵌 worker：{WORKER.worker_id}（POST /api/run 只入队，本进程消费执行）")
+        else:
+            print("未启动内嵌 worker：请运行 `python -m mas worker` 消费队列"
+                  "（面板仍可查看 GET /api/mq/status）")
+    else:
+        print("消息队列：未启用（POST /api/run 在面板进程内启动线程执行）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        if WORKER is not None:
+            WORKER.stop()
     return 0
 
 

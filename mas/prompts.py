@@ -34,6 +34,7 @@ class PromptBundle:
     user: str
     context: Dict[str, Any] = field(default_factory=dict)
     experiences: List[Dict[str, Any]] = field(default_factory=list)
+    skills: List[Dict[str, Any]] = field(default_factory=list)
     token_estimate: int = 0
     tier_counts: Dict[str, int] = field(default_factory=dict)
     path: Optional[Path] = None
@@ -45,6 +46,7 @@ class PromptBundle:
         return (
             f"role={self.role} node={self.node} iteration={self.iteration} "
             f"tokens≈{self.token_estimate} experience_injected={len(self.experiences)} tiers={self.tier_counts}"
+            + (f" skills={[item['id'] for item in self.skills]}" if self.skills else "")
         )
 
 
@@ -74,6 +76,8 @@ class PromptBuilder:
         missing: List[str],
         experience: RetrievalResult,
         contract: Dict[str, Any],
+        skills_text: str = "",
+        skill_matches: Optional[List[Dict[str, Any]]] = None,
         extra: Optional[Dict[str, Any]] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> PromptBundle:
@@ -89,6 +93,7 @@ class PromptBuilder:
             perception=perception,
             missing=missing,
             experience_text=experience.text,
+            skills_text=skills_text,
             contract=contract,
             images=list((context or {}).get("images") or []),
         )
@@ -114,6 +119,7 @@ class PromptBuilder:
                 for entry in experience.entries
             ],
             tier_counts={tier: len(items) for tier, items in experience.per_tier.items()},
+            skills=list(skill_matches or []),
             token_estimate=_estimate_tokens(system) + _estimate_tokens(user),
         )
         if extra:
@@ -160,6 +166,7 @@ class PromptBuilder:
         perception: List[str],
         missing: List[str],
         experience_text: str,
+        skills_text: str = "",
         contract: Dict[str, Any],
         images: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
@@ -206,6 +213,8 @@ class PromptBuilder:
                 ]
         if experience_text:
             lines += ["# 经验注入（按层级注入历史运行沉淀的经验）", experience_text, ""]
+        if skills_text:
+            lines += [skills_text, ""]
         lines += [
             "# 交付契约",
             "必须输出一个 JSON 对象，字段如下：",
@@ -224,7 +233,8 @@ class PromptBuilder:
         header = [
             f"<!-- run={self.run_dir.name} role={bundle.role} node={bundle.node} "
             f"task_kind={bundle.task_kind} iteration={bundle.iteration} "
-            f"tokens≈{bundle.token_estimate} injected={[e['id'] for e in bundle.experiences]} -->",
+            f"tokens≈{bundle.token_estimate} injected={[e['id'] for e in bundle.experiences]} "
+            f"skills={[item['id'] for item in bundle.skills]} -->",
             "",
         ]
         path.write_text("\n".join(header) + bundle.full_text(), encoding="utf-8")

@@ -124,7 +124,7 @@ class _E2EAgent(BaseAgent):
     def build_prompt(self, task, perception, experience):
         # 真实 LLMClient 会读 bundle.system / bundle.user / bundle.path / bundle.experiences
         return SimpleNamespace(path=None, system="你是研发工程师", user="请实现需求",
-                               experiences=[], tier_counts={})
+                               experiences=[], skills=[], tier_counts={})
 
     def build_context(self, task, perception):
         return {"requirement_text": "# 订单计价\n\n### FP-01 计算订单金额"}
@@ -178,6 +178,54 @@ class FunctionCallingE2ETests(unittest.TestCase):
         self.server.server_close()
         self.server_thread.join(timeout=5)
         self.tmp.cleanup()
+
+    # ------------------------------------------------- 轮数用尽：强制收尾出正文
+    def test_tool_rounds_exhausted_forces_text_only_final_round(self):
+        """轮数用尽时模型仍请求工具（正文为空）：追加一次**不带 tools** 的生成强制收敛。
+
+        回归 2026-10-17 的真实故障：tool_max_rounds=2 时模型两轮都在请求工具，
+        旧逻辑直接返回「finish_reason=tool_calls、正文 0 字符」→ act() 判
+        「模型未返回可解析的 JSON」→ 节点 fail（真实运行 20261017-020255-e0cf）。
+        """
+        self.config.llm["tool_max_rounds"] = 2
+        _StubLLMHandler.requests = []
+        # 前两轮都请求工具（把轮数用尽），第三轮（收尾）才给出最终 JSON
+        _StubLLMHandler.script = [_tool_call_payload, _tool_call_payload, _final_payload]
+
+        runner = ToolRunner(self.config)
+        runner.register_from_mcp()
+        try:
+            events = _RecordingEvents()
+            ctx = SimpleNamespace(
+                config=self.config, events=events, run_dir=self.root,
+                llm=LLMClient(self.config), tools=runner,
+            )
+            agent = _E2EAgent(ctx)
+            task = NodeTask(node_id="implement", title="编码实现", role="developer",
+                            kind="task", iteration=1)
+
+            result = agent.act(task)
+
+            # 1) 节点不再因「轮数用尽 + 正文为空」失败
+            self.assertEqual(result.status, "pass", result.error)
+            self.assertEqual(agent.applied.data, {"ok": True, "answer": "tool-result-consumed"})
+            self.assertEqual(result.metrics.get("tool_rounds"), 2)
+            # 2) 真实发包三次：两轮工具 + 一次收尾；收尾轮不带 tools（否则又会要工具）
+            self.assertEqual(len(_StubLLMHandler.requests), 3)
+            self.assertIn("tools", _StubLLMHandler.requests[0])
+            self.assertIn("tools", _StubLLMHandler.requests[1])
+            final = _StubLLMHandler.requests[2]
+            self.assertNotIn("tools", final)
+            self.assertNotIn("tool_choice", final)
+            # 收尾轮的历史里必须带着两轮工具结果，模型才能据此给结论
+            self.assertEqual([m["role"] for m in final["messages"]].count("tool"), 2)
+            # 3) 留痕事件：轮数用尽被显式记录
+            exhausted = [r for r in events.records if r["type"] == "tool_rounds_exhausted"]
+            self.assertEqual(len(exhausted), 1)
+            self.assertEqual(exhausted[0]["payload"]["rounds"], 2)
+            self.assertEqual(exhausted[0]["payload"]["tool_calls"], ["echo"])
+        finally:
+            runner.close()
 
     # ---------------------------------------------------------------- 全链路
     def test_full_loop_real_mcp_and_wire_protocol(self):

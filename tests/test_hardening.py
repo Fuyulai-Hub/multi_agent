@@ -451,7 +451,7 @@ class FunctionCallingTests(unittest.TestCase):
                 return RetrievalResult()
 
             def build_prompt(self, task, perception, experience):
-                return SimpleNamespace(path=None, experiences=[], tier_counts={})
+                return SimpleNamespace(path=None, experiences=[], skills=[], tier_counts={})
 
             def build_context(self, task, perception):
                 return {}

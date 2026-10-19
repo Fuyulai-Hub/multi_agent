@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from mas.config import load_config
+from mas.config import load_config, load_credentials_raw, save_credentials
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -52,6 +52,54 @@ class ConfigTests(unittest.TestCase):
         text = config.describe()
         self.assertIn("intake", text)
         self.assertIn("回退策略", text)
+
+
+class SaveCredentialsTests(unittest.TestCase):
+    """save_credentials 必须按全文合并写入，不得冲掉 store 等非 LLM 段。
+
+    回归背景（2026-10-19）：该函数曾用 load_credentials（只过滤
+    api_key/base_url/token_name 三键）整文件重写 credentials.yaml，
+    导致前端每保存一次模型配置就静默丢掉 store 段（MySQL 密码），
+    存储后端随后按设计静默降级——数据只进 jsonl、不进 MySQL。
+    """
+
+    def test_preserves_store_section_and_untouched_llm_keys(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp)
+            (cfg / "credentials.yaml").write_text(
+                "api_key: sk-old\n"
+                "base_url: https://old.example/v1\n"
+                "token_name: old\n"
+                "store:\n"
+                "  mysql:\n"
+                "    password: secret-pw\n"
+                "    host: 10.0.0.9\n",
+                encoding="utf-8",
+            )
+            saved = save_credentials(cfg, api_key="sk-new")
+
+            # 传入的键被覆盖，未传的 LLM 键保持原值
+            self.assertEqual(saved["api_key"], "sk-new")
+            self.assertEqual(saved["base_url"], "https://old.example/v1")
+            self.assertEqual(saved["token_name"], "old")
+            # store 段逐字保留（MySQL 密码不被冲掉）
+            raw = load_credentials_raw(cfg)
+            self.assertEqual(
+                raw.get("store"),
+                {"mysql": {"password": "secret-pw", "host": "10.0.0.9"}},
+            )
+
+    def test_missing_file_writes_only_passed_keys(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp)
+            saved = save_credentials(cfg, base_url="https://api.chat.csu.edu.cn/v1/")
+
+            self.assertEqual(saved, {"base_url": "https://api.chat.csu.edu.cn/v1"})
+            self.assertNotIn("store", load_credentials_raw(cfg))
 
 
 if __name__ == "__main__":

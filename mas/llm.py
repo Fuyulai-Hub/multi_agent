@@ -115,7 +115,8 @@ class LLMClient:
         # function calling：tools 由运行时注入（ToolRunner）或 config.llm.tools 静态声明
         self.tool_choice = str(config.llm.get("tool_choice", "auto"))
         self.tool_max_rounds = max(1, int(config.llm.get("tool_max_rounds", 2)))
-        # 网络重试：默认 1 次（不重试，保持既有行为）；config llm.retry 可开启
+        # 网络重试：代码默认 1 次（不重试，未配置时的既有行为）；config llm.retry 可开启，
+        # 当前 system.yaml 实配 3 次（连接类异常 10054/10061 纳入可重试分类，backoff 3s）
         retry_raw = dict(config.llm.get("retry") or {})
         self.retry_max_attempts = max(1, int(retry_raw.get("max_attempts", 1)))
         self.retry_backoff_s = float(retry_raw.get("backoff_s", 2.0))

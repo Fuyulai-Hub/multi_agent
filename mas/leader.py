@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -33,9 +34,9 @@ from .llm import LLMClient
 from .prompts import PromptBuilder
 from .sandbox import Sandbox
 from .schemas import AgentContext, AgentResult, NodeTask
-from .skills import load_run_facts
+from .skills import build_tool_schema, list_skills, load_run_facts, run_skill_script
 
-__all__ = ["Leader", "RunSummary"]
+__all__ = ["Leader", "RunSummary", "upsert_run_index"]
 
 
 def _permission_allows(agent: Any, action: str) -> bool:
@@ -44,6 +45,129 @@ def _permission_allows(agent: Any, action: str) -> bool:
     permissions = getattr(role, "permissions", None) or {}
     value = permissions.get(action, True)
     return not (value is False or value == 0 or str(value).lower() == "false")
+
+
+def upsert_run_index(mysql: Any, *, row: Dict[str, Any]) -> None:
+    """runs 表 UPSERT（索引层；SSOT 仍是 run_summary.json / metrics.jsonl）。
+
+    ``row`` 接受 run_id 必需的 13 个投影列（verdict/steps/.../canceled），缺列按
+    schema 默认值走；``finished`` 由 canceled 反推（取消的运行同样视为已收尾）。
+    Leader._persist_run_index 与 ``mas store migrate`` 共用，保证实时双写与历史
+    迁移落库口径一致。
+    """
+    sql = (
+        "INSERT INTO runs "
+        "(run_id, requirement_title, verdict, steps, rollbacks, review_rejections, "
+        " bugs_total, bugs_fixed, duration_s, injected_experiences, profile, ts, "
+        " finished, canceled) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE "
+        "requirement_title = VALUES(requirement_title), verdict = VALUES(verdict), "
+        "steps = VALUES(steps), rollbacks = VALUES(rollbacks), "
+        "review_rejections = VALUES(review_rejections), bugs_total = VALUES(bugs_total), "
+        "bugs_fixed = VALUES(bugs_fixed), duration_s = VALUES(duration_s), "
+        "injected_experiences = VALUES(injected_experiences), profile = VALUES(profile), "
+        "ts = VALUES(ts), finished = VALUES(finished), canceled = VALUES(canceled)"
+    )
+    canceled = bool(row.get("canceled"))
+    params = (
+        str(row.get("run_id") or ""),
+        row.get("requirement_title"),
+        row.get("verdict"),
+        int(row.get("steps") or 0),
+        int(row.get("rollbacks") or 0),
+        int(row.get("review_rejections") or 0),
+        int(row.get("bugs_total") or 0),
+        int(row.get("bugs_fixed") or 0),
+        float(row.get("duration_s") or 0.0),
+        int(row.get("injected_experiences") or 0),
+        row.get("profile"),
+        str(row.get("ts") or ""),
+        1,                      # finished：走到写索引这一步即视为已收尾
+        1 if canceled else 0,
+    )
+    mysql.execute(sql, params)
+
+
+def _make_mq_event_sink(mq: Any, run_id: str):
+    """把全量事件发布到 Redis Stream ``events:<run_id>``（broker 侧事件总线）。
+
+    SSOT 仍是 events.jsonl：订阅者契约要求异常不得影响主流程，broker 抖动只累计
+    错误数，运行结束时随 metrics.mq 一起落盘，便于观测而不是让运行失败。
+    """
+    stats = {"published": 0, "errors": 0}
+
+    def _sink(event: Any) -> None:
+        try:
+            record = event.to_dict() if hasattr(event, "to_dict") else dict(event)
+            mq.publish(
+                f"events:{run_id}",
+                payload=dict(record.get("payload") or {}),
+                run_id=run_id,
+                topic=str(record.get("type") or "event"),
+                kind="event",
+                sender=str(record.get("agent") or "leader"),
+                refs=list(record.get("refs") or []),
+                message_id=f"{run_id}:{record.get('id') or ''}",
+                headers={
+                    "seq": int(record.get("seq") or 0),
+                    "event_id": str(record.get("id") or ""),
+                    "node": record.get("node") or "",
+                    "iteration": record.get("iteration") if record.get("iteration") is not None else "",
+                    "severity": str(record.get("severity") or "info"),
+                    "event_ts": str(record.get("ts") or ""),
+                },
+            )
+            stats["published"] += 1
+        except Exception:  # noqa: BLE001 - 事件流是旁路，失败不影响运行
+            stats["errors"] += 1
+
+    _sink.stats = stats  # type: ignore[attr-defined]
+    return _sink
+
+
+def _make_mysql_event_sink(mysql: Any, run_id: str):
+    """事件日志双写 MySQL 的订阅回调（索引层；SSOT 仍是 events.jsonl）。
+
+    - 全量事件 → ``run_events``（INSERT IGNORE，(run_id, seq) 唯一键幂等）；
+    - ``artifact_published`` 额外 → ``artifacts_index``（文件本体仍在磁盘）。
+
+    任何异常静默吞掉：EventLog.emit 的订阅者契约即「订阅者失败不得影响主流程」，
+    且证据层已先落盘，索引晚一步/丢一条都可在 ``mas store migrate`` 后补。
+    """
+
+    def _sink(event: Any) -> None:
+        try:
+            record = event.to_dict() if hasattr(event, "to_dict") else dict(event)
+            payload = record.get("payload") or {}
+            mysql.execute(
+                "INSERT IGNORE INTO run_events "
+                "(run_id, seq, type, agent, node, iteration, severity, payload, ts) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    run_id, int(record.get("seq") or 0), str(record.get("type") or ""),
+                    record.get("agent"), record.get("node"), record.get("iteration"),
+                    str(record.get("severity") or "info"), mysql.to_json(payload),
+                    str(record.get("ts") or ""),
+                ),
+            )
+            if record.get("type") == "artifact_published":
+                refs = record.get("refs") or []
+                mysql.execute(
+                    "INSERT IGNORE INTO artifacts_index "
+                    "(run_id, name, version, producer, node, iteration, digest, path, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        run_id, str(payload.get("artifact") or ""), int(payload.get("version") or 0),
+                        record.get("agent"), record.get("node"), record.get("iteration"),
+                        str(payload.get("digest") or ""),
+                        str(refs[0]) if refs else None, str(record.get("ts") or ""),
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - 索引写失败不影响主流程
+            pass
+
+    return _sink
 
 
 # 回退归因：失败节点本次执行发出的事件类型 -> 经验 trigger。
@@ -75,6 +199,7 @@ class RunSummary:
     metrics: Dict[str, Any] = field(default_factory=dict)
     error: str = ""
     forced_fail: bool = False
+    canceled: bool = False          # True = 用户手动终止（面板「终止任务」），非自然终态
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -85,6 +210,57 @@ class Leader:
 
     def __init__(self, config: SystemConfig) -> None:
         self.config = config
+        self._store_backends_cache: Any = None
+
+    def _store_backends(self) -> Any:
+        """构建（并按实例缓存）存储后端；任何失败都降级为空后端，绝不阻塞流水线。
+
+        工作区守卫见 mas.store：测试/一次性脚本的临时 workspace 自动全禁用，
+        只有规范工作区（system.yaml 的 system.workspace）才连真实库。
+        """
+        if self._store_backends_cache is not None:
+            return self._store_backends_cache
+        try:
+            from .store import StoreBackends, build_backends
+            backends = build_backends(self.config)
+        except Exception:  # noqa: BLE001 - 存储层异常（含驱动缺失）按「未接入」处理
+            from .store import StoreBackends
+            backends = StoreBackends()
+        self._store_backends_cache = backends
+        return backends
+
+    @staticmethod
+    def _persist_run_index(mysql: Any, summary: "RunSummary", metrics: Dict[str, Any],
+                           *, canceled: bool = False) -> None:
+        """把 run_summary + metrics 双写进 MySQL 索引层（runs / run_metrics 表）。
+
+        与 jsonl 的关系：文件仍是 SSOT，MySQL 是可查询投影；写失败静默。
+        终止（canceled）的运行只写 runs 不写 run_metrics——与 metrics.jsonl 口径一致。
+        """
+        try:
+            upsert_run_index(mysql, row={
+                "run_id": summary.run_id,
+                "requirement_title": summary.requirement_title,
+                "verdict": summary.verdict,
+                "steps": int(summary.steps),
+                "rollbacks": int(summary.rollbacks),
+                "review_rejections": int(summary.review_rejections),
+                "bugs_total": int(summary.bugs_total),
+                "bugs_fixed": int(summary.bugs_fixed),
+                "duration_s": float(metrics.get("duration_s") or 0.0),
+                "injected_experiences": int(metrics.get("injected_experiences") or 0),
+                "profile": metrics.get("profile"),
+                "ts": str(metrics.get("ts") or ""),
+                "canceled": bool(canceled),
+            })
+            if not canceled:
+                mysql.execute(
+                    "INSERT INTO run_metrics (run_id, metrics) VALUES (%s, %s) "
+                    "ON DUPLICATE KEY UPDATE metrics = VALUES(metrics)",
+                    (summary.run_id, mysql.to_json(metrics)),
+                )
+        except Exception:  # noqa: BLE001 - 索引层写失败不影响主流程
+            pass
 
     # ================================================================= 运行
     def run(
@@ -94,7 +270,22 @@ class Leader:
         as_text: bool = False,
         run_id: Optional[str] = None,
         images: Optional[List[str]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        registry: Optional[Any] = None,
     ) -> RunSummary:
+        """执行一次完整流水线。
+
+        ``cancel_event``（协作式取消，默认 None 行为与改造前一致）：非 None 时在每个
+        节点边界检查信号，被设置则停止调度后续节点并走收尾流程——summary.canceled=True、
+        verdict 强制 fail、跳过经验提炼/晋级/指标记录（半截运行不污染自学习数据）。
+        当前正在执行的节点（如 LLM 生成）不会被强行打断，在其执行完毕后生效。
+
+        ``registry``（运行注册表，docs/25 协调层；默认 None 行为与改造前一致）：
+        非 None 时——运行开始自动 register（幂等）、每个节点边界 heartbeat
+        （Redis 后端即跨进程可见 + 可取消）、结束 unregister；节点边界的取消判定
+        在 cancel_event 之外额外查询 ``registry.is_canceled(run_id)``，使 CLI 等其他
+        进程发起的运行也能被终止。
+        """
         started = datetime.now().astimezone()
         stamp_fmt = str(self.config.runtime.get("run_id_format", "%Y%m%d-%H%M%S"))
         run_id = run_id or f"{started.strftime(stamp_fmt)}-{secrets.token_hex(2)}"
@@ -104,11 +295,43 @@ class Leader:
 
         verbose = bool(self.config.runtime.get("verbose", True))
 
+        # 存储后端（docs/25）：MySQL=经验库/运行索引，Redis=运行注册表（跨进程心跳/取消）。
+        # 未启用或连接失败时全部为 None，下游逐字节回落到既有 jsonl/内存路径，不抛异常。
+        backends = self._store_backends()
+        if registry is not None:
+            registry.register(run_id)   # 幂等：前端已注册时返回既有取消信号，不重置
+
         events = EventLog(run_dir / "events.jsonl", run_id, echo=verbose)
-        bus = MessageBus(run_dir / "messages.jsonl", events, run_id)
+        # 事件双写 sink（MySQL 索引层；SSOT 仍是 events.jsonl，写失败静默不影响主流程）
+        if backends.mysql is not None:
+            events.subscribe(_make_mysql_event_sink(backends.mysql, run_id))
+        # MQ（Redis Streams）：事件流 + Agent 消息投递。broker 不可用时为 None，
+        # 下游退回进程内/ jsonl 路径，行为与改造前一致。
+        bus_mq = None
+        try:
+            from .mq import build_agent_bus_mq
+            bus_mq = build_agent_bus_mq(self.config)
+        except Exception:  # noqa: BLE001 - MQ 装配失败只降级
+            bus_mq = None
+        mq_event_sink = _make_mq_event_sink(bus_mq, run_id) if bus_mq is not None else None
+        if mq_event_sink is not None:
+            events.subscribe(mq_event_sink)
+        bus = MessageBus(run_dir / "messages.jsonl", events, run_id, mq=bus_mq)
+        if bus_mq is not None:
+            events.emit(
+                "mq_ready", agent="leader",
+                payload={
+                    "transport": "redis-stream",
+                    "agent_stream": bus_mq.stream_key(f"agent:{run_id}"),
+                    "event_stream": bus_mq.stream_key(f"events:{run_id}"),
+                    "consumer_group_prefix": "role-",
+                    "prefix": bus_mq.prefix,
+                },
+            )
         blackboard = Blackboard(run_dir / "artifacts", events, run_id)
         sandbox = Sandbox(run_dir / "code", self.config, events=events)
-        experience = ExperienceLibrary(self.config.workspace_dir, self.config.learning, events, run_id)
+        experience = ExperienceLibrary(self.config.workspace_dir, self.config.learning, events, run_id,
+                                       mysql=backends.mysql)
         prompts = PromptBuilder(self.config, run_dir, enabled=bool(self.config.runtime.get("save_prompts", True)))
         llm = LLMClient(self.config)
 
@@ -227,15 +450,27 @@ class Leader:
             forced_fail = False
             node_id: Optional[str] = flow.entry
             steps = 0
+            canceled = False
             max_steps = min(int(flow.max_steps), int(self.config.runtime.get("max_steps", flow.max_steps)))
             max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
 
             while node_id and node_id not in flow.terminal and steps < max_steps:
+                # 协作式终止（面板「终止任务」）：只在节点边界检查取消信号。
+                # 当前节点的执行（含 LLM 调用）不打断，跑完后在此退出循环、进入收尾。
+                # registry 非 None 时额外查跨进程取消键：CLI/其他进程发起的运行也可被终止。
+                if cancel_event is not None and cancel_event.is_set():
+                    canceled = True
+                    break
+                if registry is not None and registry.is_canceled(run_id):
+                    canceled = True
+                    break
                 steps += 1
                 node = flow.node(node_id)
                 iteration = iterations.get(node_id, 0) + 1
                 iterations[node_id] = iteration
                 ctx.run_state["node_executions"] = steps
+                if registry is not None:
+                    registry.heartbeat(run_id, status="running", node=node_id)
                 events.emit(
                     "node_start", agent=node.role, node=node_id, iteration=iteration,
                     payload={"title": node.title, "kind": node.kind},
@@ -277,7 +512,23 @@ class Leader:
                 target = node.target(branch)
                 if target is None:
                     target = "halt"
-                if branch == "fail" and self._is_rollback(node_id, target, iterations, rollback_counts):
+                # 环境/证据通道缺口（docs/15 B 档；task04 的 C++ 工具链缺失同属此类）：
+                # 退回研发改代码无法消除，继续回退只会空转并耗尽回退预算（本项目的
+                # web_todo_spa 实测：36/36 用例全过仍被判 fail，4 次回退预算全耗在通道缺口上）。
+                # 立即如实收尾（forced fail + 门禁 + 报告），不消耗回退次数。
+                unfixable = (self._unfixable_failure_reason(ctx, node_id, iteration)
+                             if branch == "fail" else "")
+                if unfixable:
+                    forced_fail = True
+                    events.emit(
+                        "escalation", agent="leader", node=node_id, severity="error",
+                        payload={"reason": unfixable,
+                                 "strategy": collaboration.escalation.get("on_exhausted", "fail_run_and_report"),
+                                 "notify": collaboration.escalation.get("notify", [])},
+                    )
+                    self._publish_forced_gate(blackboard, "环境/证据通道缺口", unfixable, iteration)
+                    target = "report" if "report" in flow.nodes else "halt"
+                elif branch == "fail" and self._is_rollback(node_id, target, iterations, rollback_counts):
                     # 权限落地：节点角色显式声明 can_rollback=false 时，拒绝回退并终止流程
                     if not self._rollback_permitted(node_id, node, target, agents, events, iteration):
                         target = "halt"
@@ -317,15 +568,7 @@ class Leader:
                                 },
                             )
                             if str(collaboration.escalation.get("on_exhausted", "fail_run_and_report")) == "fail_run_and_report":
-                                blackboard.publish(
-                                    "acceptance_gate",
-                                    {"node": "acceptance", "passed": False, "forced": True,
-                                     "criteria": [], "failed_criteria": [{"id": "回退次数耗尽", "reason": pending_reason}],
-                                     "signoff": {"verdict": "reject", "opinion": "回退次数耗尽，验收不通过"},
-                                     "evaluated_at": datetime.now().astimezone().isoformat(timespec="seconds")},
-                                    producer="leader", node="acceptance", iteration=iteration,
-                                    summary="回退耗尽，判定不通过",
-                                )
+                                self._publish_forced_gate(blackboard, "回退次数耗尽", pending_reason, iteration)
                                 target = "report"
                             else:
                                 target = "halt"
@@ -334,8 +577,15 @@ class Leader:
         finally:
             if tool_runner is not None:
                 tool_runner.close()
+            # 注册表注销（正常/异常/取消都经此；幂等）。Redis 后端另有 TTL 兜底，
+            # 进程被杀未走到 finally 时心跳到期自动清除。
+            if registry is not None:
+                try:
+                    registry.unregister(run_id)
+                except Exception:  # noqa: BLE001 - 协调层清理失败不影响收尾
+                    pass
 
-        if node_id is None or steps >= max_steps and node_id not in flow.terminal:
+        if not canceled and (node_id is None or steps >= max_steps and node_id not in flow.terminal):
             forced_fail = True
             events.emit("escalation", agent="leader", severity="error",
                         payload={"reason": f"达到最大步数 {max_steps}，强制终止"})
@@ -348,16 +598,27 @@ class Leader:
         bugs = blackboard.get("bug_reports") or {}
         report = blackboard.get("acceptance_report") or {}
 
+        if canceled:
+            verdict = "fail"      # 手动终止的运行不参与验收结论（不显示为"通过"）
+            events.emit(
+                "run_canceled", agent="leader", severity="warning",
+                payload={"reason": "用户手动终止（面板）", "steps": steps, "stopped_at": node_id},
+            )
+
         # 经验反馈闭环（终态）：通过 → 奖励本次注入且未被降权的经验；
         # 未通过但无法归因 → neutral 仅留痕（回退归因的降权已在回退分支发生）。
-        self._reinforce_injected(
-            ctx, outcome="positive" if verdict == "pass" else "neutral",
-            evidence=f"运行结论：{verdict}（步数 {steps}、回退 {ctx.run_state['rollbacks']}）",
-        )
-
-        # 运行级经验提炼（成功路径/效率） + 晋级 + 指标
-        learned_end = self._extract_run_end(ctx, verdict, steps, duration_s)
-        promoted = experience.promote()
+        # 手动终止的运行没有真实终态：跳过终态反馈、经验提炼/晋级与指标记录，
+        # 避免半截运行的数据污染自学习闭环（run_summary 仍正常落盘，供面板展示）。
+        learned_end = 0
+        promoted: List[Any] = []
+        if not canceled:
+            self._reinforce_injected(
+                ctx, outcome="positive" if verdict == "pass" else "neutral",
+                evidence=f"运行结论：{verdict}（步数 {steps}、回退 {ctx.run_state['rollbacks']}）",
+            )
+            # 运行级经验提炼（成功路径/效率） + 晋级 + 指标
+            learned_end = self._extract_run_end(ctx, verdict, steps, duration_s)
+            promoted = experience.promote()
         metrics = {
             "run_id": run_id,
             "ts": started.isoformat(timespec="seconds"),
@@ -372,10 +633,20 @@ class Leader:
             "iterations_to_accept": steps,
             "duration_s": duration_s,
             "injected_experiences": ctx.run_state["injected_total"],
+            "skills_injected": ctx.run_state.get("skills_total", 0),
             "experience_learned": learned_end,
             "promoted": len(promoted),
+            "canceled": canceled,     # 手动终止的运行只写 run_summary，不落知识库指标
         }
-        experience.record_metrics(metrics)
+        # MQ 传输指标（broker 未接入时不写该字段，metrics 结构与改造前一致）
+        mq_metrics = bus.transport_stats()
+        if mq_metrics.get("enabled"):
+            if mq_event_sink is not None:
+                mq_metrics["events"] = dict(getattr(mq_event_sink, "stats", {}))
+            mq_metrics["consult"] = dict(ctx.run_state.get("mq_consult") or {})
+            metrics["mq"] = mq_metrics
+        if not canceled:
+            experience.record_metrics(metrics)
         ctx.run_state["metrics"] = metrics
 
         summary = RunSummary(
@@ -392,12 +663,18 @@ class Leader:
             iterations=iterations,
             metrics=metrics,
             forced_fail=forced_fail,
+            canceled=canceled,
         )
         (run_dir / "run_summary.json").write_text(
             json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
+        # MySQL 索引层双写（docs/25）：SSOT 仍是 run_summary.json / metrics.jsonl，
+        # MySQL 只是可查询投影；写失败静默——连接抖动不该让已完成的运行报错。
+        if backends.mysql is not None:
+            self._persist_run_index(backends.mysql, summary, metrics, canceled=canceled)
+        conclusion = "已终止（用户手动终止）" if canceled else ("通过" if verdict == "pass" else "未通过")
         timeline_md = ["# 运行时间线", "", f"- 运行：{run_id}", f"- 需求：{req_title}",
-                       f"- 结论：{'通过' if verdict == 'pass' else '未通过'}", ""]
+                       f"- 结论：{conclusion}", ""]
         timeline_md += events.timeline(limit=200)
         timeline_path = run_dir / "timeline.md"
         timeline_path.write_text("\n".join(timeline_md), encoding="utf-8")
@@ -408,14 +685,28 @@ class Leader:
                 "verdict": verdict, "steps": steps, "duration_s": duration_s,
                 "bugs_total": summary.bugs_total, "bugs_fixed": summary.bugs_fixed,
                 "rollbacks": summary.rollbacks, "report": report.get("path", ""),
-                "forced_fail": forced_fail,
+                "forced_fail": forced_fail, "canceled": canceled,
             },
         )
-        print(
-            f"[DONE] 运行结束 {run_id}｜验收：{'通过' if verdict == 'pass' else '未通过'}"
-            f"｜步数 {steps}｜回退 {summary.rollbacks}｜缺陷 {summary.bugs_total}(闭环 {summary.bugs_fixed})"
-            f"｜耗时 {duration_s}s\n  报告：{report.get('path', '-')}"
-        )
+        if canceled:
+            print(
+                f"[CANCELED] 运行已终止 {run_id}｜步数 {steps}｜耗时 {duration_s}s"
+                f"（用户手动终止，未参与经验与指标统计）"
+            )
+        else:
+            print(
+                f"[DONE] 运行结束 {run_id}｜验收：{'通过' if verdict == 'pass' else '未通过'}"
+                f"｜步数 {steps}｜回退 {summary.rollbacks}｜缺陷 {summary.bugs_total}(闭环 {summary.bugs_fixed})"
+                f"｜耗时 {duration_s}s\n  报告：{report.get('path', '-')}"
+            )
+        if mq_metrics.get("enabled"):
+            delivered = "、".join(f"{role}:{count}" for role, count in
+                                  (mq_metrics.get("delivered") or {}).items()) or "0"
+            print(
+                f"  消息队列：{mq_metrics['stream']}｜发布 {mq_metrics['published']}"
+                f"｜投递 {delivered}｜事件流 {mq_metrics.get('events', {}).get('published', 0)}"
+                f"｜错误 {mq_metrics.get('errors', 0)}"
+            )
         return summary
 
     # ================================================================= 流程沉淀
@@ -584,19 +875,39 @@ class Leader:
                 requester, "negotiation_request", {"question": question, "fp_id": fp_id},
                 recipients=[target_role], kind="request", node=node,
             )
+            # MQ 传输：请求入 broker 后由目标角色的消费组接管并 ACK；
+            # 应答同理回投请求方。pump 失败只计数，consult 仍走同步进程内应答。
+            request_entry = bus.pump(target_role) if bus.mq is not None else 0
             agent = agents.get(target_role)
             answer: Dict[str, Any] = {}
             if agent is not None and hasattr(agent, "consult"):
                 answer = agent.consult(question, fp_id) or {}
-            bus.send(
+            response = bus.send(
                 target_role, "negotiation_response",
                 {"question": question, "answer": answer.get("answer", ""), "fp_id": fp_id},
                 recipients=[requester], kind="response", correlation_id=request.id, node=node,
             )
+            response_entry = bus.pump(requester) if bus.mq is not None else 0
+            if bus.mq is not None:
+                mq_consult = ctx.run_state.setdefault(
+                    "mq_consult", {"requests": 0, "responses": 0, "request_entries": [], "response_entries": []})
+                mq_consult["requests"] += 1
+                mq_consult["responses"] += 1
+                for key, message in (("request_entries", request), ("response_entries", response)):
+                    entry_id = bus.mq_entry_id(message.id)
+                    if entry_id:
+                        mq_consult[key].append(entry_id)
+                if not request_entry and not response_entry:
+                    mq_consult.setdefault("undelivered", 0)
+                    mq_consult["undelivered"] = mq_consult.get("undelivered", 0) + 1
             events.emit(
                 "negotiation_closed", agent=target_role, node=node,
                 payload={"topic": "ambiguity", "question": question,
-                         "answer": answer.get("answer", ""), "fp_id": fp_id, "requester": requester},
+                         "answer": answer.get("answer", ""), "fp_id": fp_id, "requester": requester,
+                         "request_id": request.id, "response_id": response.id,
+                         "correlation_id": request.id,
+                         "mq_request_entry": bus.mq_entry_id(request.id) if bus.mq is not None else None,
+                         "mq_response_entry": bus.mq_entry_id(response.id) if bus.mq is not None else None},
             )
             ctx.run_state["negotiations"] = \
                 ctx.run_state.get("negotiations", 0) + 1
@@ -605,34 +916,44 @@ class Leader:
         return consult
 
     def _build_tool_runner(self, events: EventLog):
-        """按 llm.tools_enabled 装配 function calling 工具执行器（默认关闭，返回 None）。
+        """按配置装配 function calling 工具执行器（默认关闭，返回 None）。
 
-        开启后从 config/mcp.yaml 的 enabled 服务拉取 tools/list 转 OpenAI schema，
-        并按 inputs.yaml 的 websearch.enabled 注册本地 ``web_search`` 执行器；
-        单个 MCP 服务不可用只跳过该服务，不阻塞运行。
+        两条装配来源，同时启用时并存于同一个 ToolRunner：
+        - ``llm.tools_enabled``：从 config/mcp.yaml 的 enabled 服务拉取 tools/list 转 OpenAI
+          schema，并按 inputs.yaml 的 websearch.enabled 注册本地 ``web_search`` 执行器；
+        - ``runtime.skills``（enabled=true 且 tools_enabled=true）：把声明了 ``tool.script``
+          的技能注册为 ``skill_<id>`` 工具，模型调用时由沙箱执行技能自带脚本（mas/skills.py）。
+
+        单个 MCP 服务不可用只跳过该服务；未注册到任何工具时降级为无工具运行。
         """
-        if not bool(self.config.llm.get("tools_enabled", False)):
+        llm_tools = bool(self.config.llm.get("tools_enabled", False))
+        skills_cfg = dict(self.config.runtime.get("skills") or {})
+        skill_tools = bool(skills_cfg.get("enabled", False)) and bool(skills_cfg.get("tools_enabled", False))
+        if not llm_tools and not skill_tools:
             return None
         from .toolrunner import ToolRunner
 
         runner = ToolRunner(self.config)
         try:
-            runner.register_from_mcp()
-            self._register_web_search(runner, events)
-            static = list(self.config.llm.get("tools") or [])
-            if static:
-                runner.register_static(static)
+            if llm_tools:
+                runner.register_from_mcp()
+                self._register_web_search(runner, events)
+                static = list(self.config.llm.get("tools") or [])
+                if static:
+                    runner.register_static(static)
+            skill_count = self._register_skill_tools(runner, events)
             if not runner.schemas:
                 events.emit(
                     "tool_runner_empty", agent="leader", severity="warning",
-                    payload={"reason": "llm.tools_enabled=true 但未拉到任何工具"
-                                       "（检查 config/mcp.yaml 与 inputs.yaml 的 websearch）"},
+                    payload={"reason": "已开启 function calling 但未注册到任何工具"
+                                       "（检查 config/mcp.yaml、inputs.yaml 的 websearch、"
+                                       "config/skills 下技能的 tool.script 声明）"},
                 )
                 runner.close()
                 return None      # 无工具可用：降级为无工具运行，避免空 tools 下发干扰端点
             events.emit(
                 "tool_runner_ready", agent="leader",
-                payload={"tools": len(runner.schemas)},
+                payload={"tools": len(runner.schemas), "skills": skill_count},
             )
         except Exception as exc:  # noqa: BLE001 - 工具装配失败降级为无工具运行
             events.emit(
@@ -642,6 +963,50 @@ class Leader:
             runner.close()
             return None
         return runner
+
+    def _register_skill_tools(self, runner: Any, events: EventLog) -> int:
+        """把声明了 ``tool.script`` 的技能注册为可调用工具，返回注册数量。
+
+        开关：``runtime.skills.enabled`` 与 ``runtime.skills.tools_enabled`` 同时为 true。
+        未声明 tool.script 的技能不注册（继续走 Prompt 文本注入路径）；
+        脚本文件缺失只跳过该技能并发告警，不影响其他技能与 MCP 工具。
+        """
+
+        def _make_executor(skill: Any) -> Any:
+            """闭包工厂：把当前技能绑定进执行器（避免循环变量晚绑定陷阱）。"""
+
+            def _execute(**arguments: Any) -> Any:
+                return run_skill_script(skill, arguments, self.config, events=events)
+
+            return _execute
+
+        cfg = dict(self.config.runtime.get("skills") or {})
+        if not (bool(cfg.get("enabled", False)) and bool(cfg.get("tools_enabled", False))):
+            return 0
+        count = 0
+        for skill in list_skills(self.config.skills_dir):
+            schema = build_tool_schema(skill)
+            if schema is None:
+                continue
+            script = str((skill.meta.get("tool") or {}).get("script") or "")
+            if not (skill.dir / script).exists():
+                events.emit(
+                    "skill_tool_skipped", agent="leader", severity="warning",
+                    payload={"skill": skill.id, "script": script, "reason": "脚本文件不存在"},
+                )
+                continue
+            function = schema["function"]
+            runner.register_local(
+                function["name"], _make_executor(skill),
+                description=function["description"], parameters=function["parameters"],
+            )
+            count += 1
+            events.emit(
+                "skill_tool_registered", agent="leader",
+                payload={"skill": skill.id, "tool": function["name"], "script": script,
+                         "inputs": sorted(function["parameters"].get("properties", {}))},
+            )
+        return count
 
     def _register_web_search(self, runner: Any, events: EventLog) -> None:
         """联网搜索（docs/16 的 05 文档 路径 B）：``websearch.enabled`` 时注册本地执行器。
@@ -746,6 +1111,8 @@ class Leader:
         for tier, count in tiers.items():
             state["injected_tiers"][tier] = state["injected_tiers"].get(tier, 0) + int(count)
         state["injected_total"] += int(result.metrics.get("experience_injected", 0) or 0)
+        state["skills_total"] = int(state.get("skills_total", 0) or 0) + int(
+            result.metrics.get("skills_injected", 0) or 0)
 
     # ================================================================= 经验反馈闭环
     def _reinforce_injected(
@@ -958,6 +1325,43 @@ class Leader:
         if target in self.config.flow.terminal:
             return False
         return source in self.config.collaboration.rollback
+
+    #: 「回退也无法修复」的失败信号：事件类型 -> 归因描述。与 tester 的证据源一一对应：
+    #: ``test_verification_gap``（交付形态要求的验证通道未接入）/ ``test_environment_gap``
+    #: （测试依赖的外部工具链本机缺失）。两者都发生在证据源而非交付物，退回研发改代码无法消除。
+    _UNFIXABLE_FAILURE_EVENTS = {
+        "test_verification_gap": "验证口径/证据通道缺口",
+        "test_environment_gap": "测试执行依赖的外部工具链缺失",
+    }
+
+    def _unfixable_failure_reason(self, ctx: AgentContext, node_id: str, iteration: int) -> str:
+        """本次节点失败是否属于「回退也改不掉」的环境/证据通道缺口，是则返回归因文本。
+
+        判定依据是失败节点本轮执行留下的确定性事件（而非 LLM 措辞）：这类失败不由
+        交付物质量引起，继续回退只会空转并把回退预算耗尽，最终仍以不通过收尾——
+        与 task04（缺编译器）的教训一致。
+        """
+        for event in ctx.events.events:
+            if event.node != node_id or event.iteration != iteration:
+                continue
+            label = self._UNFIXABLE_FAILURE_EVENTS.get(event.type)
+            if label:
+                note = str((event.payload or {}).get("note", "")).strip()
+                return f"{label}：{note}" if note else label
+        return ""
+
+    def _publish_forced_gate(self, blackboard: Blackboard, criteria_id: str, reason: str,
+                             iteration: int) -> None:
+        """发布「非交付物缺陷」导致的强制不通过门禁产物（回退耗尽 / 环境通道缺口共用同一结构）。"""
+        blackboard.publish(
+            "acceptance_gate",
+            {"node": "acceptance", "passed": False, "forced": True, "criteria": [],
+             "failed_criteria": [{"id": criteria_id, "reason": reason}],
+             "signoff": {"verdict": "reject", "opinion": f"{criteria_id}，验收不通过"},
+             "evaluated_at": datetime.now().astimezone().isoformat(timespec="seconds")},
+            producer="leader", node="acceptance", iteration=iteration,
+            summary=f"{criteria_id}，判定不通过",
+        )
 
     @staticmethod
     def _logger(events: EventLog):

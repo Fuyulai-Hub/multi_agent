@@ -593,6 +593,12 @@ class TesterAgent(BaseAgent):
                 "delivery_shape": shape}
 
         if shape == "full_stack_spa":
+            # 通道已接入（runtime.ui_probe 启用 且 浏览器 MCP 就绪）时，SPA 的两种验证手段
+            # （Python 用例 + 浏览器断言）都在可执行集合内，验证口径完整 → gap=0；
+            # 证据是否够用由门禁第 9/10 条对 ui_evidence 的真实断言数把关（docs/15 §3.3：
+            # "要求浏览器通道已接入，否则 gap=1"——gap 只在通道未接入时报）。
+            if probe.get("browser_ui_ready"):
+                return {**base, "gap": 0, "note": ""}
             return {
                 **base, "gap": 1,
                 "note": ("交付形态为 full_stack_spa（浏览器前端），需要浏览器级证据通道才能验证；"

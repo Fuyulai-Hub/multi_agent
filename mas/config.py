@@ -36,6 +36,7 @@ __all__ = [
     "deep_merge",
     "credentials_path",
     "load_credentials",
+    "load_credentials_raw",
     "save_credentials",
     "resolve_credentials",
     "mask_secret",
@@ -95,6 +96,22 @@ def load_credentials(config_dir: str | Path | None = None) -> Dict[str, str]:
     return {key: str(raw[key]).strip() for key in CREDENTIAL_KEYS if str(raw.get(key) or "").strip()}
 
 
+def load_credentials_raw(config_dir: str | Path | None = None) -> Dict[str, Any]:
+    """读取凭据文件全文（含 store 等非 LLM 段）；文件不存在/损坏时返回 {}。
+
+    LLM 凭据段仍由 load_credentials 按 CREDENTIAL_KEYS 过滤消费；本函数供
+    mas/store 读取同文件里的 store 段（MySQL/Redis 连接参数），避免第二份秘密文件。
+    """
+    path = credentials_path(config_dir)
+    if not path.exists():
+        return {}
+    try:
+        raw = read_yaml(path)
+    except ConfigError:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def save_credentials(
     config_dir: str | Path | None = None,
     *,
@@ -102,15 +119,22 @@ def save_credentials(
     base_url: Optional[str] = None,
     token_name: Optional[str] = None,
 ) -> Dict[str, str]:
-    """把凭据写入 config/credentials.yaml：只覆盖传入字段，未传的保持原值。"""
+    """把凭据写入 config/credentials.yaml：只覆盖传入字段，未传的保持原值。
+
+    必须基于**全文**合并写入：该文件除 LLM 三键外还承载 store 段
+    （MySQL/Redis 连接参数，由 mas/store 经 load_credentials_raw 读取）。
+    若按 LLM 键过滤后再整文件重写，store 段会被静默冲掉——前端每点一次
+    「保存」就丢一次 MySQL 密码，存储后端随后按设计静默降级（连接失败
+    不抛异常），现象是「数据莫名只进 jsonl、不进 MySQL」。
+    """
     path = credentials_path(config_dir)
-    current = load_credentials(config_dir)
+    data = dict(load_credentials_raw(config_dir))
     if api_key and api_key.strip():
-        current["api_key"] = api_key.strip()
+        data["api_key"] = api_key.strip()
     if base_url and base_url.strip():
-        current["base_url"] = base_url.strip().rstrip("/")
+        data["base_url"] = base_url.strip().rstrip("/")
     if token_name and token_name.strip():
-        current["token_name"] = token_name.strip()
+        data["token_name"] = token_name.strip()
     header = (
         "# =============================================================================\n"
         "# LLM 凭据（本地文件，已加入 .gitignore，禁止提交到版本库）\n"
@@ -123,9 +147,10 @@ def save_credentials(
         "# =============================================================================\n"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    body = yaml.safe_dump(current, allow_unicode=True, sort_keys=False, default_flow_style=False)
-    path.write_text(header + body, encoding="utf-8")
-    return current
+    body = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    # newline="\n"：Windows 下 write_text 默认把 \n 转成 \r\n，整份文件行尾被改写（同 system.yaml 回写约定）
+    path.write_text(header + body, encoding="utf-8", newline="\n")
+    return {key: str(data[key]).strip() for key in CREDENTIAL_KEYS if str(data.get(key) or "").strip()}
 
 
 def mask_secret(value: str, keep: int = 4) -> str:
@@ -483,6 +508,14 @@ class SystemConfig:
     @property
     def runs_dir(self) -> Path:
         return self.workspace_dir / "runs"
+
+    @property
+    def store(self) -> Dict[str, Any]:
+        """runtime.store 段（MySQL/Redis 接入配置，docs/25）。
+
+        缺省为空 dict → mas.store 全部后端返回 None，走既有 jsonl/内存路径。
+        """
+        return dict(self.runtime.get("store") or {})
 
     @property
     def knowledge_dir(self) -> Path:

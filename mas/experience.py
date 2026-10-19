@@ -33,7 +33,7 @@ from .config import LearningConfig
 from .events import EventLog
 from .filelock import file_lock
 
-__all__ = ["Experience", "ExperienceLibrary", "RetrievalResult"]
+__all__ = ["Experience", "ExperienceLibrary", "RetrievalResult", "migrate_jsonl_to_mysql"]
 
 RULE_LABELS = {
     "missing_module_docstring": "模块文档字符串缺失",
@@ -113,7 +113,7 @@ def _expand_with_synonyms(tokens: set, synonyms: Dict[str, List[str]]) -> set:
 
 
 def _estimate_tokens(text: str) -> int:
-    """粗略 token 估算：中文按 1 字 1 token、英文按 4 字符 1 token 折半处理。"""
+    """粗略 token 估算：中文按 1 字 1 token、英文按 3.2 字符 1 token 折算。"""
     if not text:
         return 0
     cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
@@ -205,10 +205,53 @@ class RetrievalResult:
 
 
 class ExperienceLibrary:
-    """经验库：持久化 + 检索 + 提炼 + 晋级 + 反馈。"""
+    """经验库：持久化 + 检索 + 提炼 + 晋级 + 反馈。
+
+    持久化双后端（docs/25）：
+    - ``mysql=None``（默认）：JSONL 文件路径，行为与改造前逐字节一致；
+    - 传入 ``mas.store.MySQLBackend``：MySQL 路径，``_locked()`` 从事务文件锁切换为
+      InnoDB 事务 + ``SELECT ... FOR UPDATE``，``save()`` 从事全文件重写切换为
+      UPSERT。**合并/打分/晋级/反馈逻辑完全不变**，只换存储层。
+    """
+
+    # MySQL 后端 SQL（列序与 _experience_to_row 严格对应）
+    # 注意 `trigger` 是 MySQL 保留字：列名与 VALUES 列表内外任何引用都必须反引号
+    _MYSQL_SELECT = "SELECT * FROM experiences ORDER BY created_at, id"
+    _MYSQL_UPSERT = (
+        "INSERT INTO experiences (id, key_hash, tier, scope, roles, tags, `trigger`, lesson, action, "
+        "action_key, dedupe, confidence, hits, hits_success, hits_failed, evidence_count, "
+        "source_run, source_refs, created_at, last_used_at, status) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE tier=VALUES(tier), scope=VALUES(scope), roles=VALUES(roles), "
+        "tags=VALUES(tags), `trigger`=VALUES(`trigger`), lesson=VALUES(lesson), action=VALUES(action), "
+        "action_key=VALUES(action_key), dedupe=VALUES(dedupe), confidence=VALUES(confidence), "
+        "hits=VALUES(hits), hits_success=VALUES(hits_success), hits_failed=VALUES(hits_failed), "
+        "evidence_count=VALUES(evidence_count), source_run=VALUES(source_run), "
+        "source_refs=VALUES(source_refs), last_used_at=VALUES(last_used_at), status=VALUES(status)"
+    )
+    _MYSQL_METRICS_UPSERT = (
+        "INSERT INTO run_metrics (run_id, metrics) VALUES (%s, %s) "
+        "ON DUPLICATE KEY UPDATE metrics = VALUES(metrics)"
+    )
+    # ``mas store migrate`` 专用：INSERT IGNORE = 只补缺口，永不覆盖既有行。
+    # 为什么迁移不能用 UPSERT：MySQL 启用后经验/指标的**实时写入只进 MySQL**
+    # （jsonl 不再跟进，见 record_metrics/save 的 mysql 分支），此时 jsonl 是
+    # 启用前的陈旧快照。若 migrate 用 UPSERT，重复迁移会把运行中累积的
+    # hits/晋级/证据覆盖回陈旧值（实测：一次演示运行后二次迁移把 6 行
+    # hits 65→39 回滚）。INSERT IGNORE 让「已有行 = 实时数据，永远更新」成为
+    # 硬语义；空库首迁与降级期补录（MySQL 里没有的行）不受影响。
+    _MYSQL_MIGRATE_EXPERIENCE = (
+        "INSERT IGNORE INTO experiences (id, key_hash, tier, scope, roles, tags, `trigger`, lesson, "
+        "action, action_key, dedupe, confidence, hits, hits_success, hits_failed, evidence_count, "
+        "source_run, source_refs, created_at, last_used_at, status) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    _MYSQL_MIGRATE_METRICS = (
+        "INSERT IGNORE INTO run_metrics (run_id, metrics) VALUES (%s, %s)"
+    )
 
     def __init__(self, workspace_dir: Path, config: LearningConfig, events: Optional[EventLog] = None,
-                 run_id: str = "") -> None:
+                 run_id: str = "", mysql: Optional[Any] = None) -> None:
         self.workspace_dir = Path(workspace_dir)
         self.config = config
         self.events = events
@@ -218,6 +261,7 @@ class ExperienceLibrary:
         self._entries: List[Experience] = []
         self._loaded = False
         self._lock_timeout_s = float((config.extraction or {}).get("lock_timeout_s", 10))
+        self._mysql = mysql
         # 同义词词典（learning.yaml synonyms 段）：键为词，值为同义词列表，检索时做查询扩展
         self._synonyms: Dict[str, List[str]] = {
             str(key): [str(item) for item in (value or [])]
@@ -225,13 +269,24 @@ class ExperienceLibrary:
         }
 
     def _locked(self):
-        """经验库读-改-写锁：多进程（如前端并发起的多次运行）共享同一 experience.jsonl 时，
-        保证 load → merge → save 全链路的原子性，避免后写覆盖先写丢经验。"""
+        """经验库读-改-写锁：mysql 后端用事务（行锁 + FOR UPDATE）替代文件锁。
+
+        多进程（如前端并发起的多次运行）共享同一 experience.jsonl 时，
+        保证 load → merge → save 全链路的原子性，避免后写覆盖先写丢经验；
+        MySQL 后端下同一语义由 InnoDB 事务提供，且不再有 O(N) 全文件重写。
+        """
+        if self._mysql is not None:
+            return self._mysql.transaction()
         return file_lock(self.path, timeout_s=self._lock_timeout_s)
 
     # ---------------------------------------------------------------- 持久化
     def load(self) -> List[Experience]:
         self._entries = []
+        if self._mysql is not None:
+            sql = self._MYSQL_SELECT + (" FOR UPDATE" if self._mysql.in_transaction else "")
+            self._entries = [self._row_to_experience(row) for row in self._mysql.query_all(sql)]
+            self._loaded = True
+            return self._entries
         if self.path.exists():
             with self.path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -245,10 +300,75 @@ class ExperienceLibrary:
         return self._entries
 
     def save(self) -> None:
+        if self._mysql is not None:
+            self._save_mysql()
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as handle:
             for entry in self._entries:
                 handle.write(json.dumps(entry.to_dict(), ensure_ascii=False, default=str) + "\n")
+
+    def _save_mysql(self) -> None:
+        """把全部条目 UPSERT 进 MySQL（与 jsonl 全量写等价，但无文件锁与重写竞争）。
+
+        后续优化方向：按脏条目集合做增量 UPSERT（当前量级 156 条，executemany
+        单往返可接受，优先保证语义与 jsonl 完全一致）。
+        """
+        if not self._entries:
+            return
+        self._mysql.executemany(self._MYSQL_UPSERT, [self._experience_to_row(e) for e in self._entries])
+
+    @staticmethod
+    def _experience_to_row(entry: Experience) -> tuple:
+        """Experience → MySQL 行（列序与 _MYSQL_UPSERT 严格对应；JSON 列显式序列化）。"""
+        return (
+            entry.id, entry.key, entry.tier, entry.scope,
+            json.dumps(entry.roles or [], ensure_ascii=False),
+            json.dumps(entry.tags or [], ensure_ascii=False),
+            entry.trigger, entry.lesson, entry.action, entry.action_key, entry.dedupe,
+            float(entry.confidence), int(entry.hits), int(entry.hits_success), int(entry.hits_failed),
+            int(entry.evidence_count), entry.source_run,
+            json.dumps(entry.source_refs or [], ensure_ascii=False),
+            entry.created_at, entry.last_used_at, entry.status,
+        )
+
+    @staticmethod
+    def _row_to_experience(row: Dict[str, Any]) -> Experience:
+        """MySQL 行 → Experience（JSON 列解析回 list；数值列兜底类型转换）。"""
+
+        def _as_list(value: Any) -> List[Any]:
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            if isinstance(value, str) and value.strip():
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    return []
+                return parsed if isinstance(parsed, list) else []
+            return []
+
+        return Experience.from_dict({
+            "id": str(row.get("id") or ""),
+            "tier": str(row.get("tier") or "L1"),
+            "scope": str(row.get("scope") or "run"),
+            "roles": _as_list(row.get("roles")),
+            "tags": _as_list(row.get("tags")),
+            "trigger": str(row.get("trigger") or ""),
+            "lesson": str(row.get("lesson") or ""),
+            "action": str(row.get("action") or ""),
+            "action_key": str(row.get("action_key") or ""),
+            "dedupe": str(row.get("dedupe") or ""),
+            "confidence": float(row.get("confidence") or 0.0),
+            "hits": int(row.get("hits") or 0),
+            "hits_success": int(row.get("hits_success") or 0),
+            "hits_failed": int(row.get("hits_failed") or 0),
+            "evidence_count": int(row.get("evidence_count") or 0),
+            "source_run": str(row.get("source_run") or ""),
+            "source_refs": _as_list(row.get("source_refs")),
+            "created_at": str(row.get("created_at") or ""),
+            "last_used_at": row.get("last_used_at"),
+            "status": str(row.get("status") or "active"),
+        })
 
     @property
     def entries(self) -> List[Experience]:
@@ -729,15 +849,31 @@ class ExperienceLibrary:
 
     # ---------------------------------------------------------------- 指标
     def record_metrics(self, metrics: Dict[str, Any]) -> None:
+        if self._mysql is not None:
+            self._mysql.execute(
+                self._MYSQL_METRICS_UPSERT,
+                (str(metrics.get("run_id") or self.run_id), self._mysql.to_json(metrics)),
+            )
+            return
         self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         with file_lock(self.metrics_path, timeout_s=self._lock_timeout_s):
             with self.metrics_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(metrics, ensure_ascii=False, default=str) + "\n")
 
     def metrics_history(self) -> List[Dict[str, Any]]:
+        if self._mysql is not None:
+            history: List[Dict[str, Any]] = []
+            for row in self._mysql.query_all("SELECT run_id, metrics FROM run_metrics ORDER BY id"):
+                try:
+                    payload = json.loads(row.get("metrics") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(payload, dict):
+                    history.append(payload)
+            return history
         if not self.metrics_path.exists():
             return []
-        history: List[Dict[str, Any]] = []
+        history = []
         with self.metrics_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -794,13 +930,23 @@ class ExperienceLibrary:
         with self._locked():
             self.load() if not self._loaded else None
             before = len(self._entries)
-            self._entries = [
+            kept = [
                 entry for entry in self._entries
                 if entry.confidence >= min_confidence or entry.hits > 0
             ]
+            kept_ids = {entry.id for entry in kept}
+            removed_ids = [entry.id for entry in self._entries if entry.id not in kept_ids]
+            self._entries = kept
             removed = before - len(self._entries)
             if removed:
-                self.save()
+                if self._mysql is not None:
+                    if removed_ids:  # 行级删除替代 jsonl 的全文件重写
+                        placeholders = ", ".join(["%s"] * len(removed_ids))
+                        self._mysql.execute(
+                            f"DELETE FROM experiences WHERE id IN ({placeholders})", tuple(removed_ids)
+                        )
+                else:
+                    self.save()
         return removed
 
     def learning_report_markdown(self) -> str:
@@ -845,3 +991,119 @@ class ExperienceLibrary:
             for item in stats["top"]:
                 lines.append(f"- `{item['id']}` [{item['tier']}] {item['lesson']}（命中 {item['hits']}，置信度 {item['confidence']}）")
         return "\n".join(lines)
+
+
+def _merge_duplicate_key_rows(entries: List[Experience]) -> Tuple[List[Experience], int]:
+    """把同一 key_hash 的多行 jsonl 历史漂移合并为一行（``mas store migrate`` 专用）。
+
+    jsonl 是追加式 SSOT，历史上存在「同 key_hash、不同 id」的漂移行（实测 156 行中
+    14 行；来源疑似早期并发写入/格式变迁）。MySQL 的 ``uk_key_hash`` 唯一键会折叠
+    它们——若直接 UPSERT 全部行，语义退化为「后写覆盖」，中间行的 tier/证据信息
+    全丢。合并规则（完全确定性 → 重复迁移结果一致）：
+
+    - 基准行 = 组内「层级最高（L3>L2>L1）、证据数最多」者（并列取文件中较后者）；
+    - id/created_at/source_run/trigger/lesson/action_key/dedupe 取基准行；
+    - roles/tags/source_refs 取组内并集；其余行的**独有** lesson 以「；」拼接并入；
+    - last_used_at 取组内最晚非空值；status 有任一 active 即 active；
+    - hits/confidence 等计数列**不做加总**（漂移行的计数可能是同源重复计量，
+      相加会发明出不存在的观测数；基准行的值即代表该键的最新状态）。
+
+    返回 (合并后的行列表, 被折叠掉的行数)。
+    """
+    tier_rank = {"L1": 1, "L2": 2, "L3": 3}
+    groups: Dict[str, List[Experience]] = {}
+    order: List[str] = []
+    for entry in entries:
+        key = entry.key
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(entry)
+
+    collapsed = 0
+    merged: List[Experience] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        collapsed += len(group) - 1
+        base = group[0]
+        for candidate in group[1:]:
+            if ((tier_rank.get(candidate.tier, 0), candidate.evidence_count)
+                    >= (tier_rank.get(base.tier, 0), base.evidence_count)):
+                base = candidate
+        for other in group:
+            if other is base:
+                continue
+            base.roles = sorted(set(base.roles) | set(other.roles))
+            base.tags = sorted(set(base.tags) | set(other.tags))
+            base.source_refs = sorted(set(base.source_refs) | set(other.source_refs))
+            if other.lesson and other.lesson not in base.lesson:
+                base.lesson = f"{base.lesson}；{other.lesson}"
+            if other.last_used_at and (not base.last_used_at or other.last_used_at > base.last_used_at):
+                base.last_used_at = other.last_used_at
+            if other.status == "active":
+                base.status = "active"
+        merged.append(base)
+    return merged, collapsed
+
+
+def migrate_jsonl_to_mysql(mysql: Any, workspace_dir: Path, learning: Any) -> Dict[str, int]:
+    """一次性把 jsonl 经验库 / 指标导入 MySQL（幂等，可重复执行）。
+
+    语义：**只补缺口，永不覆盖**（``INSERT IGNORE``，见类内
+    ``_MYSQL_MIGRATE_EXPERIENCE`` 注释）。MySQL 启用后经验/指标的实时写入
+    只进 MySQL、jsonl 不再跟进，故 jsonl 是启用前的陈旧快照；UPSERT 会把
+    实时累积的 hits/晋级/证据回滚成陈旧值。同 key_hash 的历史漂移行按
+    ``_merge_duplicate_key_rows`` 的确定性规则折叠（返回 ``collapsed_rows``）。
+
+    重复迁移的行为：已在 MySQL 的行原样保留（含运行中的实时增量），
+    jsonl 中 MySQL 没有的行（降级期新写入）被补录 —— 两侧都不丢数据、
+    不产生重复，重复执行结果一致。
+
+    仅迁移，不删源文件：SSOT 仍留在磁盘，MySQL 是可查询投影（docs/25 分层原则）。
+    """
+    library = ExperienceLibrary(Path(workspace_dir), learning)
+    stats = {"experiences": 0, "metrics": 0, "collapsed_rows": 0}
+
+    if library.path.exists():
+        entries: List[Experience] = []
+        with library.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(Experience.from_dict(json.loads(line)))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        if entries:
+            merged, collapsed = _merge_duplicate_key_rows(entries)
+            mysql.executemany(
+                ExperienceLibrary._MYSQL_MIGRATE_EXPERIENCE,
+                [ExperienceLibrary._experience_to_row(entry) for entry in merged],
+            )
+            stats["experiences"] = len(merged)
+            stats["collapsed_rows"] = collapsed
+
+    if library.metrics_path.exists():
+        rows: List[Tuple[str, Any]] = []
+        with library.metrics_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                run_id = str(payload.get("run_id") or "")
+                if run_id:
+                    rows.append((run_id, mysql.to_json(payload)))
+        if rows:
+            mysql.executemany(ExperienceLibrary._MYSQL_MIGRATE_METRICS, rows)
+            stats["metrics"] = len(rows)
+    return stats

@@ -159,7 +159,8 @@ class StartRunImagesPassthroughTests(unittest.TestCase):
             frontend_server.start_run(self.workspace, None, "需求文字", images=["a.png"])
             self._wait_called(leader_cls.return_value.run)
             leader_cls.return_value.run.assert_called_once_with(
-                "需求文字", as_text=True, run_id=mock.ANY, images=["a.png"])
+                "需求文字", as_text=True, run_id=mock.ANY, images=["a.png"],
+                cancel_event=mock.ANY, registry=None)
 
     def test_images_passthrough_on_file_channel(self):
         with mock.patch("mas.leader.Leader") as leader_cls:
@@ -167,15 +168,22 @@ class StartRunImagesPassthroughTests(unittest.TestCase):
                                       requirement_path="req.md", images=["a.png"])
             self._wait_called(leader_cls.return_value.run)
             leader_cls.return_value.run.assert_called_once_with(
-                "req.md", as_text=False, run_id=mock.ANY, images=["a.png"])
+                "req.md", as_text=False, run_id=mock.ANY, images=["a.png"],
+                cancel_event=mock.ANY, registry=None)
 
     def test_no_images_stays_none(self):
-        """不传 images 时保持 None（Leader.run 默认路径逐字节一致）。"""
+        """不传 images 时保持 None（Leader.run 默认路径逐字节一致）；
+        cancel_event 恒为未置位的 threading.Event（面板「终止任务」的取消信号，docs/23）；
+        registry=None 表示后端未接入时 Leader 自行退化（docs/25）。"""
         with mock.patch("mas.leader.Leader") as leader_cls:
             frontend_server.start_run(self.workspace, None, "需求文字")
             self._wait_called(leader_cls.return_value.run)
             leader_cls.return_value.run.assert_called_once_with(
-                "需求文字", as_text=True, run_id=mock.ANY, images=None)
+                "需求文字", as_text=True, run_id=mock.ANY, images=None,
+                cancel_event=mock.ANY, registry=None)
+            cancel_event = leader_cls.return_value.run.call_args.kwargs["cancel_event"]
+            self.assertIsInstance(cancel_event, threading.Event)
+            self.assertFalse(cancel_event.is_set())
 
 
 class UploadRouteTests(unittest.TestCase):

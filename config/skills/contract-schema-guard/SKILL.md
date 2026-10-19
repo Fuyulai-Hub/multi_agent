@@ -34,6 +34,9 @@ outputs:
   - name: guard_report
     type: object
     description: 结构 {checked, missing[], type_mismatch[], skipped, fatal}，写入 result.metrics 的 schema_guard 键
+tool:
+  script: scripts/guard.py
+  description: 对已解析的结构化输出做字段级校验，返回带 field_path 的结构化报告（六键：checked/missing/type_mismatch/skipped/repaired/fatal，fatal 为空即放行）
 steps:
   - 取本节点交付契约中声明的字段清单，逐项取出 field_path、expected_type、required、default 四项，缺任一项视为契约定义不完整并报错
   - 按 field_path 逐层下钻 payload，记录每个字段的实到类型；下钻过程中遇到 None 立即记 missing 并停止该分支
@@ -78,3 +81,16 @@ tags:
 - 只做结构与类型校验，**不做业务语义校验**（值是否合理由下游负责）；
 - 只报告，不猜测修正；有 `default` 才补默认值，否则一律记为问题项；
 - 校验结果必须可断言：`result.metrics["schema_guard"]` 的六个键是固定结构。
+
+## 可调用形态（tool.script）
+
+front-matter 的 `tool.script` 声明后，本技能注册为 function calling 工具
+`skill_contract_schema_guard`，模型可直接调用（无需自己重写校验逻辑）：
+
+- 入参即上面的 inputs（`contract_spec` / `payload` / `node_id`），由框架按 JSON 经
+  `sys.argv[1]` 传入 `scripts/guard.py`；
+- `contract_spec` 可传「字段清单列表」本身，或含 `fields` 列表的对象；每项含
+  `field_path`（点号路径）/ `expected_type`（str/dict/list/int）/ `required` /
+  `default`（可选，缺失时补默认值计入 repaired）/ `element_type`（可选，列表元素类型）；
+- stdout 输出 `{"ok": ..., "skill": ..., "report": {六键报告}}`，框架原样回灌；
+  `fatal` 非空即 `ok=false`，调用方应把每条 fatal 当作节点失败信息处理。

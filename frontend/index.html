@@ -46,6 +46,11 @@
                 <option value="lean">lean（裁剪代码审查）</option>
               </select>
             </label>
+            <label class="control switch-control"
+              title="技能系统总开关：开启后按 config/skills/*/SKILL.md 的 trigger 规则向节点 Prompt 注入技能约束。「技能工具调用」开关在「⚙ 模型配置」弹窗内。勾选即时写入 config/system.yaml，下一次运行生效（运行中的流水线不受影响）">
+              <input id="skills-toggle" type="checkbox">
+              <span class="control-label">技能</span>
+            </label>
           </div>
         </div>
         <textarea id="new-requirement" rows="9"
@@ -66,6 +71,8 @@
               accept="image/png,image/jpeg,image/webp,image/gif">
           </label>
           <span id="upload-name" class="composer-status"></span>
+          <button id="cancel-upload" class="ghost-btn" hidden
+            title="取消本次上传：清除已选择的文档，回到未上传状态（服务端暂存文件同时删除）">✕ 取消上传</button>
           <div id="context-usage" class="ctx" title="当前所选运行的单次调用上下文峰值占用">
             <div class="ctx-bar"><div class="ctx-fill"></div></div>
             <span class="ctx-text">上下文 --</span>
@@ -159,6 +166,17 @@
           <span class="field-label">令牌备注名（可选）</span>
           <input id="cfg-token-name" type="text" placeholder="例如 fa_244511009">
         </label>
+        <div class="field">
+          <span class="field-label">技能系统（写入 config/system.yaml 的 runtime.skills，保存后下一次运行生效）</span>
+          <label class="switch-row">
+            <input id="cfg-skills-enabled" type="checkbox">
+            启用技能（enabled：技能文本注入与技能工具的总开关）
+          </label>
+          <label class="switch-row">
+            <input id="cfg-skills-tools-enabled" type="checkbox">
+            启用技能工具调用（tools_enabled：模型可调用 skill_&lt;id&gt; 工具，需与上方同时开启）
+          </label>
+        </div>
         <div id="cfg-status" class="modal-status"></div>
       </div>
       <div class="modal-foot">

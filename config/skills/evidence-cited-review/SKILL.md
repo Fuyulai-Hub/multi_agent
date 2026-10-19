@@ -19,6 +19,9 @@ trigger:
   requires_artifacts:
     - code_manifest
     - requirement_spec
+  nodes:
+    - review
+    - acceptance
 inputs:
   - name: findings
     type: list

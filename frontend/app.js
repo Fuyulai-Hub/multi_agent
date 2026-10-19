@@ -14,6 +14,8 @@ const state = {
     contextWindow: 262144, lastTraces: [],
     apiKeySet: false, apiKeyMasked: "", notice: "",
   },
+  // 当前生效的技能开关（与 system.yaml 的 runtime.skills.* 同名同义）
+  skills: { enabled: false, tools_enabled: false },
 };
 
 /* 附图上传约束：与后端 mas/sources.py 的 IMAGE_SUFFIXES / MAX_IMAGES、
@@ -48,14 +50,15 @@ async function loadRuns() {
   }
   state.runs.forEach((run) => {
     const running = run.finished === false;
+    const canceled = !!run.canceled;   // 用户手动终止：显示「已终止」且不展示验收判定
     const li = document.createElement("li");
     li.className = "run-item" + (state.selectedRun === run.run_id ? " selected" : "");
     li.innerHTML = `
       <div class="rid">${run.run_id}</div>
       <div class="title">${escapeHtml(run.requirement_title || (running ? "（解析需求中…）" : "-"))}</div>
       <div class="meta">
-        <span class="badge ${running ? "running" : "done"}">${running ? "进行中" : "已完成"}</span>
-        ${run.verdict ? `<span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>` : ""}
+        <span class="badge ${running ? "running" : canceled ? "canceled" : "done"}">${running ? "进行中" : canceled ? "已终止" : "已完成"}</span>
+        ${!running && !canceled && run.verdict ? `<span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>` : ""}
         <span>${run.steps ?? 0} 步</span><span>${run.rollbacks ?? 0} 回退</span><span>${run.bugs_total ?? 0} 缺陷</span>
       </div>`;
     li.addEventListener("click", () => selectRun(run.run_id));
@@ -100,14 +103,15 @@ function renderChat() {
       }
       const run = state.runs.find((r) => r.run_id === m.runId);
       const running = !run || run.finished === false;
+      const canceled = !!(run && run.canceled);
       const meta = run
         ? `${run.steps ?? 0} 步 · ${run.rollbacks ?? 0} 回退 · ${run.bugs_total ?? 0} 缺陷${run.duration_s != null ? " · " + run.duration_s + "s" : ""}`
         : "已提交，等待流水线启动…";
       return `<div class="msg run-msg" data-run="${escapeHtml(m.runId)}" title="点击查看该次任务的执行情况与思考链路">
         <div class="bubble">
           <div class="msg-head">
-            <span class="badge ${running ? "running" : "done"}">${running ? "进行中" : "已完成"}</span>
-            ${run && run.verdict ? `<span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>` : ""}
+            <span class="badge ${running ? "running" : canceled ? "canceled" : "done"}">${running ? "进行中" : canceled ? "已终止" : "已完成"}</span>
+            ${run && run.verdict && !canceled ? `<span class="badge ${run.verdict === "pass" ? "pass" : "fail"}">${run.verdict === "pass" ? "通过" : "未通过"}</span>` : ""}
             <code>${escapeHtml(m.runId)}</code>
           </div>
           <div class="msg-meta">${escapeHtml(meta)}</div>
@@ -156,11 +160,14 @@ function renderRunDetail(detail, openTraces = []) {
   const s = detail.summary || {};
   const m = s.metrics || {};
   const iter = s.iterations || {};
-  const verdictCard = detail.finished === false
-    ? ["验收", "进行中…", "orange"]
-    : !s.verdict
-      ? ["验收", "异常中断", "red"]   // 无验收结论：服务中断/线程异常，未跑完
-      : ["验收", s.verdict === "pass" ? "通过" : "未通过", s.verdict === "pass" ? "green" : "red"];
+  const canceled = !!detail.canceled;
+  const verdictCard = canceled
+    ? ["验收", "已终止", "orange"]   // 用户手动终止：无验收结论，不做通过/未通过判定
+    : detail.finished === false
+      ? ["验收", "进行中…", "orange"]
+      : !s.verdict
+        ? ["验收", "异常中断", "red"]   // 无验收结论：服务中断/线程异常，未跑完
+        : ["验收", s.verdict === "pass" ? "通过" : "未通过", s.verdict === "pass" ? "green" : "red"];
   const cards = [
     verdictCard,
     ["总步数", s.steps ?? "-", ""],
@@ -183,7 +190,16 @@ function renderRunDetail(detail, openTraces = []) {
     })
     .join("");
 
+  const detailRunId = detail.run_id || s.run_id || "";
+  const cancelPending = cancelingRuns.has(detailRunId);
+  const cancelBar = detail.finished === false
+    ? `<div class="detail-actions"><button id="cancel-run" class="danger-btn"
+         data-run="${escapeHtml(detailRunId)}"${cancelPending ? " disabled" : ""}
+         title="终止该任务：当前节点会执行完毕再停止，运行标记为「已终止」，不做验收判定">${cancelPending ? "终止中…（当前节点执行完毕后停止）" : "■ 终止任务"}</button></div>`
+    : "";
+
   $("#run-detail").innerHTML = `
+    ${cancelBar}
     <div class="cards">${cards
       .map(([label, value, cls]) => `<div class="card"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`)
       .join("")}</div>
@@ -213,6 +229,46 @@ function renderRunDetail(detail, openTraces = []) {
     if (tl) tl.scrollTop = tl.scrollHeight; // 运行中自动滚动到最新事件
   }
 }
+
+/* ---------------- 终止运行任务（协作式取消，按钮在运行详情顶部） ---------------- */
+/* 请求成功仅代表取消信号已送达；Leader 在当前节点执行完毕后退出并收尾（状态「已终止」），
+   运行真正结束由轮询刷新呈现——期间按钮保持「终止中…」置灰态。 */
+async function cancelRun(runId) {
+  if (!runId) return;
+  if (!window.confirm(`确认终止运行 ${runId}？\n\n终止将在当前节点执行完毕后生效；该运行标记为「已终止」，不做验收判定。`)) return;
+  cancelingRuns.add(runId);
+  renderCache.runId = null;   // 强制重绘：按钮立即切到「终止中…」
+  if (state.selectedRun === runId) await selectRun(runId);
+  try {
+    const res = await fetch("/api/run/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      cancelingRuns.delete(runId);           // 信号未送达（已完成/非本进程运行）：按钮恢复
+      renderCache.runId = null;
+      await loadRuns();                      // 运行实际已结束：同步列表（否则停留旧的"进行中"）
+      if (state.selectedRun === runId) await selectRun(runId);
+      setComposerStatus(data.error || "终止失败", "error");
+      return;
+    }
+    setComposerStatus(`已请求终止 ${runId}：等待当前节点执行完毕后停止…`, "running");
+    activeRuns.add(runId);                   // 纳入轮询：结束提示「已终止」并清理置灰状态
+    startPolling();
+    await loadRuns();
+    if (state.selectedRun === runId) { renderCache.runId = null; await selectRun(runId); }
+  } catch (err) {
+    cancelingRuns.delete(runId);
+    setComposerStatus(`终止请求失败：${err.message}`, "error");
+  }
+}
+
+$("#run-detail").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("#cancel-run");
+  if (btn && btn.dataset.run) cancelRun(btn.dataset.run);
+});
 
 /* ---------------- 执行步骤（从事件流提炼） ---------------- */
 function buildSteps(events) {
@@ -315,12 +371,15 @@ $("#refresh-runs").addEventListener("click", loadRuns);
 let pollTimer = null;
 /* 正在执行的运行集合：支持上一个任务进行中继续发起新需求，各自独立刷新 */
 const activeRuns = new Set();
+/* 已请求终止的运行集合：按钮置灰为「终止中…」，直到运行真正结束（轮询刷新后移除） */
+const cancelingRuns = new Set();
 
-/* ---------------- 模型配置弹窗：API Key / Base URL / 默认模型 ---------------- */
+/* ---------------- 模型配置弹窗：API Key / Base URL / 默认模型 + 技能开关 ---------------- */
 const CFG = {
   overlay: "#settings-overlay", provider: "#cfg-provider", baseUrl: "#cfg-base-url",
   apiKey: "#cfg-api-key", model: "#cfg-model", tokenName: "#cfg-token-name",
   status: "#cfg-status", modelList: "#cfg-model-list", contextWindow: "#cfg-context-window",
+  skillsEnabled: "#cfg-skills-enabled", skillsToolsEnabled: "#cfg-skills-tools-enabled",
 };
 
 function setCfgStatus(text, cls) {
@@ -332,6 +391,65 @@ function setCfgStatus(text, cls) {
 async function fetchLlmConfig() {
   const res = await fetch("/api/llm");
   return res.json();
+}
+
+/* 技能开关（system.yaml 的 runtime.skills.enabled / tools_enabled，字段同名同义） */
+async function fetchSkillsConfig() {
+  const res = await fetch("/api/skills");
+  return res.json();
+}
+
+/* tools_enabled 依赖 enabled（后端双开才注册技能工具）：总开关关闭时置灰，避免误存无效组合 */
+function syncSkillsSwitchState() {
+  $(CFG.skillsToolsEnabled).disabled = !$(CFG.skillsEnabled).checked;
+}
+
+/* ---------------- 主界面技能开关（与弹窗内 #cfg-skills-enabled 同源）----------------
+   弹窗只在点击「⚙ 模型配置」时出现，主界面此前没有任何技能状态提示，
+   因此把总开关提到发起需求的控制条上：勾选即 POST /api/skills 写回 system.yaml，
+   与弹窗内的开关读写同一个字段，两处状态由下面的 sync 调用保持一致。 */
+async function refreshSkillsToggle() {
+  try {
+    const data = await fetchSkillsConfig();
+    state.skills.enabled = !!data.enabled;
+    state.skills.tools_enabled = !!data.tools_enabled;
+    $("#skills-toggle").checked = state.skills.enabled;
+  } catch { /* 读取失败不阻塞界面，保持上一次状态 */ }
+}
+
+async function toggleSkills() {
+  const el = $("#skills-toggle");
+  const enabled = el.checked;
+  try {
+    const res = await fetch("/api/skills", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled,
+        // 总开关关闭时工具开关无意义（后端双开才注册），一并置 false
+        tools_enabled: enabled ? state.skills.tools_enabled : false,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      el.checked = !enabled;
+      setComposerStatus(data.error || "技能开关保存失败", "error");
+      return;
+    }
+    state.skills.enabled = !!data.enabled;
+    state.skills.tools_enabled = !!data.tools_enabled;
+    el.checked = state.skills.enabled;
+    // 弹窗若正开着，同步回显，避免两处状态不一致
+    if (!$(CFG.overlay).hidden) {
+      $(CFG.skillsEnabled).checked = state.skills.enabled;
+      $(CFG.skillsToolsEnabled).checked = state.skills.tools_enabled;
+      syncSkillsSwitchState();
+    }
+    setComposerStatus(`技能系统已${state.skills.enabled ? "开启" : "关闭"}（下一次运行生效）`, "done");
+  } catch (err) {
+    el.checked = !enabled;
+    setComposerStatus(`技能开关保存失败：${err.message}`, "error");
+  }
 }
 
 /* 用弹窗里填写的（留空则用已保存的）凭据探测 /models，拿到该 Key 支持的模型列表 */
@@ -400,10 +518,13 @@ async function initLlmControls() {
   if (!state.llm.lastTraces.length) updateContextUsage([]);
 }
 
-/* 打开弹窗：回显当前生效的凭据与模型 */
+/* 打开弹窗：回显当前生效的凭据、模型与技能开关 */
 function openSettings() {
   setCfgStatus("正在读取当前配置……", "");
-  fetchLlmConfig().then((cfg) => {
+  Promise.all([
+    fetchLlmConfig(),
+    fetchSkillsConfig().catch(() => null),   // 技能开关读取失败不阻塞弹窗，保存仍按表单值写入
+  ]).then(([cfg, skills]) => {
     state.llm.apiKeySet = !!cfg.api_key_set;
     state.llm.apiKeyMasked = cfg.api_key_masked || "";
     $(CFG.provider).value = cfg.provider || "offline";
@@ -417,6 +538,14 @@ function openSettings() {
     $(CFG.apiKey).placeholder = cfg.api_key
       ? "输入新的 API Key（留空表示沿用已保存值）"
       : (cfg.api_key_masked ? `已保存 ${cfg.api_key_masked}（留空沿用）` : "输入你的 API Key");
+    if (skills) {
+      $(CFG.skillsEnabled).checked = !!skills.enabled;
+      $(CFG.skillsToolsEnabled).checked = !!skills.tools_enabled;
+      syncSkillsSwitchState();
+      state.skills.enabled = !!skills.enabled;
+      state.skills.tools_enabled = !!skills.tools_enabled;
+      $("#skills-toggle").checked = state.skills.enabled;   // 弹窗打开即与主界面开关对齐
+    }
     setCfgStatus(cfg.api_key_set ? `当前凭据：${cfg.api_key_masked}` : "当前未设置 API Key", "");
   }).catch(() => setCfgStatus("读取当前配置失败，请检查服务是否可用", "error"));
   $(CFG.overlay).hidden = false;
@@ -443,6 +572,12 @@ $(CFG.overlay).addEventListener("click", (ev) => { if (ev.target === $(CFG.overl
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && !$(CFG.overlay).hidden) closeSettings();
 });
+
+/* 技能总开关联动：关闭时置灰「技能工具调用」勾选框（值保留，后端双开才生效） */
+$(CFG.skillsEnabled).addEventListener("change", syncSkillsSwitchState);
+
+/* 主界面技能开关：勾选即时写回 system.yaml */
+$("#skills-toggle").addEventListener("change", toggleSkills);
 
 /* 显示/隐藏 API Key */
 $("#cfg-eye").addEventListener("click", () => {
@@ -512,8 +647,27 @@ $("#cfg-save").addEventListener("click", async () => {
     state.llm.model = data.model || model;
     state.llm.contextWindow = data.context_window || state.llm.contextWindow;
     updateContextUsage(state.llm.lastTraces);   // 改了上下文窗口立即重算进度条
+    // 技能开关与模型配置同一次保存写回 system.yaml（下一次运行生效，无需重启服务）
+    const skillsRes = await fetch("/api/skills", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled: $(CFG.skillsEnabled).checked,
+        tools_enabled: $(CFG.skillsToolsEnabled).checked,
+      }),
+    });
+    const skillsData = await skillsRes.json();
+    if (!skillsRes.ok) {
+      setCfgStatus(skillsData.error || "技能开关保存失败（模型配置已保存）", "error");
+      return;
+    }
+    // 弹窗保存后同步主界面开关（两处读写同一字段）
+    state.skills.enabled = !!skillsData.enabled;
+    state.skills.tools_enabled = !!skillsData.tools_enabled;
+    $("#skills-toggle").checked = state.skills.enabled;
     setCfgStatus(
-      `已保存：${data.provider}${data.model ? " / " + data.model : ""}${data.api_key_masked ? " · Key " + data.api_key_masked : ""}`,
+      `已保存：${data.provider}${data.model ? " / " + data.model : ""}${data.api_key_masked ? " · Key " + data.api_key_masked : ""}` +
+      `｜技能 ${skillsData.enabled ? "开" : "关"}${skillsData.tools_enabled ? "（含工具调用）" : ""}`,
       "done"
     );
     await refreshModelList({ preferModel: state.llm.model });   // 保存后按新 Key 重取模型，必要时自动回退
@@ -610,6 +764,7 @@ async function startRun() {
     $("#upload-doc").value = "";
     $("#upload-image").value = "";
     setUploadName("");
+    syncUploadUi();                                   // 已发送：隐藏「取消上传」按钮
     renderImageTray();
     state.selectedRun = data.run_id;
     activeRuns.add(data.run_id);
@@ -630,15 +785,20 @@ function startPolling() {
 }
 
 async function pollTick() {
-  await loadRuns();   // 列表里的"进行中 / 已完成"随轮询刷新
+  await loadRuns();   // 列表里的"进行中 / 已完成 / 已终止"随轮询刷新
   for (const runId of Array.from(activeRuns)) {
     const run = state.runs.find((r) => r.run_id === runId);
     if (run && run.finished !== false) {
       activeRuns.delete(runId);
-      setComposerStatus(
-        `完成 ${runId}：${run.verdict === "pass" ? "验收通过" : "验收未通过"}（${run.steps} 步 / ${run.rollbacks} 回退 / ${run.bugs_total} 缺陷）`,
-        run.verdict === "pass" ? "done" : "error"
-      );
+      cancelingRuns.delete(runId);   // 收尾置灰状态（按钮只在运行中出现，此处仅为状态清理）
+      if (run.canceled) {
+        setComposerStatus(`已终止 ${runId}：用户手动终止（第 ${run.steps} 步后停止，未参与验收判定）`, "");
+      } else {
+        setComposerStatus(
+          `完成 ${runId}：${run.verdict === "pass" ? "验收通过" : "验收未通过"}（${run.steps} 步 / ${run.rollbacks} 回退 / ${run.bugs_total} 缺陷）`,
+          run.verdict === "pass" ? "done" : "error"
+        );
+      }
     }
   }
   if (state.selectedRun) await selectRun(state.selectedRun);   // 刷新当前查看详情（含思考链路）
@@ -674,6 +834,41 @@ function setUploadName(text, cls) {
   el.className = `composer-status ${cls || ""}`;
 }
 
+/* 「取消上传」按钮跟随 state.upload 显隐：仅在已选择待发送文档时出现 */
+function syncUploadUi() {
+  $("#cancel-upload").hidden = !state.upload;
+}
+
+/* 取消本次上传：清前端已选状态（回到未上传状态）+ 删除服务端暂存文件。
+   删除失败不回滚前端取消——本地原文件仍在，服务端残留只是一次多余的暂存副本；
+   文件此前已不存在时按幂等处理（removed=false，不视为错误）。 */
+async function cancelUpload() {
+  const upload = state.upload;
+  if (!upload) return;
+  state.upload = null;
+  syncUploadUi();
+  $("#upload-doc").value = "";   // 允许重新选择同一文件
+  try {
+    const res = await fetch("/api/upload/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: upload.path }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      setUploadName(data.removed === false
+        ? `已取消本次上传：${upload.name}（暂存文件此前已不存在）`
+        : `已取消本次上传：${upload.name}（暂存文件已删除）`);
+    } else {
+      setUploadName(`已取消选择：${upload.name}（暂存文件未删除：${data.error || "未知错误"}）`, "error");
+    }
+  } catch (err) {
+    setUploadName(`已取消选择：${upload.name}（暂存文件未删除：${err.message}）`, "error");
+  }
+}
+
+$("#cancel-upload").addEventListener("click", cancelUpload);
+
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -706,14 +901,17 @@ async function uploadDocFile(file, nameOverride) {
     const data = await res.json();
     if (!res.ok) {
       state.upload = null;
+      syncUploadUi();
       setUploadName(data.error || "上传失败", "error");
       return false;
     }
     state.upload = { path: data.path, name: data.name };
+    syncUploadUi();   // 出现「取消上传」按钮（上传错误时可撤销本次上传）
     setUploadName(`已选择：${data.name}（${data.kind}，发送时将替代输入框内容）`, "done");
     return true;
   } catch (err) {
     state.upload = null;
+    syncUploadUi();
     setUploadName(`上传失败：${err.message}`, "error");
     return false;
   }
@@ -993,4 +1191,5 @@ function renderMarkdown(md) {
 
 /* ---------------- 启动 ---------------- */
 initLlmControls();
+refreshSkillsToggle();
 loadRuns();

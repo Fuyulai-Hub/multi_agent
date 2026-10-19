@@ -21,6 +21,7 @@ from ..llm import Generation, LLMClient
 from ..prompts import PromptBuilder, PromptBundle
 from ..schemas import AgentContext, AgentResult, NodeTask
 from ..experience import RetrievalResult
+from ..skills import SkillMatch, match_skills, render_for_prompt
 
 __all__ = ["BaseAgent", "Perception"]
 
@@ -59,6 +60,7 @@ class BaseAgent:
             result.prompt_path = bundle.path
             result.metrics["experience_injected"] = len(bundle.experiences)
             result.metrics["experience_tiers"] = bundle.tier_counts
+            result.metrics["skills_injected"] = len(bundle.skills)
             result.consumed_experience = [item["id"] for item in bundle.experiences]
             context = self.build_context(task, perception)
             generation = self._generate_with_tools(task, bundle, context, result)
@@ -152,13 +154,31 @@ class BaseAgent:
             # 否则严格实现的端点会因 tool_call_id 找不到归属而报 400。
             extra_messages.append(self._assistant_tool_message(generation))
             tool_messages = runner.execute(generation.tool_calls)
-            # tool 结果统一截断（docs/16 的 02 文档）：0=不截断，默认行为与现状一致
+            # tool 结果统一截断（docs/16 的 02 文档）：代码默认 0=不截断（与改造前一致）；
+            # 当前 system.yaml 实配 4000，截断已生效（runtime.tool_result_max_chars 可调）
             runtime = getattr(self.ctx.config, "runtime", None) or {}
             tool_max_chars = int(runtime.get("tool_result_max_chars", 0) or 0)
             if tool_max_chars > 0:
                 tool_messages = compress.truncate_tool_results(tool_messages, max_chars=tool_max_chars)
             extra_messages.extend(tool_messages)
             result.metrics["tool_rounds"] = round_index
+        # 轮数用尽时模型仍在请求工具（正文为空）：再发起一次**不带 tools** 的生成，强制收敛出正文。
+        # 此前直接返回最后一轮（finish_reason=tool_calls、正文 0 字符），act() 会判
+        # 「模型未返回可解析的 JSON」使节点失败——2026-10-17 的真实运行
+        # 20261017-020255-e0cf 即此路径（2 轮工具调用用尽 → intake 节点 fail）。
+        # 只在「有 tool_calls 且正文为空」这一异常分支追加一次调用，正常路径逐字节不变。
+        if generation is not None and generation.tool_calls and not (generation.text or "").strip():
+            self.ctx.events.emit(
+                "tool_rounds_exhausted", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={
+                    "rounds": max_rounds,
+                    "tool_calls": [call.get("name", "") for call in generation.tool_calls],
+                },
+            )
+            generation = self.ctx.llm.generate(
+                self.task_kind_for(task), bundle, context, extra_messages=extra_messages,
+            )
         return generation
 
     @staticmethod
@@ -246,8 +266,9 @@ class BaseAgent:
     def perceive(self, task: NodeTask) -> Perception:
         names = self.ctx.config.collaboration.perception_of(self.role_id) or list(task.inputs)
         found, missing = self.ctx.blackboard.require(names)
-        # 感知段单产物字符预算：默认 900 会把 12 个功能点的需求规格截到只剩 3 个 FP 片段
-        # （attempt03 实测 implement/test 全程信息残缺）；由 runtime.prompt_artifact_max_chars 配置
+        # 感知段单产物字符预算：调高前的历史默认 900 会把 12 个功能点的需求规格截到只剩 3 个 FP 片段
+        # （attempt03 实测 implement/test 全程信息残缺）；代码默认与当前 system.yaml 实配均为 10000
+        # （runtime.prompt_artifact_max_chars 可再调）
         max_chars = int(self.ctx.config.runtime.get("prompt_artifact_max_chars", 10000))
         # 上下文压缩（docs/16 的 02 文档）：enabled=false 时恒等返回，行为与现状逐字节一致。
         # 压缩只改「进 Prompt 的内容」，黑板 artifact 数据不变（门禁求值走 snapshot，完全隔离）。
@@ -291,6 +312,40 @@ class BaseAgent:
             current_run=self.ctx.run_id,
         )
 
+    # ---------------------------------------------------------------- 技能
+    def match_skills(self, task: NodeTask, perception: Perception) -> List[SkillMatch]:
+        """节点级技能匹配（未配置 `runtime.skills.enabled` 时代码默认关闭，关闭时返回空列表；
+        当前 config/system.yaml 已实配 `enabled: true`，匹配真实生效）。
+
+        匹配全确定性（规则见 `mas.skills.score_skill`）：`trigger.requires_artifacts`
+        对黑板实际产物、`trigger.nodes`/`roles` 对当前节点与角色、`keywords`/`intents`
+        对需求文本与节点标签。同一输入必得同一输出，故可回放、可对照。
+        """
+        cfg = dict(self.ctx.config.runtime.get("skills") or {})
+        if not bool(cfg.get("enabled", False)):
+            return []
+        spec = perception.spec
+        points = [str(item.get("title") or "") for item in (spec.get("function_points") or [])
+                  if isinstance(item, dict)]
+        context_text = " ".join(
+            [task.title, task.directive, str(spec.get("title", "")), str(spec.get("summary", ""))]
+            + [str(tag) for tag in (spec.get("tags") or [])] + points
+        )
+        intent_tags = [
+            task.node_id, self.role_id, self.task_kind_for(task),
+            str(spec.get("delivery_shape") or ""),
+        ] + [str(tag) for tag in (spec.get("tags") or [])]
+        return match_skills(
+            self.ctx.config.skills_dir,
+            node_id=task.node_id,
+            role_id=self.role_id,
+            context_text=context_text,
+            intent_tags=intent_tags,
+            artifacts=sorted(perception.found.keys()),
+            min_score=int(cfg.get("min_score", 1) or 1),
+            limit=int(cfg.get("max_items", 3) or 3),
+        )
+
     # ---------------------------------------------------------------- Prompt
     def build_prompt(
         self, task: NodeTask, perception: Perception, experience: RetrievalResult
@@ -300,6 +355,25 @@ class BaseAgent:
         directive = task.directive
         if task.rollback_reason:
             directive = (directive + "；" if directive else "") + f"回退原因：{task.rollback_reason}"
+        skills = self.match_skills(task, perception)
+        skills_text = ""
+        if skills:
+            runtime_cfg = dict(self.ctx.config.runtime.get("skills") or {})
+            max_chars = int(runtime_cfg.get("max_chars", 88000) or 0)
+            skills_text = render_for_prompt(skills, max_chars=max_chars)
+            self.ctx.events.emit(
+                "skill_matched", agent=self.role_id, node=task.node_id, iteration=task.iteration,
+                payload={
+                    "matched": [
+                        {"id": item.id, "score": item.score, "hits": item.hits,
+                         "steps": len(item.steps), "body_chars": len(item.body)}
+                        for item in skills
+                    ],
+                    "injected_chars": len(skills_text),
+                    # 0=不截断；未截断时长度必不超过预算，故此判据只在预算为正时有意义
+                    "truncated": max_chars > 0 and len(skills_text) > max_chars,
+                },
+            )
         return self.ctx.prompts.build(
             role=role_cfg,
             node=node,
@@ -312,6 +386,10 @@ class BaseAgent:
             missing=perception.missing,
             experience=experience,
             contract=self.contract_for(task),
+            skills_text=skills_text,
+            skill_matches=[
+                {"id": item.id, "name": item.name, "score": item.score} for item in skills
+            ],
             context={
                 "perception": sorted(perception.found.keys()),
                 "missing": perception.missing,

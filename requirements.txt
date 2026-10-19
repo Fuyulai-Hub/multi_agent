@@ -1,1 +1,10 @@
 PyYAML>=6.0
+
+# ---- 可选依赖（docs/25 存储层接入）-----------------------------------------
+# MySQL 索引/结构层：未安装时 mas.store.build_mysql_backend 返回 None，
+# 全系统自动回落到 jsonl 文件路径（软依赖降级，不报错）。
+# 安装：pip install PyMySQL>=1.1
+# PyMySQL>=1.1
+
+# Redis 协调层（运行注册表 / 缓存 / 分布式锁）为零依赖实现：
+# mas/store/redis_backend.py 用标准库 socket 直接讲 RESP2 协议，无需 redis-py。

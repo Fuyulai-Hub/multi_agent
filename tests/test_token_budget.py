@@ -184,7 +184,7 @@ class _BudgetAgent(BaseAgent):
 
     def build_prompt(self, task, perception, experience):
         return SimpleNamespace(path=None, system="你是研发工程师", user="请实现需求",
-                               experiences=[], tier_counts={})
+                               experiences=[], skills=[], tier_counts={})
 
     def build_context(self, task, perception):
         return {"spec": {}}
@@ -226,7 +226,7 @@ class TokenBudgetTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _bundle(self):
-        return SimpleNamespace(path=None, system="sys", user="user", experiences=[], tier_counts={})
+        return SimpleNamespace(path=None, system="sys", user="user", experiences=[], skills=[], tier_counts={})
 
     # ---------------------------------------------------------------- 1 usage 明细
     def test_usage_details_parsed(self):

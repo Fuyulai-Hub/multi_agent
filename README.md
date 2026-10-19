@@ -33,6 +33,15 @@ python -m mas run --requirement "实现一个订单金额计算与校验服务�
 python -m mas run --requirement examples/requirements/order_pricing_service.md --profile strict
 python -m mas run --requirement examples/requirements/order_pricing_service.md --profile lean
 
+# 需求附图输入（可重复；后缀限 png/jpg/jpeg/webp/gif，单张 ≤5MB）
+python -m mas run --requirement examples/requirements/order_pricing_service.md --image docs/flow.png
+
+# 只入队不执行（需 Redis；由独立 worker 进程消费，API 与运行生命周期解耦）
+python -m mas run --requirement examples/requirements/order_pricing_service.md --enqueue
+python -m mas worker                 # 另起终端：消费任务（心跳/ACK/PEL 认领/重试/死信）
+python -m mas mq status              # 消息队列健康：运行流积压 / PEL / DLQ / worker
+python -m mas store status           # MySQL/Redis 存储后端健康报告（未装 PyMySQL 时自动降级）
+
 # 查看报告与经验库
 python -m mas report show latest
 python -m mas experience list
@@ -200,8 +209,8 @@ config/skills/<skill-id>/
 
 | Provider | 说明 |
 | --- | --- |
-| `offline`（默认） | 内置确定性 Provider：解析需求 → 匹配算子 → 生成**真实可运行代码**与**真实可执行测试**，并按配置注入首轮缺陷以演示缺陷闭环。无 API Key 即可端到端跑通 |
-| `openai_compatible` | 标准 `/chat/completions` 接口，处理任意需求（`config/system.yaml` 的 `llm.provider` 设为它，模型名填端点上真实存在的模型） |
+| `offline` | 内置确定性 Provider：解析需求 → 匹配算子 → 生成**真实可运行代码**与**真实可执行测试**，并按配置注入首轮缺陷以演示缺陷闭环。无 API Key 即可端到端跑通；未配置 `llm.provider` 时的代码默认值 |
+| `openai_compatible`（当前 `config/system.yaml` 实配） | 标准 `/chat/completions` 接口，处理任意需求。**需要 API Key**：无 Key 直接报错，不会自动回退 `offline`；模型名填端点上真实存在的模型 |
 
 ### API Key 与 BASE_URL 的外注方式
 
@@ -259,17 +268,31 @@ mas/
 ├── config.py       # 配置加载/深合并/校验（Profile、节点裁剪、LLM 凭据外注）
 ├── expr.py         # 门禁表达式安全求值（AST 白名单）
 ├── events.py       # 事件日志
-├── blackboard.py   # 版本化共享黑板
-├── bus.py          # 消息总线（direct/broadcast/request-response）
+├── blackboard.py   # 版本化共享黑板（跨进程文件锁）
+├── filelock.py     # 跨进程文件锁（msvcrt / flock）
+├── bus.py          # 消息总线（direct/broadcast/request-response + 可选 MQ 投递）
 ├── experience.py   # 分级经验库：提炼/检索/注入/晋级/反馈
 ├── prompts.py      # Prompt 组装（感知段 + 分层经验段 + 交付契约）
 ├── llm.py          # LLM 客户端（offline / openai_compatible）
 ├── skills.py       # 技能注册表：目录规范、持久化、参数校验、冒烟、流程沉淀
 ├── mcp.py          # MCP 服务配置与最小客户端（stdio / sse，仅实现健康检查所需方法）
+├── toolrunner.py   # MCP 工具 ↔ function calling 适配器（工具调用闭环）
 ├── sandbox.py      # 沙箱执行 + AST 静态分析
+├── compress.py     # 上下文压缩（Prompt 感知段，默认关闭恒等返回）
+├── concurrency.py  # 线程池并行原语（保序 map）
+├── envprobe.py     # 环境探测（node / 浏览器 MCP 可用性，发布 env_probe 产物）
+├── intent.py       # 交付形态意图识别（backend_only / full_stack_ssr / full_stack_spa）
+├── sources.py      # 输入源适配（分类/文档抽取/飞书/上传暂存/附图）
+├── uiprober.py     # UI 证据采集（浏览器 MCP 执行 checks）
+├── websearch.py    # 联网搜索工具（bing / tavily / serpapi）
+├── mq.py           # 消息队列（Redis Streams：任务队列 + Agent 消息流）
+├── runhub.py       # 运行注册表（进程内 / Redis 跨进程，取消协调）
+├── worker.py       # 运行 worker：消费任务、心跳、ACK、重试、死信
+├── store/          # MySQL/Redis 后端（软依赖：连接失败自动降级不抛异常）
 ├── leader.py       # 调度器：状态机/门禁/回退/协商/经验闭环
 ├── schemas.py      # 数据契约
+├── errors.py       # 异常层级
 ├── agents/         # 5 个角色 Agent（基类 + 实现）
-├── providers/      # 离线确定性 Provider + 算子库
-└── cli.py          # CLI（run/demo/experience/config/report）
+├── providers/      # 离线确定性 Provider + 算子库（ops.py）
+└── cli.py          # CLI（run/demo/experience/store/worker/mq/config/report/skill/mcp）
 ```

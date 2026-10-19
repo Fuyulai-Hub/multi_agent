@@ -81,7 +81,7 @@ class RetryClassificationTests(unittest.TestCase):
         self.config.llm["retry"] = {"max_attempts": 3, "backoff_s": 0}
         self.config.llm_overrides = {"api_key": "stub-key", "base_url": "http://127.0.0.1:1/v1"}
         self.bundle = SimpleNamespace(
-            path=None, system="sys", user="请解析需求", experiences=[], tier_counts={})
+            path=None, system="sys", user="请解析需求", experiences=[], skills=[], tier_counts={})
 
     def tearDown(self):
         self.tmp.cleanup()

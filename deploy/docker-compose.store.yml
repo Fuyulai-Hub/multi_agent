@@ -1,0 +1,54 @@
+# MySQL + Redis 存储层服务编排（docs/25 / docs/28）
+#
+# 用途：multi_agent 的存储后端（MySQL=索引/结构层，Redis=跨进程协调层）。
+#   docker compose -f deploy/docker-compose.store.yml up -d
+#
+# 说明：
+# - 当前开发机上的 mas-mysql / mas-redis 容器是先以 docker run 手工创建的
+#   （见 docs/28 的「服务启停命令」），数据卷 mas-mysql-data / mas-redis-data
+#   已存在；本文件面向新环境一键复现，环境变量仅在**首次初始化空数据卷**时生效。
+# - 密码约定：root 密码与 mas 业务账号密码都通过 .env 外注（与 LLM 凭据同款
+#   三通道约定：环境变量 > config/credentials.yaml > system.yaml 默认值），
+#   不写进任何提交到 git 的文件。复制 .env.example 为 .env 后自行填写。
+# - 端口绑定 127.0.0.1：只监听本机回环，不暴露到局域网。
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mas-mysql
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MAS_MYSQL_ROOT_PASSWORD:?required in .env}
+      MYSQL_DATABASE: multi_agent
+      MYSQL_USER: mas
+      MYSQL_PASSWORD: ${MAS_MYSQL_PASSWORD:?required in .env}
+    volumes:
+      - mas-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MAS_MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: mas-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    # appendonly yes：重启不丢取消键/心跳（TTL 到期自然清理，无人工维护成本）
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - mas-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mas-mysql-data:
+  mas-redis-data:

@@ -6,6 +6,10 @@
     python -m mas run --requirement ... --profile strict
     python -m mas demo                       # 三轮演示（文档 → 复用经验 → 文字需求输入）
     python -m mas experience list|stats|report|prune
+    python -m mas store status|init|migrate  # MySQL/Redis 接入：健康检查 / 建表 / 历史数据迁移
+    python -m mas worker [--once]            # 独立 worker：消费 Redis Stream 运行任务
+    python -m mas run ... --enqueue          # 只入队，由独立 worker 执行
+    python -m mas mq status [--run-id ...]   # 消息队列积压/消费组/worker 健康
     python -m mas config show|validate [--profile lean]
     python -m mas report list|show [run_id|latest]
     python -m mas skill list|show|add|edit|remove|check
@@ -28,6 +32,7 @@ from .config import SystemConfig, load_config
 from .errors import ConfigError
 from .experience import ExperienceLibrary
 from .leader import Leader, RunSummary
+from .runhub import build_registry
 from .mcp import (
     add_server,
     check_server,
@@ -82,12 +87,55 @@ def _apply_credential_overrides(config: SystemConfig, args: argparse.Namespace) 
         config.llm_overrides["base_url"] = base_url
 
 
+def _enqueue_run(config: SystemConfig, args: argparse.Namespace) -> int:
+    """``run --enqueue``：把运行投递到 Redis Stream，由独立 worker 执行。"""
+    import secrets
+
+    from datetime import datetime
+
+    from .mq import MQUnavailable, enqueue_run_task
+
+    stamp = datetime.now().strftime(str(config.runtime.get("run_id_format", "%Y%m%d-%H%M%S")))
+    run_id = args.run_id or f"{stamp}-{secrets.token_hex(2)}"
+    payload: Dict[str, Any] = {
+        "source": "cli",
+        "requirement": args.requirement,
+        "as_text": bool(args.text),
+        "workspace": str(config.workspace_dir),
+        "profile": config.profile,
+        "images": list(args.image or []),
+    }
+    if args.base_url:
+        payload["base_url"] = args.base_url
+    try:
+        result = enqueue_run_task(
+            config, payload, run_id=run_id, api_key=args.api_key,
+            config_dir=_resolve_config_dir(args.config),
+        )
+    except MQUnavailable as exc:
+        print(f"入队失败：{exc}", file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "run_id": run_id,
+        "status": "duplicate" if result.get("duplicate") else "queued",
+        "stream": result.get("stream"),
+        "entry_id": result.get("_stream_id"),
+        "workspace": str(config.workspace_dir),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config = _load(args)
+    if getattr(args, "enqueue", False):
+        return _enqueue_run(config, args)
     _apply_credential_overrides(config, args)
     leader = Leader(config)
+    # 运行注册表（docs/25 协调层）：Redis 可用则跨进程心跳/可取消，否则进程内版
+    # （行为与改造前一致）。CLI 发起的运行同样可在面板「终止任务」。
+    registry = build_registry(config, _resolve_config_dir(args.config))
     summary = leader.run(args.requirement, as_text=args.text, run_id=args.run_id,
-                         images=args.image or None)
+                         images=args.image or None, registry=registry)
     print(json.dumps({
         "run_id": summary.run_id,
         "verdict": summary.verdict,
@@ -113,22 +161,23 @@ def cmd_demo(args: argparse.Namespace) -> int:
         return 2
 
     summaries: List[RunSummary] = []
+    registry = build_registry(config, _resolve_config_dir(args.config))
     print("=" * 72)
     print("演示 1/3：需求文档输入（首轮，含注入缺陷 → 审查驳回 → 缺陷修复闭环）")
     print("=" * 72)
-    summaries.append(Leader(config).run(str(requirement_path)))
+    summaries.append(Leader(config).run(str(requirement_path), registry=registry))
 
     for index in range(2, args.runs + 1):
         print("\n" + "=" * 72)
         print(f"演示 {index}/{args.runs + 1}：同一需求再次运行（经验库注入 → 观察自学习收益）")
         print("=" * 72)
-        summaries.append(Leader(config).run(str(requirement_path)))
+        summaries.append(Leader(config).run(str(requirement_path), registry=registry))
 
     print("\n" + "=" * 72)
     print(f"演示 {args.runs + 1}/{args.runs + 1}：文字需求描述输入（--text，验证双输入通道）")
     print("=" * 72)
     text = requirement_path.read_text(encoding="utf-8")
-    summaries.append(Leader(config).run(text, as_text=True))
+    summaries.append(Leader(config).run(text, as_text=True, registry=registry))
 
     print("\n" + "=" * 72)
     print("多轮运行对比（自学习闭环效果）")
@@ -177,6 +226,149 @@ def cmd_experience(args: argparse.Namespace) -> int:
         removed = library.prune(min_confidence=float(getattr(args, "min_confidence", 0.2)))
         print(f"已清理 {removed} 条低价值经验")
     return 0
+
+
+# ---------------------------------------------------------------- store
+def cmd_store(args: argparse.Namespace) -> int:
+    """存储后端管理（docs/25）：status 健康检查 / init 建表 / migrate 历史数据迁移。
+
+    三个子命令都只读配置与数据库，不改流水线行为；MySQL 不可用时给出可执行的
+    排查清单（与 LLM 凭据排查同款风格）。
+    """
+    config = _load(args)
+    config_dir = _resolve_config_dir(args.config)
+    action = args.action or "status"
+
+    if action == "status":
+        from .store import store_status
+
+        report = store_status(config, config_dir)
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        if not report.get("enabled"):
+            print("\n（store.enabled=false：未接入数据库，流水线按既有 jsonl/内存路径运行）")
+            return 0
+        if not report.get("workspace_guard", True):
+            print("\n（当前 workspace 不是 system.yaml 指定的规范工作区，已自动禁用数据库接入）")
+            return 1
+        healthy = all(bool((report.get(key) or {}).get("ok")) for key in ("mysql", "redis"))
+        return 0 if healthy else 1
+
+    if action == "init":
+        from .store import build_mysql_backend
+
+        mysql = build_mysql_backend(config, config_dir)
+        if mysql is None:
+            print("MySQL 后端不可用，无法初始化 schema。请逐项排查：")
+            print("  1. config/system.yaml → runtime.store.enabled / runtime.store.mysql.enabled 是否为 true")
+            print("  2. 服务是否已启动：docker ps --filter name=mas-mysql（启停见 docs/25 附录）")
+            print("  3. 连接参数：环境变量 MAS_MYSQL_HOST/PORT/USER/PASSWORD/DATABASE，")
+            print("     或 config/credentials.yaml 的 store.mysql 段")
+            print("  4. PyMySQL 是否已装入当前解释器：pip install PyMySQL")
+            print("  5. 当前 --workspace 须为规范工作区（默认即为，勿用临时目录）")
+            return 1
+        schema_path = Path(__file__).resolve().parent / "store" / "schema.sql"
+        executed = mysql.ensure_schema(schema_path)   # int：执行的 DDL 语句数
+        print(f"schema 已就绪：{schema_path}（执行 {executed} 条 DDL，幂等可重复）")
+        health = mysql.health()
+        print(json.dumps(health, ensure_ascii=False, indent=2, default=str))
+        return 0 if health.get("ok") else 1
+
+    if action == "migrate":
+        from .experience import migrate_jsonl_to_mysql
+        from .leader import upsert_run_index
+        from .store import build_mysql_backend
+
+        mysql = build_mysql_backend(config, config_dir)
+        if mysql is None:
+            print("MySQL 后端不可用，无法迁移（排查清单见 `python -m mas store init` 的输出）")
+            return 1
+        # 1) 经验库 experiences.jsonl + 指标 metrics.jsonl（INSERT IGNORE：只补缺口，
+        #    永不覆盖 MySQL 既有行——启用后实时写入只进 MySQL，jsonl 是陈旧快照）
+        stats = migrate_jsonl_to_mysql(mysql, config.workspace_dir, config.learning)
+        # 2) runs 目录 → runs / run_metrics 表（run_summary.json 为投影源，SSOT 不动；
+        #    run_summary 每轮运行都重写，UPSERT 幂等且不会覆盖更新的值）
+        migrated_runs = 0
+        runs_dir = config.runs_dir
+        if runs_dir.exists():
+            for summary_path in sorted(runs_dir.glob("*/run_summary.json")):
+                try:
+                    data = json.loads(summary_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                run_id = str(data.get("run_id") or summary_path.parent.name)
+                metrics = data.get("metrics") or {}
+                canceled = bool(data.get("canceled"))
+                upsert_run_index(mysql, row={
+                    "run_id": run_id,
+                    "requirement_title": data.get("requirement_title"),
+                    "verdict": data.get("verdict"),
+                    "steps": data.get("steps") or 0,
+                    "rollbacks": data.get("rollbacks") or 0,
+                    "review_rejections": data.get("review_rejections") or 0,
+                    "bugs_total": data.get("bugs_total") or 0,
+                    "bugs_fixed": data.get("bugs_fixed") or 0,
+                    "duration_s": metrics.get("duration_s") or 0.0,
+                    "injected_experiences": metrics.get("injected_experiences") or 0,
+                    "profile": metrics.get("profile"),
+                    "ts": metrics.get("ts") or "",
+                    "canceled": canceled,
+                })
+                if not canceled and metrics:
+                    mysql.execute(
+                        "INSERT INTO run_metrics (run_id, metrics) VALUES (%s, %s) "
+                        "ON DUPLICATE KEY UPDATE metrics = VALUES(metrics)",
+                        (run_id, mysql.to_json(metrics)),
+                    )
+                migrated_runs += 1
+        print(f"迁移完成（幂等，可重复执行；既有行不覆盖，只补缺口）：经验 {stats['experiences']} 条"
+              f"（折叠历史漂移行 {stats['collapsed_rows']} 条）、"
+              f"指标 {stats['metrics']} 条、运行 {migrated_runs} 轮")
+        print("源文件未改动：SSOT 仍是 workspace 下的 jsonl / run_summary.json。")
+        return 0
+    return 1
+
+
+# ---------------------------------------------------------------- worker / mq
+def cmd_worker(args: argparse.Namespace) -> int:
+    """独立 worker：消费 Redis Stream 的运行任务（``--once`` 用于验证单条闭环）。"""
+    from .mq import MQUnavailable
+    from .worker import RunWorker
+
+    config = _load(args)
+    config_dir = _resolve_config_dir(args.config)
+    registry = build_registry(config, config_dir)
+    try:
+        worker = RunWorker(config, config_dir=config_dir, registry=registry,
+                           worker_id=args.worker_id or None)
+    except MQUnavailable as exc:
+        print(f"worker 启动失败：{exc}", file=sys.stderr)
+        return 2
+    if args.poll_ms is not None:
+        worker.queue.poll_ms = int(args.poll_ms)
+    if args.once:
+        worker.worker_registry.register(
+            worker.worker_id, queue=worker.queue.mq.stream_key(worker.queue.STREAM),
+            group=worker.queue.group, workspace=str(worker.workspace),
+        )
+        try:
+            handled = worker.poll_once(block_ms=int(args.wait_ms))
+        finally:
+            worker.cleanup()
+        print(json.dumps({**worker.status(), "handled": handled},
+                         ensure_ascii=False, indent=2, default=str))
+        return 0
+    worker.run_forever()
+    return 0
+
+
+def cmd_mq(args: argparse.Namespace) -> int:
+    """MQ 健康与积压：运行流、消费组 PEL、DLQ、延迟重试、在线 worker、Agent 事件流。"""
+    from .mq import mq_status
+
+    config = _load(args)
+    report = mq_status(config, _resolve_config_dir(args.config), run_id=args.run_id)
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if report.get("enabled") else 1
 
 
 # ---------------------------------------------------------------- config
@@ -414,6 +606,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="需求附图（可重复；后缀限 png/jpg/jpeg/webp/gif，单张 ≤5MB）")
     run_p.add_argument("--api-key", default=None, help="覆盖 API Key（等价环境变量 OPENAI_API_KEY，优先级更高）")
     run_p.add_argument("--base-url", default=None, help="覆盖 BASE_URL（等价环境变量 OPENAI_BASE_URL，优先级更高）")
+    run_p.add_argument("--enqueue", action="store_true",
+                       help="只投递到 Redis Stream，由 `python -m mas worker` 执行（需 runtime.mq 启用）")
     run_p.set_defaults(func=cmd_run)
 
     demo_p = sub.add_parser("demo", help="多轮演示：文档输入 + 经验复用 + 文字输入")
@@ -433,6 +627,32 @@ def build_parser() -> argparse.ArgumentParser:
     exp_p.add_argument("--workspace", default=None)
     exp_p.add_argument("--min-confidence", type=float, default=0.2)
     exp_p.set_defaults(func=cmd_experience)
+
+    store_p = sub.add_parser("store", help="存储后端（MySQL/Redis）管理：状态 / 建表 / 历史数据迁移")
+    store_p.add_argument("action", nargs="?", default="status", choices=["status", "init", "migrate"])
+    store_p.add_argument("--config", default="config")
+    store_p.add_argument("--profile", default=None)
+    store_p.add_argument("--workspace", default=None)
+    store_p.set_defaults(func=cmd_store)
+
+    worker_p = sub.add_parser("worker", help="运行 worker：消费 Redis Stream 任务（ACK/PEL/重试/死信）")
+    worker_p.add_argument("--once", action="store_true", help="只消费一轮后退出（验证/运维用）")
+    worker_p.add_argument("--wait-ms", type=int, default=0,
+                          help="--once 时阻塞等待新消息的毫秒数（默认 0，不等待）")
+    worker_p.add_argument("--poll-ms", type=int, default=None, help="覆盖 runtime.mq.poll_ms")
+    worker_p.add_argument("--worker-id", default=None, help="指定 worker 标识（默认 host-pid-随机）")
+    worker_p.add_argument("--config", default="config")
+    worker_p.add_argument("--profile", default=None)
+    worker_p.add_argument("--workspace", default=None)
+    worker_p.set_defaults(func=cmd_worker)
+
+    mq_p = sub.add_parser("mq", help="消息队列健康：运行流积压 / 消费组 PEL / DLQ / worker / Agent 事件流")
+    mq_p.add_argument("action", nargs="?", default="status", choices=["status"])
+    mq_p.add_argument("--run-id", default=None, help="附带该运行的 Agent/事件流消费组详情")
+    mq_p.add_argument("--config", default="config")
+    mq_p.add_argument("--profile", default=None)
+    mq_p.add_argument("--workspace", default=None)
+    mq_p.set_defaults(func=cmd_mq)
 
     cfg_p = sub.add_parser("config", help="配置查看与校验")
     cfg_p.add_argument("action", nargs="?", default="show", choices=["show", "validate"])

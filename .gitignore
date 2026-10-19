@@ -2,6 +2,11 @@
 workspace/
 # 本地 LLM 凭据（含密钥，禁止提交）
 config/credentials.yaml
+# 简历声称的本地验证工作区（一次性跑测证据，见 docs/19）
+.tmp-verify/
+# 本地临时跑测目录与改动前备份（一次性产物，禁止提交）
+.tmp-*/
+.bak-*/
 # Python
 __pycache__/
 *.py[cod]
@@ -9,3 +14,8 @@ __pycache__/
 .venv/
 # WorkBuddy 本地项目数据（会话/记忆，禁止提交）
 .workbuddy/
+# 存储层服务编排的本地密码外注（docs/28；.env.example 是模板，允许提交）
+deploy/.env
+# 外部开源仓库的本地副本（仅供架构对比参考，见 docs/27、docs/29）：codex monorepo ~800M，superpowers ~3.5M
+codex-code/
+tdd/

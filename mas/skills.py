@@ -15,12 +15,27 @@ SKILL.md 的 front-matter 必填字段与需求条目一一对应：
 | `name` | 名称 |
 | `description` | 描述 |
 | `when_to_use` | 适用场景 |
-| `trigger` | 触发条件（keywords / intents / requires_artifacts） |
+| `trigger` | 触发条件（keywords / intents / requires_artifacts / nodes / roles） |
 | `inputs` | 入参说明（每项含 name / type / required / description） |
 | `steps` | 执行步骤（非空字符串列表） |
 
 可选字段：`version`、`source`（manual | distilled）、`source_run`、`outputs`、
-`error_handling`、`checkpoints`、`smoke`、`tags`。正文用于补充说明，不参与校验。
+`error_handling`、`checkpoints`、`smoke`、`tool`、`tags`。
+
+正文（`---` 之后的全部内容）是**方法本体**：节点命中该技能时按全文注入进
+Prompt（见 `render_for_prompt`），front-matter 的 `steps`/`checkpoints`/
+`error_handling` 排在正文之前作为提要索引。校验只检查 front-matter，正文不参与。
+
+`tool` 字段（可选）把技能接入 function calling：
+
+    tool:
+      script: scripts/guard.py     # 相对技能目录的脚本路径（必需，声明了才注册为工具）
+      description: ""              # 可选：覆盖工具描述（默认取 skill.description + when_to_use）
+
+声明后技能会被注册为 `skill_<id>` 工具（inputs → function schema），模型调用时框架
+按 inputs 做参数白名单过滤 / required 校验 / default 填充，经 `mas.sandbox.Sandbox`
+（root=技能目录）以单个 JSON 参数（`sys.argv[1]`）执行脚本，脚本 stdout 原样回灌给模型。
+方法本体无法变成调用，继续走 `render_for_prompt` 的全文注入路径，两者并存。
 
 本模块不依赖 LLM，全部为确定性实现；冒烟执行复用 `mas.sandbox.Sandbox`。
 """
@@ -44,6 +59,7 @@ __all__ = [
     "SKILL_FILE",
     "REQUIRED_FIELDS",
     "Skill",
+    "SkillMatch",
     "parse_skill_text",
     "render_skill_text",
     "load_skill",
@@ -54,9 +70,15 @@ __all__ = [
     "validate_skill",
     "check_skill",
     "describe_skill",
+    "score_skill",
+    "match_skills",
+    "render_for_prompt",
     "load_run_artifacts",
     "load_run_facts",
     "distill_meta",
+    "skill_tool_name",
+    "build_tool_schema",
+    "run_skill_script",
 ]
 
 SKILL_FILE = "SKILL.md"
@@ -217,8 +239,9 @@ def validate_skill(skill: Skill) -> List[str]:
 
     if isinstance(meta.get("trigger"), dict):
         trigger = meta["trigger"]
-        if not (trigger.get("keywords") or trigger.get("intents")):
-            problems.append("trigger 至少要有 keywords 或 intents 之一")
+        if not (trigger.get("keywords") or trigger.get("intents")
+                or trigger.get("nodes") or trigger.get("roles")):
+            problems.append("trigger 至少要有 keywords / intents / nodes / roles 之一（否则永远无法匹配）")
     elif "trigger" in meta:
         problems.append("trigger 必须是映射(dict)")
 
@@ -243,6 +266,13 @@ def validate_skill(skill: Skill) -> List[str]:
             problems.append("smoke 必须是含 command 的映射(dict)")
         elif not isinstance(smoke["command"], list) or not smoke["command"]:
             problems.append("smoke.command 必须是非空列表（如 [python, -c, \"print(1)\"]）")
+
+    # tool 只校验结构（script 是非空相对路径）；脚本文件是否存在由注册端（leader）与
+    # `skill check` 负责——此处不查文件，避免脚本临时缺失连带禁用技能的文本注入路径。
+    if "tool" in meta:
+        tool = meta.get("tool")
+        if not isinstance(tool, dict) or not str(tool.get("script") or "").strip():
+            problems.append("tool 必须是含 script（相对技能目录的脚本路径）的映射(dict)")
 
     source = meta.get("source")
     if source is not None and source not in (SOURCE_MANUAL, SOURCE_DISTILLED):
@@ -515,6 +545,10 @@ def describe_skill(skill: Skill) -> str:
         f"路径      : {skill.path}",
         f"描述      : {skill.description}",
     ]
+    tool = skill.meta.get("tool")
+    if isinstance(tool, dict) and tool.get("script"):
+        lines.append(f"可调用工具: {skill_tool_name(skill.id)} → {tool['script']}"
+                     f"（inputs 映射为 function schema，沙箱执行后 stdout 回灌）")
     when_to_use = skill.meta.get("when_to_use") or []
     lines.append("适用场景  :")
     if when_to_use:
@@ -540,3 +574,315 @@ def describe_skill(skill: Skill) -> str:
             lines.append(f"{key}:")
             lines.extend(f"  - {item}" for item in items)
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- 技能工具（function calling）
+# 设计约定（最小路径，与文本注入并存）：
+# - 只有显式声明 `tool.script` 的技能才注册为模型可调用工具；未声明的技能继续走
+#   `render_for_prompt` 的全文注入——方法本体无法变成调用，只能作为方法约束；
+# - 入参协议：SKILL.md 的 inputs 映射成 function schema；模型调用时按声明字段做白名单
+#   过滤 + required 校验 + default 填充，再以**单个 JSON 参数**（sys.argv[1]）传给脚本，
+#   脚本把结果打到 stdout，由框架原样回灌给模型续跑；
+# - 执行复用 `mas.sandbox.Sandbox`（root=技能目录，cwd 同），命令白名单（python/python3/
+#   py/node）与敏感环境变量剔除同样生效；技能脚本应只读、无持久副作用，结果经 stdout 输出。
+
+_TOOL_TYPES = {"string", "integer", "number", "boolean", "object", "array"}
+_STDOUT_LIMIT = 20000  # 单次回灌 stdout 上限：脚本刷屏时截断，避免淹没模型上下文
+
+
+def skill_tool_name(skill_id: str) -> str:
+    """技能 id → function 名（`skill_<id>`；连字符/点换下划线，兼容工具名常规约束）。"""
+    return "skill_" + re.sub(r"[^a-zA-Z0-9_]", "_", str(skill_id))
+
+
+def build_tool_schema(skill: Skill) -> Optional[Dict[str, Any]]:
+    """把技能的 inputs 映射成 OpenAI function schema；未声明 `tool.script` 返回 ``None``。
+
+    - `type` 取 JSON Schema 原生名（string/integer/number/boolean/object/array），
+      未识别或缺失按 string 处理；
+    - `required: true` 的项进 `required` 数组；带 `default` 的项透传为 JSON Schema
+      `default`（模型可省略，由执行端填充）；
+    - 工具描述 = `tool.description`（若有）或技能 description，再追加 when_to_use。
+    """
+    tool = skill.meta.get("tool")
+    if not isinstance(tool, dict) or not str(tool.get("script") or "").strip():
+        return None
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+    for item in skill.meta.get("inputs") or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item["name"])
+        item_type = str(item.get("type") or "string").strip().lower()
+        schema: Dict[str, Any] = {"type": item_type if item_type in _TOOL_TYPES else "string"}
+        if item.get("description"):
+            schema["description"] = str(item["description"])
+        if item.get("default") is not None:
+            schema["default"] = item["default"]
+        properties[name] = schema
+        if item.get("required"):
+            required.append(name)
+    description = str(tool.get("description") or skill.description or "").strip()
+    when_to_use = _as_str_list(skill.meta.get("when_to_use"))
+    if when_to_use:
+        description += ("\n" if description else "") + "适用场景：" + "；".join(when_to_use)
+    function: Dict[str, Any] = {
+        "name": skill_tool_name(skill.id),
+        "description": description or f"执行技能 {skill.name}",
+        "parameters": {"type": "object", "properties": properties},
+    }
+    if required:
+        function["parameters"]["required"] = required
+    return {"type": "function", "function": function}
+
+
+def run_skill_script(
+    skill: Skill,
+    arguments: Dict[str, Any],
+    config: SystemConfig,
+    *,
+    events: Any = None,
+    timeout: Optional[int] = None,
+) -> Dict[str, Any]:
+    """在沙箱内执行 `tool.script` 并把结果整理为可回灌给模型的结构化字典。
+
+    参数处理（确定性的最小校验，全部为可回灌错误而非异常）：
+    - 只透传 inputs 声明过的字段（白名单，模型多传的字段被忽略）；
+    - 缺失且为 required 且无 default → 不执行脚本，返回错误提示让模型自行补齐；
+    - 有 default → 自动填充（显式传入优先）。
+
+    返回值恒为 dict：成功 `{ok, skill, script, exit_code, duration_ms, stdout, stderr, ...}`；
+    失败 `{ok: False, error: ...}`（脚本非零退出仍是"执行成功、脚本自报失败"，不在 error 里）。
+    """
+    tool = skill.meta.get("tool") or {}
+    script = str(tool.get("script") or "")
+    if not (skill.dir / script).exists():
+        return {"ok": False, "skill": skill.id,
+                "error": f"技能脚本不存在: {script}（技能目录 {skill.dir}）"}
+
+    payload: Dict[str, Any] = {}
+    missing: List[str] = []
+    for item in skill.meta.get("inputs") or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item["name"])
+        if name in arguments and arguments[name] is not None:
+            payload[name] = arguments[name]
+        elif item.get("default") is not None:
+            payload[name] = item["default"]
+        elif item.get("required"):
+            missing.append(name)
+    if missing:
+        return {"ok": False, "skill": skill.id,
+                "error": f"缺少必填参数: {', '.join(missing)}；请补齐后重试"}
+
+    if timeout is None:
+        cfg = dict(config.runtime.get("skills") or {})
+        timeout = int(cfg.get("tools_timeout_s", 60) or 60)
+    sandbox = Sandbox(skill.dir, config, events=events)
+    try:
+        result = sandbox.run_python(
+            script, args=[json.dumps(payload, ensure_ascii=False)], timeout=timeout,
+        )
+    except SandboxError as exc:
+        return {"ok": False, "skill": skill.id, "error": f"技能脚本执行失败: {exc}"}
+
+    stdout = result.stdout
+    truncated = len(stdout) > _STDOUT_LIMIT
+    if truncated:
+        stdout = stdout[:_STDOUT_LIMIT] + "\n…（stdout 已截断）"
+    outcome = {
+        "ok": result.exit_code == 0,
+        "skill": skill.id,
+        "script": script,
+        "exit_code": result.exit_code,
+        "duration_ms": result.duration_ms,
+        "stdout": stdout,
+        "stdout_truncated": truncated,
+        "stderr": (result.stderr or "")[-4000:],
+    }
+    if events is not None:
+        events.emit(
+            "skill_tool_executed", agent="skills",
+            payload={"skill": skill.id, "script": script, "exit_code": result.exit_code,
+                     "duration_ms": result.duration_ms, "ok": outcome["ok"],
+                     "stdout_chars": len(stdout), "args": sorted(payload)},
+        )
+    return outcome
+
+
+# --------------------------------------------------------------------------- 节点级匹配与注入
+@dataclass
+class SkillMatch:
+    """一次节点级匹配的结果，含渲染进 Prompt 所需的完整内容。
+
+    `body` 是 SKILL.md 的**正文全文**（`parse_skill_text` 切出的第二段），
+    `steps`/`checkpoints`/`error_handling` 是 front-matter 里的结构化条目。
+    两者都注入：结构化条目在前当索引，正文全文在后作为方法本体，
+    与通用 Agent 宿主「命中即加载整份技能文档」的做法一致。
+    """
+
+    id: str
+    name: str
+    score: int
+    hits: List[str] = field(default_factory=list)
+    steps: List[str] = field(default_factory=list)
+    checkpoints: List[str] = field(default_factory=list)
+    error_handling: List[str] = field(default_factory=list)
+    body: str = ""
+
+
+def _as_str_list(value: Any) -> List[str]:
+    """把 front-matter 里的字符串/列表统一成去空字符串列表（缺失即空）。"""
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def score_skill(
+    skill: Skill,
+    *,
+    node_id: str = "",
+    role_id: str = "",
+    context_text: str = "",
+    intent_tags: Optional[List[str]] = None,
+    artifacts: Optional[List[str]] = None,
+) -> Optional[SkillMatch]:
+    """按 `trigger` 四字段确定性打分；不适用返回 ``None``。
+
+    硬门禁（不满足即淘汰，不参与排序）：
+    - `requires_artifacts`：声明了就必须全部已在黑板就位——它是**前置条件**，
+      本身不计分，否则任何依赖齐备的节点都会被灌进无关技能；
+    - `nodes` / `roles`（可选字段）：声明了就必须命中当前节点 id 或角色 id。
+
+    分值（适用性证据）：关键词命中 +2/项、意图命中 +3/项、作用域命中 +1/项。
+    三项全不命中即返回 ``None``：技能必须给出「为什么适用于本节点」的可核对理由。
+    """
+    trigger = skill.meta.get("trigger")
+    if not isinstance(trigger, dict):
+        return None
+
+    tags = {str(item) for item in (intent_tags or []) if str(item)}
+    have = {str(item) for item in (artifacts or []) if str(item)}
+    haystack = (context_text or "").lower()
+
+    requires = set(_as_str_list(trigger.get("requires_artifacts")))
+    if not requires.issubset(have):
+        return None
+
+    nodes = _as_str_list(trigger.get("nodes"))
+    if nodes and node_id not in nodes:
+        return None
+    roles = _as_str_list(trigger.get("roles"))
+    if roles and role_id not in roles:
+        return None
+
+    score = 0
+    hits: List[str] = []
+    if nodes:
+        score += 1
+        hits.append(f"节点 {node_id} 命中 trigger.nodes")
+    if roles:
+        score += 1
+        hits.append(f"角色 {role_id} 命中 trigger.roles")
+    for keyword in _as_str_list(trigger.get("keywords")):
+        if keyword.lower() in haystack:
+            score += 2
+            hits.append(f"关键词「{keyword}」命中需求文本")
+    for intent in _as_str_list(trigger.get("intents")):
+        if intent in tags:
+            score += 3
+            hits.append(f"意图 {intent} 命中本次节点标签")
+    for artifact in sorted(requires):
+        hits.append(f"依赖产物 {artifact} 已就位")
+
+    if score <= 0:
+        return None
+    return SkillMatch(
+        id=skill.id,
+        name=skill.name,
+        score=score,
+        hits=hits,
+        steps=_as_str_list(skill.meta.get("steps")),
+        checkpoints=_as_str_list(skill.meta.get("checkpoints")),
+        error_handling=_as_str_list(skill.meta.get("error_handling")),
+        body=(skill.body or "").strip(),
+    )
+
+
+def match_skills(
+    skills_dir: Path,
+    *,
+    node_id: str = "",
+    role_id: str = "",
+    context_text: str = "",
+    intent_tags: Optional[List[str]] = None,
+    artifacts: Optional[List[str]] = None,
+    min_score: int = 1,
+    limit: int = 3,
+) -> List[SkillMatch]:
+    """扫描技能目录做节点级匹配，按 (-score, id) 稳定排序后取前 `limit` 个。
+
+    单个技能解析失败或无匹配字段只会让它自己不参与，不影响其他技能（与
+    `list_skills` 的容错策略一致）。全程确定性、不依赖 LLM，故同一输入必得同一输出。
+    """
+    matches: List[SkillMatch] = []
+    for skill in list_skills(skills_dir):
+        problems = validate_skill(skill)
+        if problems:
+            continue
+        match = score_skill(
+            skill,
+            node_id=node_id,
+            role_id=role_id,
+            context_text=context_text,
+            intent_tags=intent_tags,
+            artifacts=artifacts,
+        )
+        if match is not None and match.score >= max(1, int(min_score)):
+            matches.append(match)
+    matches.sort(key=lambda item: (-item.score, item.id))
+    return matches[: max(0, int(limit))]
+
+
+def render_for_prompt(matches: List[SkillMatch], *, max_chars: int = 88000) -> str:
+    """把命中技能渲染成 Prompt 注入段（纯文本，无命中即空串）。
+
+    采用通用 Agent 宿主的**全文注入**做法：命中即把该技能的 SKILL.md 全文放进
+    上下文，而不是只摘取结构化条目。front-matter 的 steps / checkpoints /
+    error_handling 排在正文之前作为索引，便于模型先定位再通读；两者内容重叠时
+    以正文为准（正文是方法本体，条目是提要）。
+
+    措辞刻意保守：技能是「怎么做」的方法约束，交付契约与门禁仍是最高优先级，
+    避免沉淀内容反过来覆盖当前节点的输出协议。
+    """
+    if not matches:
+        return ""
+    lines = [
+        "# 技能注入（本次节点匹配到的技能全文）",
+        "以下规范来自 config/skills/，由历史已验收运行的通过路径或人工手写沉淀，",
+        "只约束「怎么做」；与上面的任务描述或下面的交付契约冲突时，以任务描述与交付契约为准。",
+        "",
+    ]
+    for match in matches:
+        block = [f"## {match.name}（技能 id={match.id}，匹配度 {match.score}）"]
+        if match.hits:
+            block.append("命中依据：" + "；".join(match.hits))
+        if match.steps:
+            block.append("执行步骤（逐条照做，做不到的在结论中说明原因）：")
+            block.extend(f"  {index}. {step}" for index, step in enumerate(match.steps, start=1))
+        if match.checkpoints:
+            block.append("自检点（产出前逐条核对）：")
+            block.extend(f"  - {item}" for item in match.checkpoints)
+        if match.error_handling:
+            block.append("已知坑位与处置：")
+            block.extend(f"  - {item}" for item in match.error_handling)
+        if match.body:
+            block += ["", "技能文档正文（SKILL.md 全文，按此执行）：", "", match.body]
+        lines.extend(block + [""])
+    text = "\n".join(lines).rstrip("\n")
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n…（技能段已截断）"
+    return text

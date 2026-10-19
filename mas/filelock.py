@@ -39,17 +39,22 @@ def file_lock(target: Path, *, timeout_s: float = 10.0, poll_s: float = 0.05) ->
     path = Path(target)
     lock_path = path.with_name(path.name + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+b")
-    # msvcrt.locking 锁的是「当前文件位置起 nbytes」，必须归一化到 0，
-    # 否则不同进程位置不一致会锁到不同区段，失去互斥语义（flock 不受位置影响）。
-    handle.seek(0)
     deadline = time.monotonic() + max(0.0, timeout_s)
-    acquired = False
+    handle = None
     try:
         while True:
             try:
+                # open 也必须纳入重试：Windows 上并发打开同一 .lock 文件偶发
+                # Errno 13 Permission denied（杀软/索引器瞬时持有句柄、打开竞争），
+                # 原实现 open 在循环外，这类瞬时错误会直接穿透，绕过本函数的
+                # 「获取失败 → 重试 → 超时抛 FileLockTimeout」语义
+                # （实测：test_concurrent_runs_isolated_two_instances 约 10~20% 概率触发）。
+                if handle is None:
+                    handle = open(lock_path, "a+b")
+                # msvcrt.locking 锁的是「当前文件位置起 nbytes」，必须归一化到 0，
+                # 否则不同进程位置不一致会锁到不同区段，失去互斥语义（flock 不受位置影响）。
+                handle.seek(0)
                 _acquire(handle)
-                acquired = True
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -62,8 +67,8 @@ def file_lock(target: Path, *, timeout_s: float = 10.0, poll_s: float = 0.05) ->
         finally:
             _release(handle)
     finally:
-        handle.close()
-        acquired = False
+        if handle is not None:
+            handle.close()
 
 
 def _acquire(handle) -> None:

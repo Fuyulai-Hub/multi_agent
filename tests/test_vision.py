@@ -102,7 +102,7 @@ class VisionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _bundle(self):
-        return SimpleNamespace(path=None, system="sys", user="请解析需求", experiences=[], tier_counts={})
+        return SimpleNamespace(path=None, system="sys", user="请解析需求", experiences=[], skills=[], tier_counts={})
 
     def _images(self):
         return [{"name": "shot.png", "path": str(self.image), "mime": "image/png", "bytes": len(PNG_BYTES)}]

@@ -120,7 +120,8 @@ class Sandbox:
 
     隔离层次（由弱到强）：
     1. 路径级：resolve() 拒绝越界读写（既有能力）；
-    2. 命令级：白名单只放行 Python 解释器，拒绝 shell 解释器；
+    2. 命令级：白名单默认只放行 Python 解释器（当前 system.yaml 实配另含 node，
+       供 web_fullstack 需求的 JS 交付验证），拒绝 shell 解释器；
     3. 环境级：剔除含 KEY/TOKEN/SECRET 等敏感词的环境变量，防凭据泄露给被测代码；
     4. 资源级（仅 POSIX 单线程进程）：rlimit 限制 CPU/内存/文件大小/进程数；
     5. 检测级：静态分析 network_import 规则标记外连依赖（沙箱无网络命名空间隔离，
@@ -686,7 +687,7 @@ class Sandbox:
     def _web_lifecycle_findings(
         self, tree: ast.AST, relative: str, severity: Any
     ) -> List["Finding"]:
-        """Web 服务的三条约東（docs/15 补丁 3/4），只在 full_stack_* 形态下启用。
+        """Web 服务的三条约束（docs/15 补丁 3/4），只在 full_stack_* 形态下启用。
 
         - ``web_service_lifecycle``：模块级（非函数/if-main 内）启动服务，会把
           ``python -c "import pkg"`` 的导入自检挂死到沙箱超时；
@@ -858,7 +859,7 @@ class Sandbox:
         return findings
 
     def _js_balance_findings(self, relative: str, source: str, severity: Any) -> List["Finding"]:
-        """JS 只能做括号配平——本机无 node，没有真正的语法/语义检查，强度必须如实写明。"""
+        """JS 只能做括号配平——本检查不调用 node 做语法/语义验证，强度必须如实写明。"""
         pairs = {")": "(", "]": "[", "}": "{"}
         stack: List[str] = []
         line = 1

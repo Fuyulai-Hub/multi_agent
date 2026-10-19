@@ -18,6 +18,8 @@ trigger:
     - assess_scope
   requires_artifacts:
     - requirement_source
+  nodes:
+    - intake
 inputs:
   - name: function_points
     type: list

@@ -99,6 +99,12 @@ button.ghost:hover { color: var(--accent); border-color: var(--accent); }
 }
 .control input { min-width: 180px; }
 .control input.wide { min-width: 300px; }
+/* 主界面技能开关：勾选框不套文本输入样式（与弹窗内 .switch-row 同一处口径） */
+.control.switch-control { cursor: pointer; }
+.control.switch-control input[type="checkbox"] {
+  width: 14px; height: 14px; min-width: 0; margin: 0; padding: 0;
+  accent-color: var(--accent); cursor: pointer;
+}
 .control select:focus,
 .control input:focus { border-color: var(--accent); }
 .composer textarea {
@@ -134,6 +140,14 @@ button.primary {
 }
 button.primary:disabled { opacity: .5; cursor: not-allowed; }
 button.primary:hover:not(:disabled) { filter: brightness(1.1); }
+/* 终止任务（危险操作）：红描边幽灵按钮；「终止中…」置灰态 */
+button.danger-btn {
+  background: transparent; border: 1px solid var(--red); color: var(--red);
+  padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 600;
+  transition: all .15s;
+}
+button.danger-btn:hover:not(:disabled) { background: rgba(248, 81, 73, .12); }
+button.danger-btn:disabled { opacity: .55; cursor: not-allowed; border-color: var(--border); color: var(--muted); }
 
 /* 运行视图布局 */
 #view-runs.active { display: block; }
@@ -168,6 +182,10 @@ button.primary:hover:not(:disabled) { filter: brightness(1.1); }
 }
 .badge.pass { background: rgba(63, 185, 80, .15); color: var(--green); }
 .badge.fail { background: rgba(248, 81, 73, .15); color: var(--red); }
+.badge.canceled { background: rgba(210, 153, 34, .15); color: var(--orange); }
+
+/* 运行详情顶部工具条（终止任务按钮） */
+.detail-actions { display: flex; justify-content: flex-end; margin-bottom: 12px; }
 
 /* 运行详情 */
 .run-detail { min-width: 0; }
@@ -386,6 +404,18 @@ button.primary:hover:not(:disabled) { filter: brightness(1.1); }
 .key-row { display: flex; gap: 8px; }
 .key-row input { flex: 1; min-width: 0; }
 .key-row button { white-space: nowrap; }
+/* 技能开关行：勾选框不套用 .field input 的文本输入样式 */
+.field .switch-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text); cursor: pointer;
+  padding: 2px 0;
+}
+.field .switch-row input[type="checkbox"] {
+  width: 15px; height: 15px; margin: 0; padding: 0; flex: none;
+  accent-color: var(--accent); cursor: pointer;
+}
+.field .switch-row input[type="checkbox"]:focus { border: none; }
+.field .switch-row:has(input[type="checkbox"]:disabled) { color: var(--muted); cursor: not-allowed; }
 .modal-status { font-size: 12px; color: var(--muted); min-height: 16px; line-height: 1.6; }
 .modal-status.running { color: var(--orange); }
 .modal-status.done { color: var(--green); }
