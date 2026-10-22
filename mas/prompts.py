@@ -53,10 +53,14 @@ class PromptBundle:
 class PromptBuilder:
     """按角色与节点组装 Prompt，并负责落盘。"""
 
-    def __init__(self, config: SystemConfig, run_dir: Path, *, enabled: bool = True) -> None:
+    def __init__(self, config: SystemConfig, run_dir: Path, *, enabled: bool = True,
+                 project_docs: str = "") -> None:
         self.config = config
         self.run_dir = Path(run_dir)
         self.enabled = enabled
+        # 项目指令（AGENTS.md 等价物，docs/36）：由 Leader 在解析需求输入后写入，
+        # 之后每个节点的 Prompt 都带上它。空串时 Prompt 与改造前逐字节一致。
+        self.project_docs_text = project_docs
         self.dir = self.run_dir / "prompts"
         if self.enabled:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +100,7 @@ class PromptBuilder:
             skills_text=skills_text,
             contract=contract,
             images=list((context or {}).get("images") or []),
+            project_docs_text=self.project_docs_text,
         )
         bundle = PromptBundle(
             role=role.id,
@@ -169,6 +174,7 @@ class PromptBuilder:
         skills_text: str = "",
         contract: Dict[str, Any],
         images: Optional[List[Dict[str, Any]]] = None,
+        project_docs_text: str = "",
     ) -> str:
         lines: List[str] = [
             "# 任务",
@@ -179,6 +185,9 @@ class PromptBuilder:
         ]
         if directive:
             lines.append(f"- Leader 指令：{directive}")
+        if project_docs_text:
+            # 放在感知段之前：项目指令的优先级高于上游产物，模型应当先看到约束再看材料。
+            lines += ["", project_docs_text]
         lines += [
             "",
             "# 感知：上游已完成的工作",

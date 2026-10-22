@@ -152,6 +152,11 @@ class FunctionCallingE2ETests(unittest.TestCase):
         # 真实配置（项目 config），config_dir 指向临时目录并写入 mcp.yaml
         self.config = load_config(PROJECT_ROOT / "config", workspace=self.root / "workspace")
         self.config.runtime["verbose"] = False
+        # 本文件验证的是 ReAct 之前的工具闭环协议（docs/21）。system.yaml 现已默认开启
+        # ReAct（docs/34），命中节点会被分流到 ReAct 分支（metrics 记 react_steps 而非
+        # tool_rounds），故显式关闭以保持本文件的验证目标不变；
+        # ReAct 自身的协议验证见 tests/test_react_loop.py。
+        self.config.runtime.pop("react", None)
         # 本文件验证的是 function calling 线上协议（节点=implement）；节点隔离（tools_nodes）
         # 默认只对 intake 生效，此处显式放开为「全部节点」，使协议验证独立于该默认值。
         # 节点隔离本身的断言见 tests/test_websearch.py。

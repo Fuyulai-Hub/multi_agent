@@ -416,6 +416,18 @@ button.danger-btn:disabled { opacity: .55; cursor: not-allowed; border-color: va
 }
 .field .switch-row input[type="checkbox"]:focus { border: none; }
 .field .switch-row:has(input[type="checkbox"]:disabled) { color: var(--muted); cursor: not-allowed; }
+/* ReAct：步数输入与生效范围说明（与 .switch-row 同一口径，置灰语义一致） */
+.field .react-steps-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text); padding: 2px 0;
+}
+.field .react-steps-row input[type="number"] {
+  width: 72px; padding: 4px 6px; margin: 0;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); font-size: 13px;
+}
+.field .react-steps-row input[type="number"]:disabled { color: var(--muted); cursor: not-allowed; }
+.react-note { font-size: 12px; color: var(--muted); line-height: 1.6; padding-top: 2px; }
 .modal-status { font-size: 12px; color: var(--muted); min-height: 16px; line-height: 1.6; }
 .modal-status.running { color: var(--orange); }
 .modal-status.done { color: var(--green); }

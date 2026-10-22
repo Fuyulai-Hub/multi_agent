@@ -177,6 +177,22 @@
             启用技能工具调用（tools_enabled：模型可调用 skill_&lt;id&gt; 工具，需与上方同时开启）
           </label>
         </div>
+        <div class="field">
+          <span class="field-label">ReAct 推理-行动循环（写入 config/system.yaml 的 runtime.react，保存后下一次运行生效）</span>
+          <label class="switch-row">
+            <input id="cfg-react-enabled" type="checkbox">
+            启用 ReAct（enabled：模型按 Thought → Action → Observation 逐步推进，每步留痕）
+          </label>
+          <label class="switch-row">
+            <input id="cfg-react-require-thought" type="checkbox">
+            强制思考（require_thought：发起工具调用却没写思考时告警，不阻断）
+          </label>
+          <label class="react-steps-row">
+            单节点最大步数（max_steps）
+            <input id="cfg-react-max-steps" type="number" min="1" max="12" step="1" placeholder="4">
+          </label>
+          <div id="cfg-react-note" class="react-note"></div>
+        </div>
         <div id="cfg-status" class="modal-status"></div>
       </div>
       <div class="modal-foot">

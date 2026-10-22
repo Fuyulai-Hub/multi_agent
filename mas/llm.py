@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import SystemConfig, resolve_credentials
+from .context import ContextManager
 from .errors import AgentError
 from .prompts import PromptBundle
 
@@ -135,6 +136,11 @@ class LLMClient:
         self.vision_max_image_bytes = int(vision.get("max_image_bytes", 5242880))
         self.vision_url_style = str(vision.get("url_style", "data_uri"))
         self._offline: Any = None
+        # 上下文治理（docs/35）：Codex 式预算治理，唯一生效点在 _build_payload。
+        # 代码默认关闭（runtime.context.enabled 未配置时），开启后也只在超限时才动手，
+        # 因此未配置 / 未超限两种情况下请求体与改造前逐字节一致。
+        self.context = ContextManager.from_config(config)
+        self.last_fit = None      # 最近一次治理结果（供 Agent 层留痕，未治理时为 None）
 
     @staticmethod
     def _parse_ladder(raw: Any) -> List[str]:
@@ -155,6 +161,9 @@ class LLMClient:
         extra_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Generation:
         started = time.time()
+        # 每次生成前清空上一次的治理结果：一个节点内多轮生成时，只留痕「最近一轮」的治理，
+        # 避免上一轮的治理结果被下一个节点误当作自己的事件发出去。
+        self.last_fit = None
         if self.provider == "offline":
             generation = self._generate_offline(task_kind, bundle, context)
         elif self.provider == "openai_compatible":
@@ -163,6 +172,9 @@ class LLMClient:
             )
         else:
             raise AgentError(f"未知的 llm.provider: {self.provider}")
+        # 校准：端点返回的 prompt_tokens 是真实值，本地字节/4 只是粗估（Codex 同口径：
+        # 有服务端 usage 就优先信服务端）。offline provider 不返回 usage，此处为 no-op。
+        self.context.observe(generation)
         generation.latency_ms = int((time.time() - started) * 1000)
         generation.task_kind = task_kind
         generation.prompt_path = str(bundle.path) if bundle.path else None
@@ -285,6 +297,10 @@ class LLMClient:
             {"role": "user", "content": self._user_content(bundle, context)},
         ]
         messages.extend(extra_messages or [])
+        # 上下文治理（docs/35）：唯一组装点。未启用或未超限时 fit 原样返回，请求体逐字节不变。
+        fit = self.context.fit(messages)
+        messages = fit.messages
+        self.last_fit = fit
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,

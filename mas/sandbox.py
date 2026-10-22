@@ -11,9 +11,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -118,14 +120,16 @@ class AnalysisResult:
 class Sandbox:
     """工作目录受限的命令执行器。
 
-    隔离层次（由弱到强）：
-    1. 路径级：resolve() 拒绝越界读写（既有能力）；
-    2. 命令级：白名单默认只放行 Python 解释器（当前 system.yaml 实配另含 node，
-       供 web_fullstack 需求的 JS 交付验证），拒绝 shell 解释器；
-    3. 环境级：剔除含 KEY/TOKEN/SECRET 等敏感词的环境变量，防凭据泄露给被测代码；
-    4. 资源级（仅 POSIX 单线程进程）：rlimit 限制 CPU/内存/文件大小/进程数；
-    5. 检测级：静态分析 network_import 规则标记外连依赖（沙箱无网络命名空间隔离，
-       这一步是"让高危依赖可见"，不是隔离，已在 finding 消息中如实标注）。
+    两种执行后端（runtime.sandbox_backend）：
+
+    - ``local``：宿主进程，隔离层次为路径 + 命令白名单 + 环境剥离 + POSIX rlimit。
+      这不是安全边界——生成代码仍与宿主共享内核、网络和文件系统。
+    - ``container``：Docker/Podman 容器，``--network none``、只读根文件系统、
+      ``--cap-drop ALL``、no-new-privileges、内存/CPU/pids 上限，只挂载 run 的
+      ``code/`` 目录。后端初始化时校验运行时与镜像，任一不可用直接抛
+      ``SandboxError``（fail-closed，绝不静默降级到宿主执行）。
+
+    静态分析（network_import 等）只是把高危依赖变得可见，不构成隔离。
     """
 
     def __init__(self, root: Path, config: SystemConfig, *, events: Any = None) -> None:
@@ -135,6 +139,27 @@ class Sandbox:
         self.root.mkdir(parents=True, exist_ok=True)
         self.python = str(config.runtime.get("python") or sys.executable or "python")
         self.timeout = int(config.runtime.get("sandbox_timeout", 180))
+        self.backend = str(config.runtime.get("sandbox_backend") or "local").strip().lower()
+        if self.backend not in {"local", "container"}:
+            raise SandboxError(
+                f"未知沙箱后端 runtime.sandbox_backend={self.backend!r}（只支持 local / container）"
+            )
+        container = dict(config.runtime.get("sandbox_container") or {})
+        self.container = {
+            "runtime": str(container.get("runtime") or "docker"),
+            "image": str(container.get("image") or ""),
+            "python": str(container.get("python") or "python"),
+            "network": str(container.get("network") or "none"),
+            "memory": str(container.get("memory") or "1g"),
+            "cpus": str(container.get("cpus") or "1.0"),
+            "pids_limit": int(container.get("pids_limit") or 128),
+            "read_only": bool(container.get("read_only", True)),
+            "tmpfs": str(container.get("tmpfs") or "/tmp:rw,noexec,nosuid,size=64m"),
+            "user": str(container.get("user") or ""),
+        }
+        self._container_runtime_path = ""
+        if self.backend == "container":
+            self._verify_container_backend()
         # 命令白名单（runtime.sandbox_command_policy 可覆盖；enabled=false 可关闭）
         policy = dict(config.runtime.get("sandbox_command_policy") or {})
         self.command_policy_enabled = bool(policy.get("enabled", True))
@@ -230,17 +255,25 @@ class Sandbox:
         self._check_command(cmd)
         env = self._build_env(env_extra)
         started = time.time()
-        spawn_kwargs = self._spawn_kwargs()
+        container_name = ""
+        if self.backend == "container":
+            exec_cmd, exec_cwd, exec_env, container_name = self._container_invocation(
+                cmd, workdir, env, env_extra or {}
+            )
+            spawn_kwargs: Dict[str, Any] = {}
+        else:
+            exec_cmd, exec_cwd, exec_env = list(cmd), str(workdir), env
+            spawn_kwargs = self._spawn_kwargs()
         try:
             completed = subprocess.run(
-                cmd,
-                cwd=str(workdir),
+                exec_cmd,
+                cwd=exec_cwd,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout or self.timeout,
-                env=env,
+                env=exec_env,
                 shell=False,
                 **spawn_kwargs,
             )
@@ -249,8 +282,16 @@ class Sandbox:
             exit_code = 124
             stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
             stderr = f"命令超时（>{timeout or self.timeout}s）: {' '.join(cmd)}"
+            if container_name:
+                self._kill_container(container_name)
         except FileNotFoundError as exc:
             raise SandboxError(f"命令不可用: {cmd[0]}（{exc}）") from exc
+        if self.backend == "container" and exit_code == 125:
+            # docker run 的 125 专指运行时自身失败（daemon 不可达/镜像缺失/参数错误）。
+            # 这类失败不能当成“测试没通过”，必须让上层看到基础设施故障（fail-closed）。
+            raise SandboxError(
+                f"容器沙箱启动失败（exit 125），拒绝把基础设施故障当成测试结果: {stderr.strip()[-800:]}"
+            )
         duration_ms = int((time.time() - started) * 1000)
         result = ExecResult(
             cmd=list(cmd),
@@ -276,6 +317,132 @@ class Sandbox:
                 },
             )
         return result
+
+    # ---------------------------------------------------------------- 容器后端
+    def _verify_container_backend(self) -> None:
+        """启动即校验容器运行时与镜像；任一不可用都失败关闭（不降级到宿主）。"""
+        image = self.container["image"]
+        if not image:
+            raise SandboxError(
+                "sandbox_backend=container 但未配置 runtime.sandbox_container.image；"
+                "拒绝降级到宿主执行"
+            )
+        runtime = shutil.which(self.container["runtime"])
+        if not runtime:
+            raise SandboxError(
+                f"容器运行时不可用: {self.container['runtime']} 不在 PATH；"
+                "sandbox_backend=container 要求 fail-closed，拒绝降级到宿主执行"
+            )
+        try:
+            probe = subprocess.run(
+                [runtime, "image", "inspect", image],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxError(f"无法校验容器镜像 {image}: {exc}；拒绝降级到宿主执行") from exc
+        if probe.returncode != 0:
+            raise SandboxError(
+                f"容器镜像不可用: {image}（{probe.stderr.strip()[-500:]}）；"
+                "请先 docker pull，拒绝降级到宿主执行"
+            )
+        self._container_runtime_path = runtime
+
+    def _container_invocation(
+        self,
+        cmd: List[str],
+        workdir: Path,
+        env: Dict[str, str],
+        env_extra: Dict[str, str],
+    ) -> Tuple[List[str], str, Dict[str, str], str]:
+        """把宿主命令改写成 ``docker run`` 调用；返回 (argv, client_cwd, client_env, name)。"""
+        relative = workdir.relative_to(self.root)
+        container_cwd = "/workspace" if str(relative) in ("", ".") else f"/workspace/{relative.as_posix()}"
+        inner = [self._container_executable(cmd[0])]
+        inner.extend(self._container_path_part(str(part)) for part in cmd[1:])
+
+        name = f"mas-sandbox-{uuid.uuid4().hex[:12]}"
+        argv = [
+            self._container_runtime_path, "run", "--rm", "--name", name,
+            "--network", self.container["network"],
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+        ]
+        if self.container["read_only"]:
+            argv += ["--read-only", "--tmpfs", self.container["tmpfs"]]
+        user = self.container["user"] or (
+            f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else ""
+        )
+        if user:
+            argv += ["--user", user]
+        if self.container["memory"]:
+            argv += ["--memory", self.container["memory"]]
+        if self.container["cpus"]:
+            argv += ["--cpus", self.container["cpus"]]
+        if self.container["pids_limit"] > 0:
+            argv += ["--pids-limit", str(self.container["pids_limit"])]
+        argv += ["-v", f"{self.root}:/workspace:rw", "-w", container_cwd]
+        for key, value in sorted(self._container_env(env_extra).items()):
+            argv += ["-e", f"{key}={value}"]
+        argv += [self.container["image"]] + inner
+        return argv, str(self.root), env, name
+
+    def _container_env(self, env_extra: Dict[str, str]) -> Dict[str, str]:
+        """只传最小环境 + 显式 env_extra，避免把宿主环境整体灌进容器。"""
+        result = {
+            "PATH": "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": "/workspace",
+        }
+        for key, value in (env_extra or {}).items():
+            text = str(value)
+            if key == "PYTHONPATH":
+                text = os.pathsep.join(
+                    self._container_path_part(item) for item in text.split(os.pathsep)
+                )
+            result[str(key)] = text
+        return result
+
+    def _container_executable(self, executable: str) -> str:
+        raw = Path(str(executable)).name.lower()
+        base = raw[:-4] if raw.endswith(".exe") else raw
+        if base == "py":
+            return self.container["python"]
+        if re.fullmatch(r"python[\d.]*", base):
+            return self.container["python"]
+        if base == "node":
+            return "node"
+        if base in self.allowed_commands:
+            return base
+        if os.path.abspath(str(executable)) == os.path.abspath(self.python):
+            return self.container["python"]
+        raise SandboxError(f"容器沙箱不支持该可执行文件: {executable}")
+
+    def _container_path_part(self, part: str) -> str:
+        """把挂在 /workspace 下的宿主绝对路径改写成容器内路径；其余参数原样保留。"""
+        if not os.path.isabs(part):
+            return part
+        try:
+            path = Path(part).resolve()
+        except OSError:
+            return part
+        if path == self.root:
+            return "/workspace"
+        if self.root in path.parents:
+            return f"/workspace/{path.relative_to(self.root).as_posix()}"
+        return part
+
+    def _kill_container(self, name: str) -> None:
+        """超时后清掉容器进程（docker CLI 被杀不会自动停容器）。"""
+        if not name or not self._container_runtime_path:
+            return
+        try:
+            subprocess.run(
+                [self._container_runtime_path, "rm", "-f", name],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
 
     # ---------------------------------------------------------------- 隔离策略
     def _check_command(self, cmd: List[str]) -> None:
@@ -353,6 +520,13 @@ class Sandbox:
 
     def _isolation_label(self) -> str:
         """本次执行的隔离等级标签（写入事件，便于审计实际生效的隔离措施）。"""
+        if self.backend == "container":
+            rootfs = "ro" if self.container["read_only"] else "rw"
+            return (
+                f"container:{self.container['image']}"
+                f"+network:{self.container['network']}+rootfs:{rootfs}+workspace:rw"
+                f"+cap-drop:ALL+mem:{self.container['memory']}+cpus:{self.container['cpus']}"
+            )
         if os.name == "nt":
             limits = "windows-no-rlimit"
         elif not self.rlimits:

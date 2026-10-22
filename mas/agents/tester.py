@@ -10,6 +10,7 @@ from ..errors import SandboxError
 from ..intent import resolve_delivery_shape, shape_family
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
+from ..verifier import TestVerifier, VerificationError
 from .base import BaseAgent, Perception
 
 __all__ = ["TesterAgent"]
@@ -209,7 +210,9 @@ class TesterAgent(BaseAgent):
                     "每条回填的 fp_id 必须如实来自需求规格的功能点编号（覆盖率统计与缺陷跟踪以此准，漏填即覆盖率不达标）",
                     "exit code：全部通过返回 0，否则返回 1",
                     "期望值只能来自需求契约（规则/样例），禁止读取研发实现代码反推",
-                    "仅用标准库；import 被测包（package 字段指定的包名）下的公开接口"
+                    "仅用标准库；import 被测包（package 字段指定的包名）下的公开接口",
+                    "测试套件首次执行后由框架冻结（test_manifest.json）：后续轮次提交的 tests/ 修改不会生效，"
+                    "执行的是冻结副本；测试自身崩溃/协议失效导致无法取证时框架才会解冻重新生成"
                 ]
             },
         }
@@ -265,27 +268,62 @@ class TesterAgent(BaseAgent):
         fps = spec.get("function_points", [])
         fp_total = len(fps)
 
-        # 1) 写入测试文件（真实可执行）
+        # 1) 测试冻结（docs/37 P0-2）：一旦冻结，生成方提交的 tests/ 文件不再生效，
+        # 执行前从 run_dir/frozen_tests/ 恢复权威副本。首次执行前冻结当前套件。
+        verifier = TestVerifier(self.ctx.run_dir, self.ctx.sandbox.root, events=self.ctx.events)
+        try:
+            frozen = verifier.load_manifest()
+        except VerificationError as exc:
+            result.status, result.error = "fail", f"测试冻结清单校验失败: {exc}"
+            result.summary = result.error
+            return
+
+        generated_tests = [
+            (str(item["path"]), str(item["content"]))
+            for item in (data.get("files") or [])
+            if isinstance(item, dict) and str(item.get("path", "")).startswith("tests/")
+        ]
         test_file = ""
-        for file_item in data.get("files", []):
-            if not isinstance(file_item, dict) or not file_item.get("path"):
-                continue          # 契约外防御：跳过结构非法的文件项，不让整个节点崩溃
-            path = str(file_item["path"])
-            try:
-                self.sandbox_write(path, str(file_item["content"]))
-            except SandboxError as exc:
-                # 权限守卫拒绝（如契约诱导模型输出 tests/ 之外的 serve.py）：单文件写不进去
-                # 不该让整个测试节点崩掉——跳过后继续写其余测试文件，并在事件里如实记账。
-                self.ctx.events.emit(
-                    "test_file_write_denied", agent=self.role_id, node=task.node_id,
-                    iteration=task.iteration, severity="error",
-                    payload={"path": path, "error": str(exc),
-                             "note": "测试角色只能写 tests/ 下的文件；该文件被跳过，未写入沙箱"},
-                )
-                continue
-            if path.startswith("tests/"):
-                test_file = path
-                self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
+        if frozen is not None:
+            test_file = str(frozen.get("test_file") or "")
+            changes = verifier.restore_if_changed()
+            self.ctx.events.emit(
+                "test_generation_ignored", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"test_hash": frozen.get("digest", ""), "files": len(generated_tests),
+                         "restored_changes": changes,
+                         "note": "测试套件已冻结：本轮新生成的 tests/ 文件被忽略，执行冻结副本"},
+            )
+            self.evidence(result, "frozen_tests", test_file=test_file,
+                          test_hash=frozen.get("digest", ""), restored=len(changes))
+        else:
+            # 首次（或冻结已失效）时写入测试文件（真实可执行）
+            for file_item in data.get("files", []):
+                if not isinstance(file_item, dict) or not file_item.get("path"):
+                    continue          # 契约外防御：跳过结构非法的文件项，不让整个节点崩溃
+                path = str(file_item["path"])
+                try:
+                    self.sandbox_write(path, str(file_item["content"]))
+                except SandboxError as exc:
+                    # 权限守卫拒绝（如契约诱导模型输出 tests/ 之外的 serve.py）：单文件写不进去
+                    # 不该让整个测试节点崩掉——跳过后继续写其余测试文件，并在事件里如实记账。
+                    self.ctx.events.emit(
+                        "test_file_write_denied", agent=self.role_id, node=task.node_id,
+                        iteration=task.iteration, severity="error",
+                        payload={"path": path, "error": str(exc),
+                                 "note": "测试角色只能写 tests/ 下的文件；该文件被跳过，未写入沙箱"},
+                    )
+                    continue
+                if path.startswith("tests/"):
+                    test_file = path
+                    self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
+            if test_file:
+                try:
+                    verifier.freeze(test_file, task.iteration)
+                except VerificationError as exc:
+                    result.status, result.error = "fail", f"测试套件冻结失败: {exc}"
+                    result.summary = result.error
+                    return
         if not test_file:
             result.status, result.error = "fail", "测试套件未生成测试文件"
             result.summary = result.error
@@ -355,28 +393,60 @@ class TesterAgent(BaseAgent):
             log=str((run_dir / "stdout.txt").relative_to(self.ctx.run_dir)).replace("\\", "/"),
         )
 
-        # 4) 覆盖率统计
-        coverage = self._coverage(parsed.get("cases", []), fp_total, data)
+        # 4) 独立验证（docs/37 P0-2）：只用逐用例记录重算结果，并核对冻结 hash。
+        root_cause = self._root_cause(preexec_findings, parsed.get("cases", []))
+        spec_fps = [str(fp.get("id")) for fp in fps if fp.get("id")]
+        try:
+            attestation = verifier.attest(
+                parsed=parsed, exit_code=exec_result.exit_code,
+                duration_ms=exec_result.duration_ms, test_file=test_file,
+                iteration=task.iteration, spec_fps=spec_fps,
+                verification_gap=bool(verification["gap"]),
+                root_cause_category=root_cause.get("category", ""),
+            )
+        except VerificationError as exc:
+            attestation = {
+                "version": 1, "valid": False, "reasons": [f"verifier_error:{exc}"],
+                "test_file": test_file, "test_hash": "", "files": {}, "total": 0,
+                "passed": 0, "failed": 0, "assertions": 0,
+                "coverage": self._coverage(parsed.get("cases", []), fp_total, data),
+                "exec": {"exit_code": exec_result.exit_code,
+                         "duration_ms": exec_result.duration_ms},
+                "verification_gap": bool(verification["gap"]),
+                "root_cause_category": root_cause.get("category", ""),
+                "signature": "", "cases": parsed.get("cases", []),
+            }
+        effective_cases = attestation.get("cases") or parsed.get("cases", [])
+        coverage = (attestation.get("coverage") if attestation.get("valid")
+                    else self._coverage(effective_cases, fp_total, data))
 
         # 5) 缺陷跟踪（含上一轮缺陷的闭环判定）
-        bugs = self._track_bugs(parsed.get("cases", []), data.get("cases", []), task, perception)
+        bugs = self._track_bugs(effective_cases, data.get("cases", []), task, perception)
 
-        # 6) 测试报告
-        root_cause = self._root_cause(preexec_findings, parsed.get("cases", []))
+        # 6) 测试报告（summary 以验证器重算值为准）
         summary = {
-            "total": int(parsed.get("total", 0)),
-            "passed": int(parsed.get("passed", 0)),
-            "failed": int(parsed.get("failed", 0)),
-            "pass_rate": round(
-                (int(parsed.get("passed", 0)) / int(parsed.get("total", 1))) if int(parsed.get("total", 0)) else 0.0, 4
-            ),
+            "total": int(attestation.get("total", parsed.get("total", 0))),
+            "passed": int(attestation.get("passed", parsed.get("passed", 0))),
+            "failed": int(attestation.get("failed", parsed.get("failed", 0))),
+            "pass_rate": 0.0,
             "duration_ms": int(parsed.get("duration_ms", exec_result.duration_ms)),
         }
+        if summary["total"]:
+            summary["pass_rate"] = round(summary["passed"] / summary["total"], 4)
+        attestation_report = {key: value for key, value in attestation.items() if key != "cases"}
+        if not attestation.get("valid"):
+            # 测试套件自身失效（无记录/协议崩溃/自报不一致/弱断言）允许下轮重新生成；
+            # 冻结文件被篡改或仅是验证口径缺口时不放开，避免“改测试”成为通过手段。
+            reopen_reasons = set(attestation.get("reasons") or []) - {
+                "test_files_changed_during_execution", "verification_gap"}
+            if reopen_reasons:
+                verifier.invalidate("; ".join(sorted(reopen_reasons)))
         test_report = {
             "title": f"《{spec.get('title', '')}》业务测试报告",
             "test_file": test_file,
             "summary": summary,
             "coverage": coverage,
+            "verification_attestation": attestation_report,
             "negotiation": negotiation,
             "executions": [{
                 "cmd": " ".join(exec_result.cmd),
@@ -434,11 +504,14 @@ class TesterAgent(BaseAgent):
         # 无证据不得判通过：total==0（测试文件崩溃/未按协议回传）时 failed 也为 0，
         # 原实现据此判 pass 并把 32 个缺陷自动闭环（task04-cpp-probe-02 iter02 实测）。
         result.status = ("pass" if summary["total"] > 0 and summary["failed"] == 0
+                         and bool(attestation.get("valid"))
                          and negotiation["open"] == 0 and not verification["gap"]
                          and int(ui_evidence.get("failed_asserts", 0)) == 0
                          else "fail")
         if verification["gap"]:
             result.error = verification["note"]
+        elif not attestation.get("valid"):
+            result.error = "测试证据未通过独立验证: " + ", ".join(attestation.get("reasons") or [])
         result.summary = (
             f"业务测试：功能 {coverage['functional']['total']} / 异常 {coverage['exception']['total']} / "
             f"边界 {coverage['boundary']['total']} 条用例，通过率 {summary['pass_rate']}，"
@@ -446,6 +519,10 @@ class TesterAgent(BaseAgent):
             f"歧义协商 {negotiation['closed']}/{negotiation['total']} 闭环"
             + (f"；根因：{test_report['root_cause_note']}" if preexec_findings else "")
             + (f"；验证口径缺口：{verification['note']}" if verification["gap"] else "")
+            + (f"；独立验证未通过：{', '.join(attestation.get('reasons') or [])}"
+               if not attestation.get("valid") else
+               f"；独立验证通过（test_hash {str(attestation.get('test_hash', ''))[:16]}，"
+               f"断言 {attestation.get('assertions', 0)} 条）")
             + (f"；交付形态 {shape}"
                + (f"；UI 证据失败断言 {int(ui_evidence.get('failed_asserts', 0))} 条"
                   f"（{ui_evidence.get('error') or ui_evidence.get('mode')}）"
@@ -469,6 +546,9 @@ class TesterAgent(BaseAgent):
                 "total": summary["total"],
                 "pass_rate": summary["pass_rate"],
                 "coverage": {key: value["rate"] for key, value in coverage.items()},
+                "verification_valid": bool(attestation.get("valid")),
+                "verification_reasons": attestation.get("reasons") or [],
+                "test_hash": attestation.get("test_hash", ""),
                 "failures": test_report["failures"],
             },
             refs=[f"test_runs/iter{task.iteration:02d}/stdout.txt"],

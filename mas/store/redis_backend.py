@@ -35,6 +35,11 @@ _RELEASE_LOCK_LUA = (
     "then return redis.call('DEL', KEYS[1]) else return 0 end"
 )
 
+_RENEW_LOCK_LUA = (
+    "if redis.call('GET', KEYS[1]) == ARGV[1] "
+    "then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end"
+)
+
 
 class RedisClient:
     """最小 RESP2 客户端：connect + execute(*args)，支持 AUTH/SELECT。"""
@@ -362,10 +367,15 @@ class RedisBackend:
         self.client.srem(self._running_key(), run_id)
 
     def request_cancel(self, run_id: str) -> bool:
-        """请求取消：键不存在（未注册/已结束）返回 False，调用方据此报 404。"""
+        """请求取消：键不存在（未注册/已结束）返回 False，调用方据此报 404。
+
+        取消键独立于运行心跳键：长时间节点即使让心跳键短暂过期，已设置的取消
+        仍可重复请求成功（幂等），不会被误报为「运行不存在」。
+        """
+        cancel_key = f"{self._run_key(run_id)}:cancel"
         if self.client.get(self._run_key(run_id)) is None:
-            return False
-        self.client.set(f"{self._run_key(run_id)}:cancel", "1", ex=3600)
+            return self.client.get(cancel_key) is not None
+        self.client.set(cancel_key, "1", ex=3600)
         return True
 
     def is_canceled(self, run_id: str) -> bool:
@@ -425,6 +435,17 @@ class RedisBackend:
         """SET NX PX 获取锁，成功返回 token（释放时须带 token 校验）。"""
         token = uuid.uuid4().hex
         return token if self.client.setnx(self._lock_key(name), token, px_ms=ttl_ms) else None
+
+    def renew_lock(self, name: str, token: str, ttl_ms: int = 10000) -> bool:
+        """持锁人续租：token 不匹配（锁已过期并被他人拿走）时返回 False。
+
+        长任务（LLM 单节点可达数十分钟）必须续租，否则租约到期后另一个
+        worker 会认为持有者已死并重跑同一运行。
+        """
+        result = self.client.eval(
+            _RENEW_LOCK_LUA, 1, self._lock_key(name), token, int(ttl_ms)
+        )
+        return bool(result)
 
     def release_lock(self, name: str, token: str) -> bool:
         """Lua 原子释放：只有持锁人（token 匹配）能删，防误删他人锁。"""

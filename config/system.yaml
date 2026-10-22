@@ -89,6 +89,24 @@ runtime:
     address_space_bytes: 1073741824
     file_size_bytes: 67108864
     max_processes: 128
+  # 执行后端（docs/37 P0-1）：
+  #   local     = 宿主进程。只有路径/命令/环境/rlimit 约束，不是安全边界，适合本地开发；
+  #   container = Docker/Podman。--network none、只读根、cap-drop ALL、no-new-privileges、
+  #               内存/CPU/pids 上限，只挂载本次 run 的 code/ 目录。
+  # backend=container 时初始化即校验运行时与镜像；任一不可用直接失败（fail-closed），
+  # 绝不静默降级到宿主执行。镜像需自带交付物所需解释器（默认 python，node 需求请换镜像）。
+  sandbox_backend: "local"
+  sandbox_container:
+    runtime: "docker"              # 可执行文件名或绝对路径（podman 亦可）
+    image: "python:3.12-slim"
+    python: "python"               # 容器内解释器名（宿主绝对路径会被映射成它）
+    network: "none"                # 生产保持 none；改成 bridge 即失去网络隔离
+    memory: "1g"
+    cpus: "1.0"
+    pids_limit: 128
+    read_only: true                # 根文件系统只读，/tmp 用 tmpfs
+    tmpfs: "/tmp:rw,noexec,nosuid,size=64m"
+    user: ""                       # 空=POSIX 当前 uid:gid；Windows 交给 Docker Desktop
   # 静态分析并行度（按文件并行，IO 等待型负载；不配则用默认 min(8, cpu+4)）
   sandbox_analyze_workers: null
   # UI 证据采集（docs/15 方案 B）：默认关闭，行为与现状一致。
@@ -99,6 +117,12 @@ runtime:
     enabled: false
     server: "playwright"          # mcp.yaml 中已注册且 enabled 的服务名
     timeout: 300                  # 单次 UI 探测总超时（秒），独立于 sandbox_timeout
+  # 项目指令文件（docs/36，对标 Codex 的 AGENTS.md）：从需求文件所在目录向上逐级收集到
+  # 项目根，注入每个节点的 Prompt；文件头部可选 YAML front-matter，其中 delivery_shape
+  # 由框架确定性采纳（优先于模型判定）。没有该文件时整段为空，Prompt 与未启用时逐字节一致。
+  project_docs:
+    enabled: true
+    max_bytes: 32768               # 累积上限（字节），与 Codex 的 32 KiB 一致，超限即停
   save_prompts: true              # 落盘每次 Prompt（含分层经验注入证据）
   # 技能注入（config/skills/*/SKILL.md → 节点 Prompt）：默认开启。
   # 关闭时 Prompt 与改造前逐字节一致；开启后每个节点执行前做确定性匹配（规则见 mas/skills.py 的 score_skill）：
@@ -138,6 +162,35 @@ runtime:
     total_chars: 32000           # 感知段总量预算；超出时按优先级裁剪低优先级明细
     llm_summary: false           # 可选 LLM 摘要（默认关：每次新增 LLM 调用都叠加网关超时风险）
   tool_result_max_chars: 4000    # tool 结果统一截断（头 60% + 尾 40%），0=不截断
+  # 上下文管理（docs/35）：对齐 Codex 的 truncation + compaction 分层机制。
+  # 唯一生效点是 mas/llm.py 的请求组装；未启用或未超限时 fit 原样返回，请求体逐字节不变。
+  # 分层：①truncate 单条 tool 结果头尾截断 → ②trim 从最老的「工具往返」整轮丢弃
+  #      → ③compact 把丢弃内容折叠成一条摘要挂回（不静默丢信息）
+  #      → 仍超硬上限则标 overflow 只告警（此时是 system+user 本身超窗，再切会切坏交付契约）
+  context:
+    enabled: true
+    compact_ratio: 0.90          # 输入 token 达可用预算的 90% 起动手（Codex auto_compact_token_limit）
+    hard_ratio: 0.95             # 硬上限（Codex effective_context_window_percent）；超出只告警
+    reserve_output: true         # 先从窗口扣掉 max_tokens(64000) 再算可用预算：
+                                 # 不扣会把「输入撞墙」误判成「还有余量」（与 Codex 的显式分歧）
+    tool_result_chars: 4000      # 阶段①单条 tool 结果预算（0=跳过该阶段）
+    keep_recent_rounds: 1        # 阶段②至少保留最近几轮工具往返（整轮丢弃，保证 tool_call_id 配对）
+    summary_max_chars: 2000      # 阶段③摘要字符上限
+    calibrate: false             # 用端点返回的 prompt_tokens 校准字节/4 粗估（默认关：保持确定性）
+  # ReAct（Reasoning + Acting）推理-行动循环：默认关闭，关闭时走改造前的工具闭环
+  # （llm.tool_max_rounds），行为逐字节一致。
+  # 开启后命中节点按 Thought → Action → Observation 逐步推进：模型每步先输出思考（正文），
+  # 再发起 tool_calls（Action），框架经 ToolRunner 真实执行后把结果作为 Observation 回传续跑；
+  # 每步落 react_step 事件（思考 + 动作 + 观察摘要），不再请求工具的那步落 react_final，
+  # 步数用尽仍在要工具则落 react_step_limit 并追加一次不带 tools 的生成强制收敛。
+  # 生效范围取三重交集：react.enabled + react.nodes（空=全部）+ llm.tools_nodes（工具下发白名单）。
+  react:
+    enabled: true               # 默认开启：命中节点按 Thought → Action → Observation 推进（docs/34）
+    nodes: []                   # 空=全部节点；非空=仅这些节点走 ReAct
+    max_steps: 4                # ReAct 步数上限（不含步数用尽后的收尾轮）
+    thought_max_chars: 2000     # 单步思考落事件的字符上限（0=不截断；只影响留痕，不影响回传）
+    observation_max_chars: 1500 # 单条观察结果落事件的字符上限（同上）
+    require_thought: false      # true=某步未抽出思考时发 react_thought_missing 告警（不阻断）
   # 数据存储后端（docs/25）：MySQL=索引/结构层（经验库/运行索引/产物索引），
   # Redis=跨进程协调层（运行注册表+心跳+取消键）。enabled=false 时全部走既有
   # jsonl/内存路径，行为与现状逐字节一致；任一后端连接失败也自动降级不报错。
@@ -179,6 +232,8 @@ runtime:
     stream_maxlen: 20000             # 单 Stream 近似上限，防止无限增长
     stream_ttl_s: 604800             # 7 天：按 run 隔离的 agent/events 流自动回收
     queue_ttl_s: 3600                # 排队中的运行注册键 TTL（取消按钮在领取前也生效）
+    lease_ttl_s: 300                 # worker 运行租约 TTL（秒）；领取失败不 ACK，留给后续重投
+    lease_renew_s: 30                # 租约续期间隔（秒），同时刷新运行心跳（长 LLM 节点不掉线）
     poll_ms: 1000                    # worker XREADGROUP 阻塞时长
     agent_bus:
       enabled: true                  # Agent 消息写 Redis Stream；关闭后只保留 jsonl 主路径

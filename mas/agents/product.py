@@ -11,6 +11,7 @@ from ..intent import (
     resolve_delivery_shape,
 )
 from ..llm import Generation
+from ..projectdocs import directive_shape
 from ..schemas import AgentResult, NodeTask
 from .base import BaseAgent, Perception
 
@@ -97,6 +98,23 @@ class ProductAgent(BaseAgent):
         # 兜底取 backend_only：现有已验证能力全在该形态下，不改变任何既有行为。
         raw_shape = spec.get("delivery_shape", spec.get("delivery_mode"))
         shape, source, fell_back = resolve_delivery_shape(spec)
+
+        # L0 项目指令声明（docs/36，对标 Codex AGENTS.md）：需求方在 AGENTS.md 的
+        # front-matter 里写明的形态**覆盖**模型判定。判错的代价很高——形态决定用哪条
+        # 证据通道验收，而 full_stack_spa 在本机无浏览器通道时必然不通过；此前除了改
+        # intent.py 的分类规则没有任何纠正入口，现在纠正权回到需求方手里。
+        declared = directive_shape(self.ctx.blackboard.get("project_docs"))
+        if declared:
+            # 与模型判定不一致时单独留痕：这就是「用户纠正了框架」的证据，复盘时可直接查。
+            if declared != shape:
+                self.ctx.events.emit(
+                    "intent_declared_by_project_doc", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration,
+                    payload={"model_shape": shape, "declared_shape": declared,
+                             "note": "项目指令文件 front-matter 声明的交付形态覆盖模型判定"},
+                )
+            shape, source = declared, "project_doc"
+
         spec["delivery_shape"] = shape
         spec["delivery_shape_source"] = source
         if fell_back:

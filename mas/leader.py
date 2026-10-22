@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import secrets
 import threading
 from dataclasses import asdict, dataclass, field
@@ -31,12 +33,31 @@ from .events import EventLog
 from .experience import Experience, ExperienceLibrary
 from .expr import evaluate
 from .llm import LLMClient
+from .projectdocs import collect_project_docs, render_section
 from .prompts import PromptBuilder
 from .sandbox import Sandbox
 from .schemas import AgentContext, AgentResult, NodeTask
 from .skills import build_tool_schema, list_skills, load_run_facts, run_skill_script
 
 __all__ = ["Leader", "RunSummary", "upsert_run_index"]
+
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_RUN_STATE_KEYS = (
+    "injected_experience_ids", "injected_tiers", "injected_total", "rollbacks",
+    "review_rejections", "node_executions", "last_extract_seq",
+    "negotiations", "penalized_experience_ids", "skills_total",
+)
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """检查点原子落盘：先写临时文件再 replace，避免断电留下半截 JSON。"""
+    tmp = path.with_name(path.name + ".tmp")
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(serialized)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 def _permission_allows(agent: Any, action: str) -> bool:
@@ -263,6 +284,91 @@ class Leader:
             pass
 
     # ================================================================= 运行
+    # ================================================================= 断点续跑
+    @staticmethod
+    def _checkpoint_path(run_dir: Path) -> Path:
+        return run_dir / "checkpoint.json"
+
+    def _load_checkpoint(self, path: Path, run_id: str) -> Dict[str, Any]:
+        """读取并校验检查点；任何不一致都拒绝恢复（不做“猜着续跑”）。"""
+        if not path.exists():
+            raise ConfigError(f"无法恢复：运行 {run_id} 没有 checkpoint.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"无法恢复：检查点损坏（{path}）：{exc}") from exc
+        if int(data.get("version") or 0) != _CHECKPOINT_VERSION:
+            raise ConfigError(
+                f"无法恢复：检查点版本 {data.get('version')} 不受支持"
+                f"（期望 {_CHECKPOINT_VERSION}）"
+            )
+        if str(data.get("run_id") or "") != run_id:
+            raise ConfigError(
+                f"无法恢复：检查点属于运行 {data.get('run_id')}，不是 {run_id}"
+            )
+        if str(data.get("status") or "") != "running":
+            raise ConfigError(f"无法恢复：运行 {run_id} 的检查点状态为 {data.get('status')}")
+        return data
+
+    def _resume_input(self, run_dir: Path, state: Dict[str, Any]) -> Tuple[str, str, str]:
+        """续跑入口校验：需求快照存在且 hash 与检查点一致（否则拒绝续跑）。"""
+        encoding = str(self.config.system.get("requirement_encoding", "utf-8"))
+        title = str(state.get("requirement_title") or "").strip()
+        requirement_file = run_dir / "input" / "requirement.md"
+        try:
+            text = requirement_file.read_text(encoding=encoding)
+        except OSError as exc:
+            raise ConfigError(f"无法恢复：需求快照不可读（{requirement_file}）：{exc}") from exc
+        if not title:
+            raise ConfigError(
+                f"无法恢复：检查点缺少 requirement_title（{run_dir / 'checkpoint.json'}）"
+            )
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest != str(state.get("requirement_sha256") or ""):
+            raise ConfigError(
+                f"无法恢复：需求内容与检查点不一致（{requirement_file}），"
+                "拒绝把不同需求续到同一运行上"
+            )
+        return title, text, digest
+
+    def _write_checkpoint(
+        self,
+        path: Path,
+        *,
+        req_title: str,
+        requirement_sha256: str,
+        next_node: Optional[str],
+        iterations: Dict[str, int],
+        rollback_counts: Dict[str, int],
+        pending_reason: str,
+        forced_fail: bool,
+        steps: int,
+        run_state: Dict[str, Any],
+        project_docs_text: str,
+        started_at: str = "",
+        status: str = "running",
+    ) -> None:
+        """记录「已完成的节点 + 下一步去哪」；崩溃后从 next_node 重跑。"""
+        payload = {
+            "version": _CHECKPOINT_VERSION,
+            "run_id": path.parent.name,
+            "status": status,
+            "requirement_title": req_title,
+            "requirement_sha256": requirement_sha256,
+            "next_node": next_node,
+            "iterations": dict(iterations),
+            "rollback_counts": dict(rollback_counts),
+            "pending_reason": pending_reason,
+            "forced_fail": bool(forced_fail),
+            "steps": int(steps),
+            "run_state": {key: run_state[key] for key in _CHECKPOINT_RUN_STATE_KEYS
+                          if key in run_state},
+            "project_docs_text": project_docs_text,
+            "started_at": started_at or datetime.now().astimezone().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        _atomic_write_json(path, payload)
+
     def run(
         self,
         requirement: str,
@@ -272,6 +378,7 @@ class Leader:
         images: Optional[List[str]] = None,
         cancel_event: Optional[threading.Event] = None,
         registry: Optional[Any] = None,
+        resume: bool = False,
     ) -> RunSummary:
         """执行一次完整流水线。
 
@@ -285,6 +392,11 @@ class Leader:
         （Redis 后端即跨进程可见 + 可取消）、结束 unregister；节点边界的取消判定
         在 cancel_event 之外额外查询 ``registry.is_canceled(run_id)``，使 CLI 等其他
         进程发起的运行也能被终止。
+
+        ``resume``（断点续跑；默认 False 行为与改造前完全一致）：从
+        ``run_dir/checkpoint.json`` 恢复状态机，跳过已完成的输入与节点；需求文件
+        hash 不一致、检查点损坏或状态非 running 时抛 ``ConfigError``，绝不猜测续跑。
+        节点粒度是 at-least-once：崩溃时正在执行的节点会重跑，之后的节点不重跑。
         """
         started = datetime.now().astimezone()
         stamp_fmt = str(self.config.runtime.get("run_id_format", "%Y%m%d-%H%M%S"))
@@ -292,6 +404,19 @@ class Leader:
         run_dir = self.config.runs_dir / run_id
         for sub in ("input", "code", "reports", "evidence"):
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = self._checkpoint_path(run_dir)
+        resume_state = self._load_checkpoint(checkpoint_path, run_id) if resume else None
+        requirement_sha256 = ""
+        resume_title = ""
+        resume_text = ""
+        if resume_state is not None:
+            # 在创建任何运行时资源之前完成校验：hash 不符时快速失败，不留半开连接
+            resume_title, resume_text, requirement_sha256 = self._resume_input(run_dir, resume_state)
+            try:                     # 续跑仍按「首次开始时间」统计总耗时/指标时间戳
+                started = datetime.fromisoformat(str(resume_state.get("started_at") or ""))
+            except ValueError:
+                pass
 
         verbose = bool(self.config.runtime.get("verbose", True))
 
@@ -301,7 +426,8 @@ class Leader:
         if registry is not None:
             registry.register(run_id)   # 幂等：前端已注册时返回既有取消信号，不重置
 
-        events = EventLog(run_dir / "events.jsonl", run_id, echo=verbose)
+        events = EventLog(run_dir / "events.jsonl", run_id, echo=verbose,
+                          resume=resume_state is not None)
         # 事件双写 sink（MySQL 索引层；SSOT 仍是 events.jsonl，写失败静默不影响主流程）
         if backends.mysql is not None:
             events.subscribe(_make_mysql_event_sink(backends.mysql, run_id))
@@ -333,6 +459,9 @@ class Leader:
         experience = ExperienceLibrary(self.config.workspace_dir, self.config.learning, events, run_id,
                                        mysql=backends.mysql)
         prompts = PromptBuilder(self.config, run_dir, enabled=bool(self.config.runtime.get("save_prompts", True)))
+        if resume_state is not None:
+            # 项目指令文本不重扫：以检查点保存的内容为准，保证续跑前后 Prompt 一致
+            prompts.project_docs_text = str(resume_state.get("project_docs_text") or "")
         llm = LLMClient(self.config)
 
         ctx = AgentContext(
@@ -357,88 +486,122 @@ class Leader:
         # 完成「值 → (title, text)」，之后与原有文件/文字通道完全同路（下游零改动）。
         encoding = str(self.config.system.get("requirement_encoding", "utf-8"))
         images_meta: List[Dict[str, Any]] = []
-        try:
-            source_kind = "text" if as_text else "file"
-            candidate: Optional[Path] = None if as_text else self._requirement_path(requirement)
-            if candidate is not None and sources.classify_source(requirement) == "feishu":
-                req_title, req_text = sources.fetch_feishu_document(requirement, self.config)
-                source_kind = "feishu"
-                events.emit(
-                    "input_source_fetched", agent="leader",
-                    payload={"source": "feishu", "title": req_title, "chars": len(req_text),
-                             "run_id": run_id},
-                )
-            elif candidate is not None and sources.file_backend(candidate, self.config) != "text":
-                if not candidate.exists():
-                    raise ConfigError(
-                        f"需求输入既不是存在的文件，也不是 --text 文字需求: {requirement}"
+        if resume_state is not None:
+            # 续跑：输入阶段已落盘，不再重新抓取/解析/发布（否则会产生重复产物与事件）
+            req_title, req_text = resume_title, resume_text
+            events.emit(
+                "run_resumed", agent="leader",
+                payload={
+                    "run_id": run_id, "requirement": req_title,
+                    "resumed_from": resume_state.get("next_node"),
+                    "completed_steps": int(resume_state.get("steps") or 0),
+                    "requirement_sha256": requirement_sha256,
+                },
+            )
+        else:
+            try:
+                source_kind = "text" if as_text else "file"
+                candidate: Optional[Path] = None if as_text else self._requirement_path(requirement)
+                if candidate is not None and sources.classify_source(requirement) == "feishu":
+                    req_title, req_text = sources.fetch_feishu_document(requirement, self.config)
+                    source_kind = "feishu"
+                    events.emit(
+                        "input_source_fetched", agent="leader",
+                        payload={"source": "feishu", "title": req_title, "chars": len(req_text),
+                                 "run_id": run_id},
                     )
-                req_text, backend = sources.extract_text(candidate, self.config, encoding=encoding)
-                req_title = candidate.stem
+                elif candidate is not None and sources.file_backend(candidate, self.config) != "text":
+                    if not candidate.exists():
+                        raise ConfigError(
+                            f"需求输入既不是存在的文件，也不是 --text 文字需求: {requirement}"
+                        )
+                    req_text, backend = sources.extract_text(candidate, self.config, encoding=encoding)
+                    req_title = candidate.stem
+                    events.emit(
+                        "document_parsed", agent="leader",
+                        payload={"path": str(candidate), "format": candidate.suffix.lower(),
+                                 "chars": len(req_text), "backend": backend},
+                    )
+                else:
+                    req_title, req_text = load_requirement(
+                        requirement, as_text=as_text, project_root=self.config.project_root,
+                        encoding=encoding,
+                    )
+                # 附图（docs/16 的 01 文档）：校验 + 复制落盘，元数据随 requirement_source 发布
+                images_meta, images_truncated = sources.prepare_images(
+                    list(images or []), run_dir, project_root=self.config.project_root,
+                    max_bytes=int((self.config.llm.get("vision") or {}).get("max_image_bytes", 5242880)),
+                )
+            except ConfigError as exc:
+                events.emit("run_failed", severity="error", payload={"error": str(exc)})
+                return RunSummary(run_id=run_id, run_dir=str(run_dir), requirement_title="",
+                                  verdict="fail", steps=0, rollbacks=0, review_rejections=0,
+                                  bugs_total=0, bugs_fixed=0, error=str(exc))
+            (run_dir / "input" / "requirement.md").write_text(req_text, encoding="utf-8")
+            requirement_sha256 = hashlib.sha256(req_text.encode("utf-8")).hexdigest()
+            # 新字段仅在非空时并入：无附图/无预检索时 artifact 结构与改造前一致（默认路径逐字节不变）
+            source_payload: Dict[str, Any] = {
+                "title": req_title, "text": req_text, "source": source_kind,
+                "chars": len(req_text), "run_id": run_id,
+            }
+            if images_meta:
+                source_payload["images"] = images_meta
+            references = self._pre_enrich_references(req_title, req_text, events)
+            if references:
+                source_payload["references"] = references
+            blackboard.publish(
+                "requirement_source", source_payload,
+                producer="leader", node="intake", iteration=0, summary=f"需求输入（{len(req_text)} 字符）",
+            )
+            if images_meta:
                 events.emit(
-                    "document_parsed", agent="leader",
-                    payload={"path": str(candidate), "format": candidate.suffix.lower(),
-                             "chars": len(req_text), "backend": backend},
+                    "requirement_images_attached", agent="leader",
+                    payload={"count": len(images_meta),
+                             "images": [{"name": item["name"], "bytes": item["bytes"]}
+                                        for item in images_meta]},
                 )
-            else:
-                req_title, req_text = load_requirement(
-                    requirement, as_text=as_text, project_root=self.config.project_root,
-                    encoding=encoding,
+            if images_truncated:
+                events.emit(
+                    "requirement_images_truncated", agent="leader", severity="warning",
+                    payload={"dropped": images_truncated, "max_images": sources.MAX_IMAGES},
                 )
-            # 附图（docs/16 的 01 文档）：校验 + 复制落盘，元数据随 requirement_source 发布
-            images_meta, images_truncated = sources.prepare_images(
-                list(images or []), run_dir, project_root=self.config.project_root,
-                max_bytes=int((self.config.llm.get("vision") or {}).get("max_image_bytes", 5242880)),
+            # 环境探测（docs/15 B1）：node/浏览器工具链可用性在启动时写成事实，
+            # 供 tester 语言闸与 UI 证据采集判定；缺失时按「环境或构建问题」显式失败。
+            env_probe = probe_environment(self.config, sandbox)
+            blackboard.publish(
+                "env_probe", env_probe,
+                producer="leader", node="intake", iteration=0,
+                summary=(f"node={'可用' if env_probe['javascript_ready'] else '不可用'}，"
+                         f"browser_ui={'可用' if env_probe['browser_ui_ready'] else '不可用'}"),
             )
-        except ConfigError as exc:
-            events.emit("run_failed", severity="error", payload={"error": str(exc)})
-            return RunSummary(run_id=run_id, run_dir=str(run_dir), requirement_title="",
-                              verdict="fail", steps=0, rollbacks=0, review_rejections=0,
-                              bugs_total=0, bugs_fixed=0, error=str(exc))
-        (run_dir / "input" / "requirement.md").write_text(req_text, encoding="utf-8")
-        # 新字段仅在非空时并入：无附图/无预检索时 artifact 结构与改造前一致（默认路径逐字节不变）
-        source_payload: Dict[str, Any] = {
-            "title": req_title, "text": req_text, "source": source_kind,
-            "chars": len(req_text), "run_id": run_id,
-        }
-        if images_meta:
-            source_payload["images"] = images_meta
-        references = self._pre_enrich_references(req_title, req_text, events)
-        if references:
-            source_payload["references"] = references
-        blackboard.publish(
-            "requirement_source", source_payload,
-            producer="leader", node="intake", iteration=0, summary=f"需求输入（{len(req_text)} 字符）",
-        )
-        if images_meta:
+            # 项目指令文件（docs/36，对标 Codex AGENTS.md）：从需求文件所在目录向上收集到
+            # 项目根，注入每个节点的 Prompt；front-matter 声明的 delivery_shape 由框架确定性
+            # 采纳（ProductAgent 读取 project_docs 产物）。没有文件时整段为空，Prompt 不变。
+            docs_dir = (candidate.parent if candidate is not None and candidate.exists()
+                        else self.config.project_root)
+            project_docs = collect_project_docs(
+                docs_dir, root=self.config.project_root, runtime=self.config.runtime)
+            if project_docs.text:
+                prompts.project_docs_text = render_section(project_docs)
+                blackboard.publish(
+                    "project_docs", project_docs.to_dict(),
+                    producer="leader", node="intake", iteration=0,
+                    summary=(f"项目指令 {len(project_docs.files)} 份（{project_docs.chars} 字符）"
+                             + (f"，声明形态 {project_docs.directives['delivery_shape']}"
+                                if project_docs.directives.get("delivery_shape") else "")),
+                )
+                events.emit(
+                    "project_docs_loaded", agent="leader",
+                    payload={**project_docs.to_dict(), "start_dir": str(docs_dir)},
+                )
             events.emit(
-                "requirement_images_attached", agent="leader",
-                payload={"count": len(images_meta),
-                         "images": [{"name": item["name"], "bytes": item["bytes"]}
-                                    for item in images_meta]},
+                "run_started", payload={
+                    "run_id": run_id, "requirement": req_title, "input_mode": "text" if as_text else "file",
+                    "profile": self.config.profile, "flow_entry": self.config.flow.entry,
+                    "config_name": self.config.name, "llm_provider": self.config.llm.get("provider"),
+                },
             )
-        if images_truncated:
-            events.emit(
-                "requirement_images_truncated", agent="leader", severity="warning",
-                payload={"dropped": images_truncated, "max_images": sources.MAX_IMAGES},
-            )
-        # 环境探测（docs/15 B1）：node/浏览器工具链可用性在启动时写成事实，
-        # 供 tester 语言闸与 UI 证据采集判定；缺失时按「环境或构建问题」显式失败。
-        env_probe = probe_environment(self.config, sandbox)
-        blackboard.publish(
-            "env_probe", env_probe,
-            producer="leader", node="intake", iteration=0,
-            summary=(f"node={'可用' if env_probe['javascript_ready'] else '不可用'}，"
-                     f"browser_ui={'可用' if env_probe['browser_ui_ready'] else '不可用'}"),
-        )
-        events.emit(
-            "run_started", payload={
-                "run_id": run_id, "requirement": req_title, "input_mode": "text" if as_text else "file",
-                "profile": self.config.profile, "flow_entry": self.config.flow.entry,
-                "config_name": self.config.name, "llm_provider": self.config.llm.get("provider"),
-            },
-        )
-        print(f"\n[RUN] {run_id}｜{self.config.name}｜需求：{req_title}")
+            print(f"\n[RUN] {run_id}｜{self.config.name}｜需求：{req_title}")
 
         # ---------------------------------------------------------------- 状态机
         try:
@@ -448,9 +611,31 @@ class Leader:
             rollback_counts: Dict[str, int] = {}
             pending_reason = ""
             forced_fail = False
-            node_id: Optional[str] = flow.entry
             steps = 0
             canceled = False
+            if resume_state is not None:
+                iterations = {str(key): int(value) for key, value in
+                              (resume_state.get("iterations") or {}).items()}
+                rollback_counts = {str(key): int(value) for key, value in
+                                   (resume_state.get("rollback_counts") or {}).items()}
+                pending_reason = str(resume_state.get("pending_reason") or "")
+                forced_fail = bool(resume_state.get("forced_fail"))
+                steps = max(0, int(resume_state.get("steps") or 0))
+                node_id: Optional[str] = str(resume_state.get("next_node") or flow.entry)
+                if node_id not in flow.nodes and node_id not in flow.terminal:
+                    raise ConfigError(f"无法恢复：检查点中的节点不存在: {node_id}")
+                ctx.run_state.update(resume_state.get("run_state") or {})
+                ctx.run_state["node_executions"] = steps
+            else:
+                node_id = flow.entry
+                self._write_checkpoint(
+                    checkpoint_path, req_title=req_title,
+                    requirement_sha256=requirement_sha256, next_node=node_id,
+                    iterations=iterations, rollback_counts=rollback_counts,
+                    pending_reason=pending_reason, forced_fail=forced_fail, steps=steps,
+                    run_state=ctx.run_state, project_docs_text=prompts.project_docs_text,
+                    started_at=started.isoformat(timespec="seconds"),
+                )
             max_steps = min(int(flow.max_steps), int(self.config.runtime.get("max_steps", flow.max_steps)))
             max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
 
@@ -573,6 +758,16 @@ class Leader:
                             else:
                                 target = "halt"
                 node_id = target
+                # 检查点写在「节点完成 + 分支落定」之后：崩溃发生在节点内部时，
+                # next_node 仍是该节点，恢复会重跑它；已完成的节点不会重跑。
+                self._write_checkpoint(
+                    checkpoint_path, req_title=req_title,
+                    requirement_sha256=requirement_sha256, next_node=node_id,
+                    iterations=iterations, rollback_counts=rollback_counts,
+                    pending_reason=pending_reason, forced_fail=forced_fail, steps=steps,
+                    run_state=ctx.run_state, project_docs_text=prompts.project_docs_text,
+                    started_at=started.isoformat(timespec="seconds"),
+                )
 
         finally:
             if tool_runner is not None:
@@ -668,6 +863,19 @@ class Leader:
         (run_dir / "run_summary.json").write_text(
             json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
+        # 正常/取消/失败收尾后把检查点标记为 completed：worker 只恢复 status=running 的运行，
+        # 不会把「已给出结论」的运行再跑一遍。保留文件供排查，不做删除。
+        try:
+            self._write_checkpoint(
+                checkpoint_path, req_title=req_title,
+                requirement_sha256=requirement_sha256, next_node=node_id,
+                iterations=iterations, rollback_counts=rollback_counts,
+                pending_reason=pending_reason, forced_fail=forced_fail, steps=steps,
+                run_state=ctx.run_state, project_docs_text=prompts.project_docs_text,
+                started_at=started.isoformat(timespec="seconds"), status="completed",
+            )
+        except OSError:  # noqa: BLE001 - 收尾标记失败不影响已落盘的运行结论
+            pass
         # MySQL 索引层双写（docs/25）：SSOT 仍是 run_summary.json / metrics.jsonl，
         # MySQL 只是可查询投影；写失败静默——连接抖动不该让已完成的运行报错。
         if backends.mysql is not None:

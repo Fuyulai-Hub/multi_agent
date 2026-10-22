@@ -565,6 +565,9 @@ class RealFlowGateTests(_CtxMixin, unittest.TestCase):
             {"summary": {"failed": 0},
              "coverage": {"functional": {"rate": 1.0}, "exception": {"rate": 1.0},
                           "boundary": {"rate": 1.0}},
+             # docs/37 P0-2 新增的两条 acceptance criterion 只读这份凭据摘要；
+             # 真实签名链路由 tests/test_verifier.py 覆盖，这里构造已通过的门禁快照。
+             "verification_attestation": {"valid": True, "test_hash": "fixture-digest"},
              "negotiation": {"open": 0}},
             producer="tester", node="test", iteration=1, summary="t")
         self.blackboard.publish("bug_reports", {"open": 0},

@@ -6,8 +6,12 @@ collaboration:
 
   # 每个角色动手前必须“感知”的上游产物（黑板读取 + 通讯摘要）
   perception:
-    product: ["requirement_source"]
-    developer: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "acceptance_gate"]
+    # env_probe（docs/36）：环境事实（node/浏览器通道可用性）在 run 启动时就已写成黑板产物，
+    # 但此前只有 tester 能看到——决策节点（产品定形态、研发定选型）看不到，于是出现
+    # 「规划时不看约束、验收时才发现违反约束」的必然失败。对标 Codex 的 world state
+    # （build_initial_context_with_world_state），这里让决策角色同样感知环境能力。
+    product: ["requirement_source", "env_probe"]
+    developer: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "acceptance_gate", "env_probe"]
     reviewer: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "bug_reports", "test_report"]
     tester: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "review_report", "bug_reports"]
     reporter: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "fix_summary", "fix_test_report", "acceptance_gate"]

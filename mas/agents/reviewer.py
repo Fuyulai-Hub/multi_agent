@@ -216,6 +216,8 @@ class ReviewerAgent(BaseAgent):
         if task.node_id == "acceptance":
             self._apply_signoff(task, data, result)
             return
+        if task.node_id == "review":
+            data = self._recompute_blocking(task, data, perception, context)
         verdict = str(data.get("verdict", "reject"))
         artifact_name = "review_report" if task.node_id == "review" else "design_review"
         self.publish(
@@ -243,6 +245,72 @@ class ReviewerAgent(BaseAgent):
             },
             refs=[f"artifacts/{artifact_name}"],
         )
+
+    def _recompute_blocking(
+        self,
+        task: NodeTask,
+        data: Dict[str, Any],
+        perception: Perception,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """阻塞数由框架按确定性证据重算，不再采信模型 JSON（docs/37 P0-2）。
+
+        确定性来源：build_context 已算好的 AST/Web 静态 findings + 代码清单里
+        功能点到实现的映射缺口。LLM 的自报 findings 保留为 ``advisory_findings``，
+        但 ``blocking``/``blocking_items`` 只由框架写入——模型说 0 不能把
+        ``eval_usage``/语法错误/未实现功能点洗掉；模型虚报阻塞也无法改变计数。
+        """
+        manifest = perception.found.get("code_manifest") or {}
+        policies = dict(context.get("policies") or self.role.policies)
+        blocking_severities = set(policies.get("blocking_severities") or ("critical", "major"))
+        static = (context.get("static_analysis") or {}).get("findings") or []
+        deterministic = [item for item in static if isinstance(item, dict)]
+
+        mapped = set((manifest.get("fp_mapping") or {}).keys())
+        first_file = (manifest.get("files") or ["-"])[0]
+        for fp in perception.spec.get("function_points", []) or []:
+            fp_id = str(fp.get("id") or "")
+            if fp_id and fp_id not in mapped:
+                deterministic.append({
+                    "rule": "unimplemented_function_point", "severity": "critical",
+                    "file": first_file, "line": 0, "symbol": fp_id,
+                    "message": f"需求功能点 {fp_id} 未映射到任何实现函数",
+                })
+
+        llm_findings = [item for item in (data.get("findings") or []) if isinstance(item, dict)]
+        merged: List[Dict[str, Any]] = []
+        seen: set = set()
+        for item in list(llm_findings) + deterministic:
+            try:
+                line = int(item.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            key = (str(item.get("rule", "")), str(item.get("file", "")),
+                   line, str(item.get("symbol", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        blocking_items = [item for item in deterministic
+                          if str(item.get("severity", "")) in blocking_severities]
+        original = data.get("blocking")
+        data["llm_verdict"] = data.get("verdict", "reject")
+        data["llm_findings"] = llm_findings
+        data["findings"] = merged
+        data["blocking"] = len(blocking_items)
+        data["blocking_items"] = blocking_items
+        data["deterministic_blocking"] = len(blocking_items)
+        if blocking_items:
+            data["verdict"] = "reject"
+        if original != len(blocking_items):
+            self.ctx.events.emit(
+                "review_blocking_recomputed", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"model_reported": original, "framework_blocking": len(blocking_items),
+                         "rules": sorted({str(item.get("rule", "")) for item in blocking_items}),
+                         "note": "阻塞数以框架确定性证据为准，模型自报值仅作审计留痕"},
+            )
+        return data
 
     def _apply_signoff(self, task: NodeTask, data: Dict[str, Any], result: AgentResult) -> None:
         verdict = str(data.get("verdict", "reject"))

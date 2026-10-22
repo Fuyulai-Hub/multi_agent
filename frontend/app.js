@@ -16,6 +16,8 @@ const state = {
   },
   // 当前生效的技能开关（与 system.yaml 的 runtime.skills.* 同名同义）
   skills: { enabled: false, tools_enabled: false },
+  // 当前生效的 ReAct 开关（enabled/max_steps/require_thought 可写；nodes/tools_nodes 只读回显）
+  react: { enabled: false, max_steps: 4, require_thought: false, nodes: [], tools_nodes: [] },
 };
 
 /* 附图上传约束：与后端 mas/sources.py 的 IMAGE_SUFFIXES / MAX_IMAGES、
@@ -380,6 +382,8 @@ const CFG = {
   apiKey: "#cfg-api-key", model: "#cfg-model", tokenName: "#cfg-token-name",
   status: "#cfg-status", modelList: "#cfg-model-list", contextWindow: "#cfg-context-window",
   skillsEnabled: "#cfg-skills-enabled", skillsToolsEnabled: "#cfg-skills-tools-enabled",
+  reactEnabled: "#cfg-react-enabled", reactRequireThought: "#cfg-react-require-thought",
+  reactMaxSteps: "#cfg-react-max-steps", reactNote: "#cfg-react-note",
 };
 
 function setCfgStatus(text, cls) {
@@ -402,6 +406,37 @@ async function fetchSkillsConfig() {
 /* tools_enabled 依赖 enabled（后端双开才注册技能工具）：总开关关闭时置灰，避免误存无效组合 */
 function syncSkillsSwitchState() {
   $(CFG.skillsToolsEnabled).disabled = !$(CFG.skillsEnabled).checked;
+}
+
+/* ReAct 开关（system.yaml 的 runtime.react.enabled / max_steps / require_thought，字段同名同义） */
+async function fetchReactConfig() {
+  const res = await fetch("/api/react");
+  return res.json();
+}
+
+/* require_thought / max_steps 依赖 enabled：总开关关闭时置灰，避免存出无效组合 */
+function syncReactSwitchState() {
+  const on = $(CFG.reactEnabled).checked;
+  $(CFG.reactRequireThought).disabled = !on;
+  $(CFG.reactMaxSteps).disabled = !on;
+}
+
+/* 生效范围是三重交集 enabled ∧ nodes ∧ llm.tools_nodes：面板直接算出实际节点，
+   避免"开了开关却没生效"的困惑（nodes/tools_nodes 为空均表示全部节点）。 */
+function renderReactNote(data) {
+  const el = $(CFG.reactNote);
+  if (!data || !data.enabled) {
+    el.textContent = "";
+    return;
+  }
+  const scope = (list) => (list && list.length ? list : null);
+  const nodes = scope(data.nodes);
+  const tools = scope(data.tools_nodes);
+  let text;
+  if (!nodes && !tools) text = "将在全部节点生效";
+  else if (nodes && tools) text = `将在 ${nodes.filter((n) => tools.includes(n)).join("、") || "（交集为空，不会生效）"} 节点生效`;
+  else text = `将在 ${(nodes || tools).join("、")} 节点生效`;
+  el.textContent = `当前：${text}（nodes × tools_nodes 取交集，两项为空表示全部节点）`;
 }
 
 /* ---------------- 主界面技能开关（与弹窗内 #cfg-skills-enabled 同源）----------------
@@ -524,7 +559,8 @@ function openSettings() {
   Promise.all([
     fetchLlmConfig(),
     fetchSkillsConfig().catch(() => null),   // 技能开关读取失败不阻塞弹窗，保存仍按表单值写入
-  ]).then(([cfg, skills]) => {
+    fetchReactConfig().catch(() => null),    // ReAct 开关同理
+  ]).then(([cfg, skills, react]) => {
     state.llm.apiKeySet = !!cfg.api_key_set;
     state.llm.apiKeyMasked = cfg.api_key_masked || "";
     $(CFG.provider).value = cfg.provider || "offline";
@@ -545,6 +581,17 @@ function openSettings() {
       state.skills.enabled = !!skills.enabled;
       state.skills.tools_enabled = !!skills.tools_enabled;
       $("#skills-toggle").checked = state.skills.enabled;   // 弹窗打开即与主界面开关对齐
+    }
+    if (react) {
+      state.react.enabled = !!react.enabled;
+      state.react.max_steps = react.max_steps || 4;
+      state.react.nodes = react.nodes || [];
+      state.react.tools_nodes = react.tools_nodes || [];
+      $(CFG.reactEnabled).checked = !!react.enabled;
+      $(CFG.reactRequireThought).checked = !!react.require_thought;
+      $(CFG.reactMaxSteps).value = react.max_steps || 4;
+      syncReactSwitchState();
+      renderReactNote(react);
     }
     setCfgStatus(cfg.api_key_set ? `当前凭据：${cfg.api_key_masked}` : "当前未设置 API Key", "");
   }).catch(() => setCfgStatus("读取当前配置失败，请检查服务是否可用", "error"));
@@ -575,6 +622,13 @@ document.addEventListener("keydown", (ev) => {
 
 /* 技能总开关联动：关闭时置灰「技能工具调用」勾选框（值保留，后端双开才生效） */
 $(CFG.skillsEnabled).addEventListener("change", syncSkillsSwitchState);
+
+/* ReAct 总开关联动：关闭时置灰「强制思考」与「最大步数」，并重算生效节点提示 */
+$(CFG.reactEnabled).addEventListener("change", () => {
+  syncReactSwitchState();
+  renderReactNote({ enabled: $(CFG.reactEnabled).checked, nodes: state.react.nodes,
+                    tools_nodes: state.react.tools_nodes });
+});
 
 /* 主界面技能开关：勾选即时写回 system.yaml */
 $("#skills-toggle").addEventListener("change", toggleSkills);
@@ -661,13 +715,29 @@ $("#cfg-save").addEventListener("click", async () => {
       setCfgStatus(skillsData.error || "技能开关保存失败（模型配置已保存）", "error");
       return;
     }
+    // ReAct 开关同上：与模型配置、技能开关同一次保存写回 system.yaml
+    const reactRes = await fetch("/api/react", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled: $(CFG.reactEnabled).checked,
+        max_steps: Number($(CFG.reactMaxSteps).value) || 4,
+        require_thought: $(CFG.reactRequireThought).checked,
+      }),
+    });
+    const reactData = await reactRes.json();
+    if (!reactRes.ok) {
+      setCfgStatus(reactData.error || "ReAct 开关保存失败（模型配置与技能开关已保存）", "error");
+      return;
+    }
     // 弹窗保存后同步主界面开关（两处读写同一字段）
     state.skills.enabled = !!skillsData.enabled;
     state.skills.tools_enabled = !!skillsData.tools_enabled;
     $("#skills-toggle").checked = state.skills.enabled;
     setCfgStatus(
       `已保存：${data.provider}${data.model ? " / " + data.model : ""}${data.api_key_masked ? " · Key " + data.api_key_masked : ""}` +
-      `｜技能 ${skillsData.enabled ? "开" : "关"}${skillsData.tools_enabled ? "（含工具调用）" : ""}`,
+      `｜技能 ${skillsData.enabled ? "开" : "关"}${skillsData.tools_enabled ? "（含工具调用）" : ""}` +
+      `｜ReAct ${reactData.enabled ? "开" : "关"}${reactData.enabled ? `（≤${reactData.max_steps} 步）` : ""}`,
       "done"
     );
     await refreshModelList({ preferModel: state.llm.model });   // 保存后按新 Key 重取模型，必要时自动回退

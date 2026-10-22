@@ -53,6 +53,8 @@ DEFAULTS: Dict[str, Any] = {
     "stream_maxlen": 20000,
     "stream_ttl_s": 604800,            # 7 天：agent/event 流按 run 隔离，过期自动回收
     "queue_ttl_s": 3600,               # 排队中的运行注册键 TTL（长于心跳 90s）
+    "lease_ttl_s": 300,                # 运行租约 TTL：worker 崩溃后最多 5 分钟可被接管
+    "lease_renew_s": 30,               # 租约续租/运行心跳间隔（须小于 heartbeat_ttl 90s）
     "poll_ms": 1000,
     "agent_bus": {"enabled": True},
 }

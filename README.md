@@ -85,7 +85,9 @@ python frontend/server.py
 python frontend/server.py --port 8080
 
 # ③ 指定端口 + 监听地址（0.0.0.0 开放局域网访问，默认仅本机）
-python frontend/server.py --host 0.0.0.0 --port 8080
+#    非回环地址必须同时设置访问令牌，否则服务拒绝启动（失败关闭）
+MAS_PANEL_TOKEN="换成一个随机长令牌" python frontend/server.py --host 0.0.0.0 --port 8080
+#    浏览器首次打开 http://<主机>:8080/?token=<令牌>，换取 HttpOnly Cookie 后即可正常使用
 
 # ④ 同时指定数据目录（默认 <项目根>/workspace）
 python frontend/server.py --port 8080 --workspace workspace
@@ -104,13 +106,25 @@ python frontend/server.py --port 8080 --workspace workspace
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--port` | `8000` | HTTP 监听端口；被占用时改用其他空闲端口（如 `8080`、`9000`） |
-| `--host` | `127.0.0.1` | 监听地址；`127.0.0.1` 仅本机可访问，改成 `0.0.0.0` 开放局域网访问 |
+| `--host` | `127.0.0.1` | 监听地址；`127.0.0.1` 仅本机可访问，改成 `0.0.0.0` 开放局域网访问（必须配令牌） |
 | `--workspace` | `<项目根>/workspace` | 面板读取的运行数据目录，应与 `python -m mas run/demo` 的产出目录一致 |
+| `MAS_PANEL_TOKEN` | 空 | 面板访问令牌；非回环 `--host` 下为必填，空值会拒绝启动 |
+| `MAS_PANEL_ORIGINS` | 空 | 额外允许的跨域来源，逗号分隔（默认只允许同源） |
 
-> 端口、监听地址与数据目录**只能通过命令行参数指定**：不读配置文件、不支持环境变量，
-> 也没有对应的 `mas` CLI 子命令，必须直接运行 `frontend/server.py`。
+> 端口、监听地址与数据目录**只能通过命令行参数指定**；只有访问令牌与跨域白名单走环境变量。
+> 面板没有对应的 `mas` CLI 子命令，必须直接运行 `frontend/server.py`。
 > 若 `--workspace` 指向的目录不存在，服务打印「工作区不存在」提示并以退出码 2 退出，
 > 先跑一次 `python -m mas demo` 生成数据即可。
+
+### 访问控制与输入边界
+
+- 默认绑定 `127.0.0.1`，`/api/*` 只接受同源请求；跨站 `POST` 会被 403 拒绝。
+- 设置 `MAS_PANEL_TOKEN` 后，所有 `/api/*` 需要 `Authorization: Bearer <token>`、
+  `X-Panel-Token: <token>`，或先访问 `/?token=<token>` 换取 `HttpOnly; SameSite=Strict` Cookie。
+- 响应不再发送 `Access-Control-Allow-Origin: *`，只回显同源或 `MAS_PANEL_ORIGINS` 白名单来源。
+- `GET /api/llm` 只返回 `api_key_set` 与掩码，**不回显明文 Key**；表单留空即沿用已保存值。
+- `POST /api/run` 的 `requirement_path` 与 `images` 必须指向 `workspace/uploads/` 内已存在的文件；
+  `profile` 只接受字母/数字/下划线/连字符；`run_id` 拒绝 `..` 与路径分隔符。
 
 ## 流程与状态机
 
@@ -292,7 +306,7 @@ mas/
 ├── leader.py       # 调度器：状态机/门禁/回退/协商/经验闭环
 ├── schemas.py      # 数据契约
 ├── errors.py       # 异常层级
-├── agents/         # 5 个角色 Agent（基类 + 实现）
+├── agents/         # 5 个角色 Agent（基类 + 实现；基类含可选 ReAct 推理-行动循环，见 docs/34）
 ├── providers/      # 离线确定性 Provider + 算子库（ops.py）
 └── cli.py          # CLI（run/demo/experience/store/worker/mq/config/report/skill/mcp）
 ```

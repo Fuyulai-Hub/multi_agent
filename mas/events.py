@@ -41,9 +41,15 @@ class Event:
 
 
 class EventLog:
-    """JSONL 事件日志，支持订阅回调。"""
+    """JSONL 事件日志，支持订阅回调。
 
-    def __init__(self, path: Path, run_id: str, echo: bool = False) -> None:
+    ``resume=True`` 用于断点续跑：从已有 ``events.jsonl`` 恢复事件与序号，
+    保证新事件不重号（MySQL 的 (run_id, seq) 唯一键依赖该单调性）。
+    尾部半行（进程被强杀时可能留下）会被跳过，不让一条残行阻断恢复。
+    """
+
+    def __init__(self, path: Path, run_id: str, echo: bool = False,
+                 resume: bool = False) -> None:
         self.path = Path(path)
         self.run_id = run_id
         self.echo = echo
@@ -51,6 +57,8 @@ class EventLog:
         self._seq = 0
         self._subscribers: List[Callable[[Event], None]] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if resume:
+            self.load()
 
     # ---------------------------------------------------------------- 写入
     def emit(
@@ -104,8 +112,15 @@ class EventLog:
         with self.path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
-                if line:
-                    records.append(json.loads(line))
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    # 强杀可能留下半行；跳过残行而不是让断点恢复失败
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
         return records
 
     def load(self) -> List[Event]:
@@ -114,10 +129,11 @@ class EventLog:
         self._seq = 0
         for record in self.read():
             payload = dict(record or {})
-            self._seq += 1
+            seq = int(record.get("seq") or self._seq + 1)
+            self._seq = max(self._seq, seq)
             self._events.append(Event(
-                seq=int(record.get("seq", self._seq)),
-                id=str(record.get("id", f"evt-{self._seq:05d}")),
+                seq=seq,
+                id=str(record.get("id", f"evt-{seq:05d}")),
                 ts=str(record.get("ts", "")),
                 run_id=str(record.get("run_id", self.run_id)),
                 type=str(record.get("type", "")),

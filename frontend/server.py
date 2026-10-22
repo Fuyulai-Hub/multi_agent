@@ -3,14 +3,23 @@
 用法：
     python frontend/server.py [--host 127.0.0.1] [--port 8000] [--workspace workspace]
 
+访问控制：
+    默认仅绑定回环地址（127.0.0.1 / localhost / ::1），无需令牌即可打开面板；
+    绑定非回环地址（如 0.0.0.0）必须设置环境变量 MAS_PANEL_TOKEN，否则拒绝启动。
+    设置令牌后，所有 /api/* 请求需携带 Authorization: Bearer <token>、
+    X-Panel-Token: <token>，或先访问 /?token=<token> 换取 HttpOnly Cookie。
+    静态页面（/、app.js、style.css）保持公开，不含运行数据；跨域默认只允许同源，
+    额外来源可通过 MAS_PANEL_ORIGINS（逗号分隔）放行。
+
 API：
     GET /api/runs                    运行列表（含摘要指标）
     GET /api/run?id=<run_id>         运行详情（摘要 + 事件流 + 验收报告 + 时间线）
     GET /api/experience              分级经验库
     GET /api/metrics                 每轮效果指标
     GET /api/learning-report         自学习效果报告（Markdown）
-    GET /api/llm                     当前 LLM 配置与凭据（Key 脱敏/回显、来源标注）
+    GET /api/llm                     当前 LLM 配置与凭据（Key 只返回掩码与是否已设置，不回显明文）
     GET /api/skills                  技能开关（runtime.skills.enabled / tools_enabled，与 system.yaml 同名同义）
+    GET /api/react                   ReAct 开关（runtime.react.enabled / max_steps / require_thought，与 system.yaml 同名同义）
     GET /api/store/status            MySQL/Redis 存储后端健康报告（docs/25）
     GET /api/mq/status               消息队列健康：运行流积压 / PEL / DLQ / worker（docs/26）
     POST /api/run                     发起一次流水线（requirement 文字 / requirement_path 上传文件，二选一；可另带 images 附图路径数组）
@@ -22,14 +31,17 @@ API：
     POST /api/llm                     保存 provider/model 到 system.yaml，凭据到 credentials.yaml
     POST /api/llm/test               用给定凭据探测 BASE_URL 的 /models，验证 Key 是否可用
     POST /api/skills                 保存技能开关到 system.yaml（下一次运行生效，无需重启服务）
+    POST /api/react                  保存 ReAct 开关到 system.yaml（下一次运行生效，无需重启服务）
 静态文件：/ 直接映射本目录（index.html / app.js / style.css）
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -39,7 +51,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 FRONTEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = FRONTEND_DIR.parent
@@ -92,6 +104,15 @@ REGISTRY: object | None = None
 RUN_QUEUE: object | None = None
 MQ_SETTINGS: dict = {}
 WORKER: object | None = None
+
+# ---------------- 面板访问控制（默认回环免令牌；对外绑定必须显式给令牌）----------------
+PANEL_TOKEN_ENV = "MAS_PANEL_TOKEN"        # 面板访问令牌；非回环绑定下为必填
+PANEL_ORIGINS_ENV = "MAS_PANEL_ORIGINS"    # 额外允许的跨域来源，逗号分隔（如 https://ops.example）
+PANEL_COOKIE = "mas_panel_token"
+# profile 是 config/profiles/<name>.yaml 的文件名分量：只允许安全字符，杜绝 ../ 穿越。
+_PROFILE_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# run_id 会拼进 workspace/runs/<id>：只允许文件名安全字符，挡住 ../ 目录穿越。
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,80}")
 
 
 def run_finished(run_dir: Path, run_id: str) -> bool:
@@ -279,7 +300,7 @@ def load_llm_defaults() -> dict:
         "provider": llm.get("provider") or "offline",
         "model": llm.get("model") or "",
         "base_url": base_url,
-        "api_key": api_key,                      # 本地面板回显，便于修改/切换其他 Key
+        # 不回显明文 Key：面板只需知道「是否已设置 + 掩码」，留空提交即沿用已保存值。
         "api_key_set": bool(api_key),
         "api_key_masked": mask_secret(api_key),
         "token_name": creds.get("token_name") or "",
@@ -448,6 +469,88 @@ def save_skills_switch(enabled: bool, tools_enabled: bool) -> dict:
         encoding="utf-8", newline="\n",
     )
     return load_skills_switch()
+
+
+# ---------------- ReAct 开关（runtime.react.enabled / max_steps / require_thought）----------------
+# 与技能开关同一模式：读取走 load_config、写回走 system.yaml 行级替换，保存后下一次运行生效。
+# nodes（节点白名单）仍手改 yaml：其值是列表且需与 llm.tools_nodes 取交集，前端不做。
+# 注意 ReAct 的实际生效范围是三重交集：enabled ∧ nodes ∧ llm.tools_nodes（见 docs/34）。
+
+
+def load_react_switch() -> dict:
+    """读取 ReAct 开关（字段名与 system.yaml 的 runtime.react 子键完全一致）。"""
+    from mas.config import load_config
+
+    config = load_config(PROJECT_ROOT / "config")
+    react = dict(config.runtime.get("react") or {})
+    return {
+        "enabled": bool(react.get("enabled", False)),
+        "max_steps": int(react.get("max_steps", 4) or 4),
+        "require_thought": bool(react.get("require_thought", False)),
+        # 只读回显：让面板能显示"实际会在哪些节点生效"，不参与写回
+        "nodes": [str(node) for node in (react.get("nodes") or [])],
+        "tools_nodes": [str(node) for node in (config.llm.get("tools_nodes") or [])],
+    }
+
+
+def _rewrite_react_switch(text: str, enabled: bool, max_steps: int, require_thought: bool) -> str:
+    """行级替换 runtime.react 下的三个键，保留注释与其余内容原样。
+
+    与 `_rewrite_skills_switches` 同样的三层缩进定位（runtime → react → 键）：
+    同名键 `enabled` 在 llm.vision / runtime.ui_probe / runtime.context_compression
+    等段同样存在，只按缩进匹配会误改。目标键缺失时报 ValueError（不猜测插入位置）。
+    """
+    import re
+
+    found = {"enabled": False, "max_steps": False, "require_thought": False}
+    values = {"enabled": str(enabled).lower(), "max_steps": str(max_steps),
+              "require_thought": str(require_thought).lower()}
+    out: list[str] = []
+    top = ""
+    second = ""
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):       # 注释行不改变层级状态
+            out.append(line)
+            continue
+        m_top = re.match(r"^([^\s#][^:]*):", line)
+        m_second = re.match(r"^  ([^\s#][^:]*):", line)
+        m_third = re.match(r"^    ([^\s#][^:]*):", line)
+        if m_top:
+            top, second = m_top.group(1), ""
+        elif m_second:
+            second = m_second.group(1)
+        elif m_third and top == "runtime" and second == "react":
+            key = m_third.group(1)
+            if key in found:
+                # 只换值、保留该行值之后的全部原文（对齐空格 + 行尾注释），
+                # 使往返替换逐字节还原（压缩对齐空格会让往返不等价）。
+                head = re.match(r"^(    [^\s#][^:]*:\s*)", line)
+                if head:
+                    prefix = head.group(1)
+                    rest = line[len(prefix):]
+                    tail_match = re.match(r"^[^\s#]+(\s*#.*)?$", rest)
+                    tail = (tail_match.group(1) or "") if tail_match else ""
+                    line = f"{prefix}{values[key]}{tail}"
+                found[key] = True
+        out.append(line)
+    missing = [key for key, hit in found.items() if not hit]
+    if missing:
+        raise ValueError(f"config/system.yaml 的 runtime.react 缺少字段: {', '.join(missing)}")
+    return "\n".join(out) + "\n"
+
+
+def save_react_switch(enabled: bool, max_steps: int, require_thought: bool) -> dict:
+    """把 ReAct 开关写回 system.yaml（下一次运行生效；``newline="\\n"`` 防整份换行符改写）。"""
+    if not isinstance(enabled, bool) or not isinstance(require_thought, bool):
+        raise ValueError("enabled / require_thought 必须是布尔值（true/false）")
+    if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
+        raise ValueError("max_steps 必须是 >= 1 的整数")
+    original = SYSTEM_YAML.read_text(encoding="utf-8")
+    SYSTEM_YAML.write_text(
+        _rewrite_react_switch(original, enabled, max_steps, require_thought),
+        encoding="utf-8", newline="\n",
+    )
+    return load_react_switch()
 
 
 def test_llm_connection(api_key: str | None = None, base_url: str | None = None) -> dict:
@@ -677,19 +780,147 @@ def remove_upload(workspace: Path, path: str) -> dict:
     return {"removed": existed, "path": str(target)}
 
 
+def is_loopback_host(host: str) -> bool:
+    """是否为回环绑定地址（只有这些地址允许在无令牌模式下对外提供服务）。"""
+    name = (host or "").strip().strip("[]").lower()
+    return name in {"127.0.0.1", "localhost", "::1"}
+
+
+def bind_security_error(host: str, token: str) -> str:
+    """非回环绑定且无令牌时返回拒绝原因（空串 = 允许启动）。"""
+    if is_loopback_host(host) or (token or "").strip():
+        return ""
+    return (f"--host {host} 非回环地址，必须设置环境变量 {PANEL_TOKEN_ENV}"
+            "（否则面板的 API Key/运行数据将对网络开放）")
+
+
+def allowed_panel_origins(host: str, port: int) -> set[str]:
+    """跨域白名单：回环绑定时自动包含同端口别名，另叠加 MAS_PANEL_ORIGINS。"""
+    origins = set()
+    for item in (os.environ.get(PANEL_ORIGINS_ENV) or "").split(","):
+        item = item.strip().rstrip("/")
+        if item:
+            origins.add(item)
+    if is_loopback_host(host):
+        bare = (host or "").strip().strip("[]").lower()
+        shown = f"[{bare}]" if ":" in bare else bare
+        origins.update({
+            f"http://{shown}:{port}",
+            f"http://localhost:{port}",
+            f"http://127.0.0.1:{port}",
+        })
+    return origins
+
+
+def normalize_profile(raw: object) -> str | None:
+    """校验运行 profile 名（会拼进 config/profiles/<name>.yaml，必须杜绝路径穿越）。"""
+    profile = str(raw or "").strip()
+    if not profile:
+        return None
+    if not _PROFILE_RE.fullmatch(profile):
+        raise ValueError("profile 只能包含字母/数字/下划线/连字符（1-64 个字符）")
+    return profile
+
+
+def normalize_run_id(raw: object) -> str:
+    """校验 run_id（会拼进 workspace/runs/<id>，必须杜绝路径穿越）。"""
+    run_id = str(raw or "").strip()
+    if not run_id or not _RUN_ID_RE.fullmatch(run_id) or run_id in (".", ".."):
+        raise ValueError("run_id 非法（只允许字母/数字/点/下划线/连字符）")
+    return run_id
+
+
+def restrict_panel_path(workspace: Path, raw: str, kind: str) -> str:
+    """把面板提交的文件路径收敛到 ``workspace/uploads`` 内，返回解析后的绝对路径。
+
+    resolve() 会展开 ``..`` 与符号链接，因此目录前缀校验同时挡住路径穿越与
+    指向外部的链接；``is_file()`` 拒绝目录以及不存在的路径。上传落盘见
+    ``sources.save_upload``（返回绝对路径），CLI/测试直接调用 start_run 不受此限制。
+    """
+    uploads_dir = (workspace / "uploads").resolve()
+    try:
+        target = Path(raw).resolve()
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{kind}路径非法: {raw}") from exc
+    if target != uploads_dir and uploads_dir not in target.parents:
+        raise ValueError(f"{kind}只能引用 workspace/uploads 内的文件: {raw}")
+    if not target.is_file():
+        raise ValueError(f"{kind}不存在: {raw}")
+    return str(target)
+
+
+def _secure_equals(given: str, expected: str) -> bool:
+    """常量时间比较（先编码，避免非 ASCII 触发 compare_digest 的 TypeError）。"""
+    return hmac.compare_digest(
+        (given or "").encode("utf-8"), (expected or "").encode("utf-8")
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     workspace: Path = PROJECT_ROOT / "workspace"
+    token: str = ""                    # main() 从 MAS_PANEL_TOKEN 注入；空 = 回环免令牌模式
+    allowed_origins: set[str] = set()  # main() 按绑定地址与 MAS_PANEL_ORIGINS 注入
     server_version = "mas-frontend/1.0"
 
     def log_message(self, fmt: str, *args) -> None:  # 静默访问日志
         return
+
+    # ------------------------------------------------------------ 认证/CORS 基础设施
+    def _request_token(self) -> str:
+        """从 Authorization / X-Panel-Token / Cookie 中取面板令牌。"""
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        header = (self.headers.get("X-Panel-Token") or "").strip()
+        if header:
+            return header
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == PANEL_COOKIE:
+                return unquote(value.strip())
+        return ""
+
+    def _authorized(self) -> bool:
+        """未配置令牌时只依赖回环绑定；配置后所有 /api/* 一律校验。"""
+        return not self.token or _secure_equals(self._request_token(), self.token)
+
+    def _origin_allowed(self) -> bool:
+        """同源或显式白名单才放行；无 Origin（CLI/测试）视为同源。"""
+        origin = (self.headers.get("Origin") or "").strip().rstrip("/")
+        if not origin:
+            return True
+        if origin in self.allowed_origins:
+            return True
+        parsed = urlparse(origin)
+        host = (self.headers.get("Host") or "").strip().lower()
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc) \
+            and parsed.netloc.lower() == host
+
+    def _cors_headers(self) -> None:
+        """只回显白名单来源；默认不再发送 ``Access-Control-Allow-Origin: *``。"""
+        origin = (self.headers.get("Origin") or "").strip().rstrip("/")
+        if origin and self._origin_allowed():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _reject_unauthorized(self) -> None:
+        self._send_json(
+            {"error": "需要面板访问令牌：访问 /?token=<MAS_PANEL_TOKEN> 或携带 "
+                      "Authorization: Bearer / X-Panel-Token"},
+            401,
+        )
 
     def _send_json(self, payload, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if status == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="mas-panel"')
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -698,8 +929,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if status == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="mas-panel"')
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_login(self, provided: str) -> None:
+        """GET /?token=... ：校验后种 HttpOnly Cookie 并 303 回 /（令牌不出现在后续 URL）。"""
+        if not self.token or not _secure_equals(provided, self.token):
+            self._send_text("invalid panel token", 401)
+            return
+        cookie = (f"{PANEL_COOKIE}={quote(self.token, safe='')}; Path=/; HttpOnly; "
+                  f"SameSite=Strict; Max-Age=86400")
+        if (self.headers.get("X-Forwarded-Proto") or "").strip().lower() == "https":
+            cookie += "; Secure"
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802（标准库命名）
+        if not self._origin_allowed():
+            self._send_text("forbidden", 403)
+            return
+        self.send_response(204)
+        self._cors_headers()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Panel-Token")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _serve_static(self, path: str) -> None:
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
@@ -721,10 +983,21 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route, query = parsed.path, parse_qs(parsed.query)
 
+        if route in ("/", "/index.html") and "token" in query:
+            self._handle_login((query.get("token") or [""])[0])
+            return
+        if route.startswith("/api/") and not self._authorized():
+            self._reject_unauthorized()
+            return
+
         if route == "/api/runs":
             self._send_json(load_runs(self.workspace))
         elif route == "/api/run":
-            run_id = (query.get("id") or [""])[0]
+            try:
+                run_id = normalize_run_id((query.get("id") or [""])[0])
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
             detail = load_run_detail(self.workspace, run_id)
             if detail is None:
                 self._send_json({"error": f"run 不存在: {run_id}"}, 404)
@@ -741,6 +1014,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(load_llm_defaults())
         elif route == "/api/skills":
             self._send_json(load_skills_switch())
+        elif route == "/api/react":
+            self._send_json(load_react_switch())
         elif route == "/api/store/status":
             self._send_json(load_store_status())
         elif route == "/api/mq/status":
@@ -754,8 +1029,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802（标准库命名）
         parsed = urlparse(self.path)
+        if not self._authorized():
+            self._reject_unauthorized()
+            return
+        # 无令牌（回环模式）时用 Origin 兜底防 CSRF；有令牌时令牌本身就是门槛，
+        # 同源/反代场景不再依赖 Origin（否则 https 反代到回环会被误拒）。
+        if not self.token and not self._origin_allowed():
+            self._send_json({"error": "拒绝跨站请求：Origin 不在允许列表"}, 403)
+            return
         if parsed.path not in ("/api/run", "/api/run/cancel", "/api/upload", "/api/upload/remove",
-                               "/api/upload_image", "/api/llm", "/api/llm/test", "/api/skills"):
+                               "/api/upload_image", "/api/llm", "/api/llm/test", "/api/skills",
+                               "/api/react"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -766,9 +1050,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "请求体不是合法 JSON"}, 400)
             return
         if parsed.path == "/api/run/cancel":
-            run_id = str(data.get("run_id") or "").strip()
-            if not run_id:
-                self._send_json({"error": "run_id 不能为空"}, 400)
+            try:
+                run_id = normalize_run_id(data.get("run_id"))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
                 return
             try:
                 self._send_json(cancel_run(run_id))
@@ -828,6 +1113,22 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as exc:
                 self._send_json({"error": str(exc)}, 400)
             return
+        if parsed.path == "/api/react":
+            enabled = data.get("enabled")
+            max_steps = data.get("max_steps")
+            require_thought = data.get("require_thought")
+            if not isinstance(enabled, bool) or not isinstance(require_thought, bool):
+                self._send_json(
+                    {"error": "enabled / require_thought 必须是布尔值（true/false）"}, 400)
+                return
+            if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
+                self._send_json({"error": "max_steps 必须是 >= 1 的整数"}, 400)
+                return
+            try:
+                self._send_json(save_react_switch(enabled, max_steps, require_thought))
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+            return
         requirement = str(data.get("requirement") or "").strip()
         requirement_path = str(data.get("requirement_path") or "").strip()
         # 两段式上传（docs/16 的 04 文档）：requirement_path 走文件通道，与文字需求二选一
@@ -850,7 +1151,18 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": "images 必须是文件路径字符串数组（先经 POST /api/upload_image 上传）"}, 400)
                 return
             images = [item.strip() for item in raw_images] or None
-        profile = data.get("profile") or None
+        # 路径限制只放在 HTTP 边界（start_run 的 Python 调用方保留原有绝对路径语义）：
+        # requirement_path / images 必须指向 workspace/uploads 内已存在的文件；
+        # profile 会拼进 config/profiles/<name>.yaml，同样拒绝路径穿越。
+        try:
+            profile = normalize_profile(data.get("profile"))
+            if requirement_path:
+                requirement_path = restrict_panel_path(self.workspace, requirement_path, "需求文档")
+            if images:
+                images = [restrict_panel_path(self.workspace, item, "附图") for item in images]
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, 400)
+            return
         provider = (data.get("provider") or "").strip() or None
         model = (data.get("model") or "").strip() or None
         api_key = (data.get("api_key") or "").strip() or None
@@ -927,6 +1239,15 @@ def main() -> int:
     parser.add_argument("--workspace", default=str(PROJECT_ROOT / "workspace"))
     args = parser.parse_args()
 
+    # 失败关闭：非回环绑定会暴露运行数据与写接口，没有令牌就不启动。
+    panel_token = (os.environ.get(PANEL_TOKEN_ENV) or "").strip()
+    security_error = bind_security_error(args.host, panel_token)
+    if security_error:
+        print(f"拒绝启动：{security_error}")
+        return 2
+    Handler.token = panel_token
+    Handler.allowed_origins = allowed_panel_origins(args.host, args.port)
+
     workspace = Path(args.workspace).resolve()
     if not workspace.exists():
         print(f"工作区不存在: {workspace}（先运行 python -m mas demo 生成数据）")
@@ -966,6 +1287,11 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"前端面板：http://{args.host}:{args.port}  （数据目录：{workspace}）")
+    if panel_token:
+        print(f"访问控制：已启用令牌认证（{PANEL_TOKEN_ENV}）；"
+              f"首次访问请打开 http://{args.host}:{args.port}/?token=<令牌>")
+    else:
+        print("访问控制：仅回环地址、无令牌（所有 /api/* 仅同源可访问）")
     if BACKENDS is not None and BACKENDS.any_enabled:
         print(f"存储后端：MySQL={'已连接' if BACKENDS.mysql is not None else '未连接'}，"
               f"Redis={'已连接' if BACKENDS.redis is not None else '未连接'}"

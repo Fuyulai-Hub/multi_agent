@@ -15,7 +15,8 @@ flow:
       role: product
       kind: task
       iterable: false
-      inputs: ["requirement_source"]
+      # env_probe（docs/36）：让需求拆解阶段就看到本机环境能力，避免定出无法验证的形态
+      inputs: ["requirement_source", "env_probe"]
       outputs: ["requirement_spec"]
       transitions: { pass: solution, fail: halt }
       retry: { max_attempts: 1 }
@@ -26,7 +27,7 @@ flow:
       role: developer
       kind: task
       iterable: false
-      inputs: ["requirement_spec"]
+      inputs: ["requirement_spec", "env_probe"]
       outputs: ["solution_design"]
       transitions: { pass: implement, fail: halt }
 
@@ -82,6 +83,12 @@ flow:
         criteria:
           - id: "用例全部通过"
             expr: "test_report.summary.failed == 0"
+          # docs/37 P0-2：测试套件由验证器冻结并重算，门禁只认签名凭证；
+          # 没有凭证、凭证被篡改、自报与逐用例记录不一致、断言为空均判失败。
+          - id: "测试证据通过独立验证"
+            expr: "test_report.verification_attestation.valid == True"
+          - id: "冻结测试 hash 非空"
+            expr: "test_report.verification_attestation.test_hash != ''"
           - id: "功能点覆盖完整"
             expr: "test_report.coverage.functional.rate >= 1.0"
           - id: "异常用例覆盖"

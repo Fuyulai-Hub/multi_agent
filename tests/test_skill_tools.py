@@ -326,6 +326,10 @@ class LeaderRegistrationTests(_SkillToolsTestBase):
 class ClosingLoopTests(_SkillToolsTestBase):
     def setUp(self):
         super().setUp()
+        # 本类验证的是 ReAct 之前的技能工具闭环（docs/21）；system.yaml 现已默认开启
+        # ReAct（docs/34），命中节点会分流到 ReAct 分支（metrics 改记 react_steps），
+        # 故显式关闭以保持验证目标不变（ReAct 自身验证见 tests/test_react_loop.py）。
+        self.config.runtime.pop("react", None)
         _StubLLMHandler.requests = []
         _StubLLMHandler.script = [_tool_call_payload, _final_payload]
         self.server = _StubServer(("127.0.0.1", 0), _StubLLMHandler)

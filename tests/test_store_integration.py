@@ -137,6 +137,9 @@ class StoreIntegrationTests(unittest.TestCase):
         self.addCleanup(self.redis.release_lock, name, token)
         # 互斥：第二把锁拿不到
         self.assertIsNone(self.redis.acquire_lock(name, ttl_ms=10000))
+        # 续租：持锁人可延长 TTL；错 token 不能续（锁过期被他人接管时不误续）
+        self.assertTrue(self.redis.renew_lock(name, token, ttl_ms=20000))
+        self.assertFalse(self.redis.renew_lock(name, "wrong-token", ttl_ms=20000))
         # 错 token 释放失败（防误删他人锁）
         self.assertFalse(self.redis.release_lock(name, "wrong-token"))
         # 正确 token 释放后可再获取

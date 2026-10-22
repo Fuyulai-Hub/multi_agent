@@ -41,7 +41,7 @@ from .mq import (
 )
 from .runhub import build_registry
 
-__all__ = ["RunWorker", "PermanentTaskError", "make_worker_id"]
+__all__ = ["RunWorker", "RunLease", "PermanentTaskError", "make_worker_id"]
 
 
 class PermanentTaskError(RuntimeError):
@@ -50,6 +50,97 @@ class PermanentTaskError(RuntimeError):
 
 def make_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
+class RunLease:
+    """运行租约：同一 run 同时只允许一个 worker 执行。
+
+    - ``acquire`` 失败 = 另一个 worker 持有租约；调用方不得执行，也不得 ACK
+      （消息留在 PEL，等持有者完成或崩溃后由语义重新投递）；
+    - 持锁期间守护线程周期性续租，并顺带刷新运行注册表心跳——单个 LLM 节点
+      可能远超 90s 的心跳 TTL，只在节点边界心跳会让面板误判运行已死亡；
+    - Redis 抖动时降级为「不阻塞执行」（MQ 本身也在同一次故障里），但会记录
+      ``degraded`` 原因，供 worker 事件与日志取证。
+    """
+
+    def __init__(
+        self,
+        backend: Any,
+        run_id: str,
+        *,
+        worker_id: str,
+        ttl_ms: int = 300000,
+        renew_s: float = 30.0,
+        registry: Any = None,
+        log: Any = print,
+    ) -> None:
+        self.backend = backend
+        self.run_id = run_id
+        self.worker_id = worker_id
+        self.ttl_ms = int(ttl_ms)
+        self.renew_s = max(0.05, float(renew_s))
+        self.registry = registry
+        self.log = log
+        self.token: Optional[str] = None
+        self.lost = False
+        self.degraded = ""
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.backend is not None and self.token is not None
+
+    def acquire(self) -> bool:
+        if self.backend is None:
+            return True                      # 离线队列（测试替身）没有租约原语
+        try:
+            self.token = self.backend.acquire_lock(f"run:{self.run_id}", ttl_ms=self.ttl_ms)
+        except Exception as exc:  # noqa: BLE001 - Redis 抖动时降级，不让运行停摆
+            self.degraded = f"{type(exc).__name__}: {exc}"
+            self.log(f"[worker] 运行租约不可用，降级执行 {self.run_id}：{self.degraded}")
+            return True
+        return self.token is not None
+
+    def start(self) -> None:
+        if not self.enabled or self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._renew_loop, name=f"mas-lease-{self.run_id[:12]}", daemon=True
+        )
+        self._thread.start()
+
+    def _renew_loop(self) -> None:
+        while not self._stop.wait(self.renew_s):
+            try:
+                renewed = self.backend.renew_lock(f"run:{self.run_id}", self.token, self.ttl_ms)
+            except Exception as exc:  # noqa: BLE001 - 网络抖动交给下一轮重试
+                self.log(f"[worker] 租约续租失败 {self.run_id}：{type(exc).__name__}: {exc}")
+                continue
+            if not renewed:
+                self.lost = True
+                self.log(f"[worker] 运行租约已丢失 {self.run_id}（可能已过期并被其他 worker 接管）")
+                return
+            if self.registry is not None:
+                try:
+                    info = self.registry.get(self.run_id) or {}
+                    self.registry.heartbeat(
+                        self.run_id, status="running", node=info.get("node")
+                    )
+                except Exception:  # noqa: BLE001 - 心跳失败不影响任务
+                    pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.renew_s + 1))
+            self._thread = None
+        if self.token is not None and self.backend is not None:
+            try:
+                self.backend.release_lock(f"run:{self.run_id}", self.token)
+            except Exception:  # noqa: BLE001 - 释放失败靠 TTL 兜底
+                pass
+            self.token = None
 
 
 def _stamp() -> str:
@@ -84,6 +175,8 @@ class RunWorker:
         self.worker_registry = WorkerRegistry(self.queue.mq)
         self.worker_id = worker_id or make_worker_id()
         self.log = log
+        self.lease_ttl_ms = max(30000, int(float(settings.get("lease_ttl_s", 300)) * 1000))
+        self.lease_renew_s = max(5.0, float(settings.get("lease_renew_s", 30)))
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.counters = {"finished": 0, "failed": 0, "skipped": 0, "canceled": 0}
@@ -194,37 +287,62 @@ class RunWorker:
             return "duplicate"
 
         self.worker_registry.heartbeat(self.worker_id, status="busy", run_id=run_id)
+        lease = RunLease(
+            getattr(self.queue.mq, "backend", None), run_id,
+            worker_id=self.worker_id, ttl_ms=self.lease_ttl_ms,
+            renew_s=self.lease_renew_s, registry=self.registry, log=self.log,
+        )
+        if not lease.acquire():
+            # 另一个 worker 正在执行同一 run：不 ACK、不进重试，让消息留在 PEL。
+            # 持有者完成后会 ACK；若它崩溃，租约与 PEL 可见性超时后再接管。
+            self.counters["skipped"] += 1
+            self._event("worker_task_lease_busy", run_id,
+                        {"worker_id": self.worker_id, "attempt": attempt,
+                         "reason": "同一运行的租约被其他 worker 持有"})
+            self.log(f"[worker] 跳过 {run_id}：租约被其他 worker 持有（消息保留在 PEL）")
+            return "lease_busy"
+        lease.start()
         self._event("worker_task_started", run_id,
                     {"worker_id": self.worker_id, "attempt": attempt,
+                     "lease": "degraded" if lease.degraded else ("locked" if lease.enabled else "none"),
+                     "lease_error": lease.degraded,
                      "queued_at": (delivery.get("headers") or {}).get("enqueued_at")})
         self.log(f"[worker] 开始任务 {run_id}（attempt {attempt}/{self.queue.max_attempts}）")
         started = time.time()
         try:
-            summary = self._execute(run_id, payload, attempt, delivery)
-        except PermanentTaskError as exc:
-            result = self.queue.dead_letter(delivery, str(exc), attempt)
-            self.queue.mq.delete_secret(run_id)
-            self.counters["failed"] += 1
-            self._event("worker_task_dead_lettered", run_id,
-                        {"worker_id": self.worker_id, "error": str(exc), "attempt": attempt})
-            self.log(f"[worker] 任务不可重试，已进死信 {run_id}：{exc}")
-            return str(result.get("status") or "dead_lettered")
-        except Exception as exc:  # noqa: BLE001 - 基础设施/未预期异常都走重试
-            error = f"{type(exc).__name__}: {exc}"
-            result = self.queue.fail(delivery, error)
-            if result.get("status") == "dead_lettered":
+            try:
+                summary = self._execute(run_id, payload, attempt, delivery)
+            except PermanentTaskError as exc:
+                result = self.queue.dead_letter(delivery, str(exc), attempt)
                 self.queue.mq.delete_secret(run_id)
                 self.counters["failed"] += 1
-            self._event(
-                "worker_task_dead_lettered" if result.get("status") == "dead_lettered"
-                else "worker_task_retried",
-                run_id,
-                {"worker_id": self.worker_id, "error": error[:2000], "attempt": attempt,
-                 "delay_s": result.get("delay_s"), "max_attempts": self.queue.max_attempts},
-            )
-            self.log(f"[worker] 任务失败 {run_id}：{error[:300]}"
-                     f"（{result.get('status')}，attempt {attempt}）")
-            return str(result.get("status") or "failed")
+                self._event("worker_task_dead_lettered", run_id,
+                            {"worker_id": self.worker_id, "error": str(exc), "attempt": attempt})
+                self.log(f"[worker] 任务不可重试，已进死信 {run_id}：{exc}")
+                return str(result.get("status") or "dead_lettered")
+            except Exception as exc:  # noqa: BLE001 - 基础设施/未预期异常都走重试
+                error = f"{type(exc).__name__}: {exc}"
+                result = self.queue.fail(delivery, error)
+                if result.get("status") == "dead_lettered":
+                    self.queue.mq.delete_secret(run_id)
+                    self.counters["failed"] += 1
+                self._event(
+                    "worker_task_dead_lettered" if result.get("status") == "dead_lettered"
+                    else "worker_task_retried",
+                    run_id,
+                    {"worker_id": self.worker_id, "error": error[:2000], "attempt": attempt,
+                     "delay_s": result.get("delay_s"), "max_attempts": self.queue.max_attempts},
+                )
+                self.log(f"[worker] 任务失败 {run_id}：{error[:300]}"
+                         f"（{result.get('status')}，attempt {attempt}）")
+                return str(result.get("status") or "failed")
+        finally:
+            lease.stop()
+        if lease.lost:
+            self._event("worker_task_lease_lost", run_id,
+                        {"worker_id": self.worker_id, "attempt": attempt,
+                         "note": "租约在任务结束前已丢失；结果已落盘，但可能与其他 worker 重叠执行"})
+            self.log(f"[worker] 警告：{run_id} 的租约在结束前丢失")
 
         elapsed = round(time.time() - started, 2)
         self.queue.ack(delivery)
@@ -233,7 +351,7 @@ class RunWorker:
         self._event("worker_task_finished", run_id,
                     {"worker_id": self.worker_id, "verdict": getattr(summary, "verdict", None),
                      "steps": getattr(summary, "steps", None), "duration_s": elapsed,
-                     "attempt": attempt})
+                     "attempt": attempt, "lease_lost": lease.lost})
         self.log(f"[worker] 完成 {run_id}｜verdict={getattr(summary, 'verdict', None)}"
                  f"｜{elapsed}s")
         return "finished"
@@ -270,8 +388,13 @@ class RunWorker:
         if api_key:
             config.llm_overrides["api_key"] = api_key
 
-        # 重试前归档半截运行目录并重置该 run 的 broker 流，保证证据链干净。
-        if self._archive_partial_run(run_id, attempt):
+        # 有可恢复检查点时续跑，不再归档半截目录；否则按既有逻辑归档后重跑。
+        resume = self._is_resumable(run_id)
+        if resume:
+            self._event("worker_task_resumed", run_id,
+                        {"worker_id": self.worker_id, "attempt": attempt})
+            self.log(f"[worker] 从检查点续跑 {run_id}")
+        elif self._archive_partial_run(run_id, attempt):
             try:
                 self.queue.mq.reset_run_streams(run_id)
             except Exception:  # noqa: BLE001 - 流清理失败不影响重跑
@@ -279,21 +402,45 @@ class RunWorker:
 
         images = payload.get("images") or None
         leader = Leader(config)
-        if requirement_path:
-            return leader.run(requirement_path, as_text=False, run_id=run_id,
-                              images=images, registry=self.registry)
-        return leader.run(requirement, as_text=True, run_id=run_id,
-                          images=images, registry=self.registry)
+        try:
+            if requirement_path:
+                return leader.run(requirement_path, as_text=False, run_id=run_id,
+                                  images=images, registry=self.registry, resume=resume)
+            return leader.run(requirement, as_text=True, run_id=run_id,
+                              images=images, registry=self.registry, resume=resume)
+        except ConfigError as exc:
+            # 检查点/需求 hash 不一致属于不可重试：重跑只会得到同一个错误
+            raise PermanentTaskError(f"运行无法继续（配置/检查点）：{exc}") from exc
 
     # ---------------------------------------------------------------- 幂等/归档
+    @staticmethod
+    def _runs_dir(workspace: Path) -> Path:
+        return workspace / "runs"
+
+    def _is_resumable(self, run_id: str) -> bool:
+        """checkpoint.status == running 且有需求快照 → 可续跑。"""
+        path = self._runs_dir(self.workspace) / run_id / "checkpoint.json"
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (str(data.get("run_id") or "") == run_id
+                and str(data.get("status") or "") == "running"
+                and (self._runs_dir(self.workspace) / run_id / "input" / "requirement.md").exists())
+
     def _archive_partial_run(self, run_id: str, attempt: int) -> bool:
         """把上次未完成（无 run_summary）的运行目录移到 run_attempts/，返回是否归档。
 
         只有「有实质内容」的目录才归档；前端预创建的空 events.jsonl 直接复用。
         绝不删除：归档保留完整的事件与产物，便于排查重试前的失败现场。
+        可续跑的运行（检查点 status=running）不归档——否则续跑起点就没了。
         """
-        run_dir = self.workspace / "runs" / run_id
+        run_dir = self._runs_dir(self.workspace) / run_id
         if not run_dir.is_dir() or (run_dir / "run_summary.json").exists():
+            return False
+        if self._is_resumable(run_id):
             return False
         progressed = False
         for path in run_dir.rglob("*"):
