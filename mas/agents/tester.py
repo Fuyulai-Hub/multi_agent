@@ -4,108 +4,22 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Optional
+from typing import Any, Dict, List, Optional
 
 from ..errors import SandboxError
 from ..intent import resolve_delivery_shape, shape_family
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
 from ..verifier import TestVerifier, VerificationError
+from ..verify.exec import execute_frozen_suite
 from .base import BaseAgent, Perception
 
 __all__ = ["TesterAgent"]
 
 _SEVERITY = {"functional": "critical", "exception": "major", "boundary": "major"}
 
-#: 沙箱唯一可执行的验证语言（证据通道固定为 `python <测试文件>`）
+#: 沙箱唯一可执行的验证语言（证据通道固定为框架 runner 执行 Python 用例）
 _EXECUTABLE_LANGUAGE = "python"
-
-# 测试文件结果回传的参考实现（与离线 Provider 模板同源，已在生产验证）。
-# 关键点：用自定义 TestResult 的 startTest/addFailure/addError 钩子收集记录，
-# 而不是跑完再遍历 suite——unittest 执行后会把 suite 内元素置为 None，
-# 二次迭代必崩（'NoneType' object has no attribute 'id'，attempt04 实测）。
-_REFERENCE_RUNNER = '''import argparse
-import json
-import sys
-import time
-import traceback
-import unittest
-
-MARKER = "<<<MASS_RESULT>>>"
-
-
-class _CollectResult(unittest.TestResult):
-    def __init__(self):
-        super().__init__()
-        self.records = []
-        self.started = time.time()
-
-    def startTest(self, test):
-        super().startTest(test)
-        self.records.append({"id": test.id(), "status": "passed", "message": ""})
-
-    def _mark(self, test, status, err):
-        for record in self.records:
-            if record["id"] == test.id():
-                record["status"] = status
-                record["message"] = "".join(
-                    traceback.format_exception_only(err[0], err[1])
-                )[-300:].strip()
-
-    def addError(self, test, err):
-        super().addError(test, err)
-        self._mark(test, "error", err)
-
-    def addFailure(self, test, err):
-        super().addFailure(test, err)
-        self._mark(test, "failed", err)
-
-
-def _filter(suite, keywords):
-    filtered = unittest.TestSuite()
-    for item in suite:
-        if isinstance(item, unittest.TestSuite):
-            filtered.addTests(_filter(item, keywords))
-        elif any(keyword in item.id() for keyword in keywords):
-            filtered.addTest(item)
-    return filtered
-
-
-def main():
-    keywords = []
-    if "--only" in sys.argv:
-        keywords = [part for part in sys.argv[sys.argv.index("--only") + 1].split(",") if part]
-    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    if keywords:
-        suite = _filter(suite, keywords)
-    result = _CollectResult()
-    suite.run(result)
-    cases = []
-    for record in result.records:
-        _, class_name, method = record["id"].rsplit(".", 2)[-3:]
-        parts = method.split("_")
-        cases.append({
-            "test": method,
-            "class": class_name,
-            "fp_id": FP_BY_CLASS.get(class_name, ""),
-            "category": parts[1] if len(parts) > 1 else "",
-            "status": record["status"],
-            "message": record["message"],
-        })
-    failed = sum(1 for case in cases if case["status"] != "passed")
-    summary = {
-        "total": result.testsRun,
-        "passed": result.testsRun - failed,
-        "failed": failed,
-        "duration_ms": int((time.time() - result.started) * 1000),
-        "cases": cases,
-    }
-    print(MARKER + json.dumps(summary, ensure_ascii=False))
-    return 0 if failed == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())'''
 
 # Web 交付执行协议（A 档）：delivery_shape == full_stack_ssr 时由 build_prompt 注入。
 # 设计依据 docs/15 补丁 4/A3：证据通道保持"单命令 python 测试文件 → exit_code"不变，
@@ -142,8 +56,9 @@ finally:
    即是这类用例的期望值来源；禁止读取实现代码反推 HTML 结构。
 3. 本模式下测试文件 import http/socket/threading 属需求本身（框架已按需求声明对该类
    依赖做审查豁免）；其余仍仅用标准库。
-4. reference_runner、<<<MASS_RESULT>>> 标记、test_{{category}}_{{op}}_{{name}} 命名、fp_id 回填、
-   exit code 约定全部不变；整个测试文件须在沙箱超时（默认 180 秒）内完成。
+4. test_{{category}}_{{op}}_{{name}} 命名不变；执行与取证由框架 runner 负责——
+   测试文件只定义用例，不要写 main()、结果标记或结果文件；fp_id 由契约 cases
+   元数据绑定。整个套件须在沙箱超时（默认 180 秒）内完成。
 5. files 只写 tests/ 下的测试文件：本角色无写实现代码的权限，写 serve.py/app.py 这类文件
    会让整个测试节点因权限被拒而失败；服务必须在测试进程内起停，不落成独立文件。
 6. **全部功能点的用例必须写在同一个测试文件里**（如 tests/test_all.py），且每个功能点都要有
@@ -188,31 +103,23 @@ class TesterAgent(BaseAgent):
             # 形态下才有意义，无条件下发会诱导模型输出 `serve.py`，而 tester 无写实现代码权限
             # （实测导致测试节点直接崩溃）。改为在 _BROWSER_PROTOCOL 里按形态注入。
             "execution_protocol": {
-                "note": "测试文件必须是可独立执行的 Python 脚本，并按本协议回传结果；沙箱按 <<<MASS_RESULT>>> 标记解析 stdout，缺失任一要素将导致用例统计为 0、覆盖率门禁必然失败",
-                "run_cmd": "python tests/test_xxx.py [--only 名称子串,名称子串]",
-                "marker": "<<<MASS_RESULT>>>",
-                "stdout_last_line": "MARKER + json.dumps(result_json, ensure_ascii=False)，单行，必须是 stdout 中最后一个非空行",
-                "result_json": {
-                    "total": "int，执行用例总数",
-                    "passed": "int，通过数",
-                    "failed": "int，未通过数（含 error）",
-                    "duration_ms": "int，耗时毫秒",
-                    "cases": [{"test": "方法名", "class": "类名", "fp_id": "FP-01",
-                               "category": "functional|exception|boundary",
-                               "status": "passed|failed|error（非 passed 均计失败）",
-                               "message": "失败摘要（通过时为空串）"}]
-                },
-                "reference_runner": _REFERENCE_RUNNER,
+                "note": (
+                    "测试文件只定义 unittest 用例；框架用固定执行器 mas/verify/runner.py "
+                    "按冻结清单逐条执行，并直接读取 runner 写到沙箱工作区之外的逐用例记录。"
+                    "不要在测试文件里实现 main()/argparse、打印结果标记或写结果文件——"
+                    "stdout 不作为验收证据，测试文件也没有选择执行哪些用例的权利。"
+                ),
+                "runner": "mas/verify/runner.py",
+                "case_discovery": "框架从冻结清单 test_ids 枚举用例：文件里额外定义/动态生成的用例不会执行，清单内缺失的用例记 error",
+                "result_file": "由框架通过 --out 指定（位于模型工作区之外），测试文件禁止读写该路径",
                 "requirements": [
-                    "文件末尾的 main() 必须采用 reference_runner 参考实现（自定义 TestResult 在 startTest/addFailure/addError 中收集记录）；文件顶部定义 FP_BY_CLASS = {测试类名: 功能点编号} 供回填 fp_id",
-                    "禁止重复遍历已执行的 suite：unittest 执行后会把 suite 内元素置为 None，二次迭代会触发 'NoneType' object has no attribute 'id'（attempt04 实测，marker 因此未输出、用例统计为 0）",
-                    "测试方法命名约定 test_{category}_{op}_{name}（category 为 functional/exception/boundary 之一），main 中按方法名第二段回填 category；cases 元数据的 category/op/name 必须与方法名一致",
-                    "每条回填的 fp_id 必须如实来自需求规格的功能点编号（覆盖率统计与缺陷跟踪以此准，漏填即覆盖率不达标）",
-                    "exit code：全部通过返回 0，否则返回 1",
+                    "文件只定义测试类与 test_* 方法（可定义纯辅助函数/常量）；禁止文件级结果回传逻辑：不要写 main、MARKER、sys.exit 或 result.json",
+                    "测试方法命名约定 test_{category}_{op}_{name}（category 为 functional/exception/boundary 之一），cases 元数据的 category/op/name 必须与方法名一致",
+                    "fp_id 由契约 cases 元数据提供并在冻结时绑定到 test_id，测试文件无需（也不应）自报 fp_id",
                     "期望值只能来自需求契约（规则/样例），禁止读取研发实现代码反推",
                     "仅用标准库；import 被测包（package 字段指定的包名）下的公开接口",
-                    "测试套件首次执行后由框架冻结（test_manifest.json）：后续轮次提交的 tests/ 修改不会生效，"
-                    "执行的是冻结副本；测试自身崩溃/协议失效导致无法取证时框架才会解冻重新生成"
+                    "测试套件首次执行后由框架冻结（test_manifest.json 记录文件 hash、test_ids 与 fp_id 元数据）："
+                    "后续轮次提交的 tests/ 修改不会生效，执行的是冻结副本；测试自身崩溃/无法枚举用例时框架才会解冻重新生成"
                 ]
             },
         }
@@ -270,7 +177,11 @@ class TesterAgent(BaseAgent):
 
         # 1) 测试冻结（docs/37 P0-2）：一旦冻结，生成方提交的 tests/ 文件不再生效，
         # 执行前从 run_dir/frozen_tests/ 恢复权威副本。首次执行前冻结当前套件。
-        verifier = TestVerifier(self.ctx.run_dir, self.ctx.sandbox.root, events=self.ctx.events)
+        verifier = TestVerifier(
+            self.ctx.run_dir, self.ctx.sandbox.root, events=self.ctx.events,
+            config=self.ctx.config, sandbox=self.ctx.sandbox,
+            run_id=getattr(self.ctx, "run_id", ""),
+        )
         try:
             frozen = verifier.load_manifest()
         except VerificationError as exc:
@@ -284,6 +195,7 @@ class TesterAgent(BaseAgent):
             if isinstance(item, dict) and str(item.get("path", "")).startswith("tests/")
         ]
         test_file = ""
+        suite_manifest: Optional[Dict[str, Any]] = frozen
         if frozen is not None:
             test_file = str(frozen.get("test_file") or "")
             changes = verifier.restore_if_changed()
@@ -295,7 +207,8 @@ class TesterAgent(BaseAgent):
                          "note": "测试套件已冻结：本轮新生成的 tests/ 文件被忽略，执行冻结副本"},
             )
             self.evidence(result, "frozen_tests", test_file=test_file,
-                          test_hash=frozen.get("digest", ""), restored=len(changes))
+                          test_hash=frozen.get("digest", ""), restored=len(changes),
+                          test_ids=len(frozen.get("test_ids") or []))
         else:
             # 首次（或冻结已失效）时写入测试文件（真实可执行）
             for file_item in data.get("files", []):
@@ -319,13 +232,18 @@ class TesterAgent(BaseAgent):
                     self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
             if test_file:
                 try:
-                    verifier.freeze(test_file, task.iteration)
+                    suite_manifest = verifier.freeze(
+                        test_file, task.iteration, case_meta=data.get("cases") or [])
                 except VerificationError as exc:
                     result.status, result.error = "fail", f"测试套件冻结失败: {exc}"
                     result.summary = result.error
                     return
         if not test_file:
             result.status, result.error = "fail", "测试套件未生成测试文件"
+            result.summary = result.error
+            return
+        if suite_manifest is None:
+            result.status, result.error = "fail", "没有可用的冻结测试清单，拒绝执行"
             result.summary = result.error
             return
 
@@ -360,29 +278,41 @@ class TesterAgent(BaseAgent):
                          "executable_languages": verification["executable_languages"]},
             )
 
-        # 3) 沙箱真实执行
-        exec_result = self.sandbox_run(
-            [self.ctx.sandbox.python, test_file],
-            env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
-            result_marker="<<<MASS_RESULT>>>",
+        # 3) 沙箱真实执行：执行权交给框架 runner（只跑冻结清单 test_ids），
+        #    结果从工作区外的 runner_result.json 读取；stdout 只留作诊断日志。
+        execution = execute_frozen_suite(
+            self.ctx.sandbox, self.ctx.run_dir, suite_manifest,
+            iteration=task.iteration, tag="tester",
         )
+        exec_result = execution.exec
         run_dir = self.ctx.run_dir / "test_runs" / f"iter{task.iteration:02d}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "stdout.txt").write_text(exec_result.stdout, encoding="utf-8")
         (run_dir / "stderr.txt").write_text(exec_result.stderr, encoding="utf-8")
-        parsed = exec_result.parsed
+        parsed = execution.result
         protocol_note = ""
         if parsed is None:
-            # 结果回传协议缺失：测试文件跑完但没输出 <<<MASS_RESULT>>>（如 main() 收集逻辑崩溃）。
-            # 原实现静默按 0 用例继续，验收门禁只看到"覆盖率为 0"而看不到为什么。
-            protocol_note = ("测试文件未按 execution_protocol 回传结果：stdout 无 <<<MASS_RESULT>>> 标记"
-                             "或标记后 JSON 不可解析，用例统计为 0（常见原因：main() 重复遍历已执行的 suite）")
-            parsed = {"total": 0, "passed": 0, "failed": 0, "cases": [], "duration_ms": 0}
+            # runner 没有产出逐用例记录：文件崩溃、解释器起不来或证据目录不可写。
+            # 不再从 stdout 兜底解析，缺少 runner 记录就是无证据。
+            protocol_note = ("框架执行器未产出逐用例记录（runner_result.json 缺失或不可解析）："
+                             "用例统计为 0，stdout 不再作为证据")
+            parsed = {"total": 0, "passed": 0, "failed": 0, "cases": [], "duration_ms": 0,
+                      "runner": {"name": "", "version": 0, "manifest_digest": ""}}
             self.ctx.events.emit(
                 "test_protocol_violation", agent=self.role_id, node=task.node_id,
                 iteration=task.iteration, severity="error",
                 payload={"note": protocol_note,
+                         "runner_cmd": execution.cmd,
                          "stdout_tail": exec_result.stdout.strip()[-300:],
+                         "stderr_tail": exec_result.stderr.strip()[-300:]},
+            )
+        elif parsed.get("error"):
+            protocol_note = f"框架执行器报告错误：{parsed['error']}"
+            self.ctx.events.emit(
+                "test_protocol_violation", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"note": protocol_note,
+                         "unexpected_test_ids": parsed.get("unexpected_test_ids") or [],
                          "stderr_tail": exec_result.stderr.strip()[-300:]},
             )
         (run_dir / "result.json").write_text(
@@ -391,6 +321,7 @@ class TesterAgent(BaseAgent):
         self.evidence(
             result, "execution", cmd=" ".join(exec_result.cmd), exit_code=exec_result.exit_code,
             log=str((run_dir / "stdout.txt").relative_to(self.ctx.run_dir)).replace("\\", "/"),
+            runner=str(execution.result_path.relative_to(self.ctx.run_dir)).replace("\\", "/"),
         )
 
         # 4) 独立验证（docs/37 P0-2）：只用逐用例记录重算结果，并核对冻结 hash。
@@ -399,16 +330,23 @@ class TesterAgent(BaseAgent):
         try:
             attestation = verifier.attest(
                 parsed=parsed, exit_code=exec_result.exit_code,
-                duration_ms=exec_result.duration_ms, test_file=test_file,
+                duration_ms=int(parsed.get("duration_ms") or exec_result.duration_ms),
+                test_file=test_file,
                 iteration=task.iteration, spec_fps=spec_fps,
                 verification_gap=bool(verification["gap"]),
                 root_cause_category=root_cause.get("category", ""),
+                requirement_spec=spec, run_id=getattr(self.ctx, "run_id", ""),
             )
         except VerificationError as exc:
             attestation = {
-                "version": 1, "valid": False, "reasons": [f"verifier_error:{exc}"],
+                "version": 2, "signature_alg": "", "valid": False,
+                "reasons": [f"verifier_error:{exc}"],
                 "test_file": test_file, "test_hash": "", "files": {}, "total": 0,
                 "passed": 0, "failed": 0, "assertions": 0,
+                "requirement_hash": "", "code_hash": "",
+                "visible_suite_hash": "", "hidden_suite_hash": "", "env_hash": "",
+                "runner_version": 0, "run_id": getattr(self.ctx, "run_id", ""),
+                "per_case_digest": "",
                 "coverage": self._coverage(parsed.get("cases", []), fp_total, data),
                 "exec": {"exit_code": exec_result.exit_code,
                          "duration_ms": exec_result.duration_ms},
@@ -444,6 +382,8 @@ class TesterAgent(BaseAgent):
         test_report = {
             "title": f"《{spec.get('title', '')}》业务测试报告",
             "test_file": test_file,
+            "runner": parsed.get("runner") or {},
+            "test_ids": list(suite_manifest.get("test_ids") or []),
             "summary": summary,
             "coverage": coverage,
             "verification_attestation": attestation_report,

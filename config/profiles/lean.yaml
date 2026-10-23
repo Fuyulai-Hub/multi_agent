@@ -3,7 +3,7 @@
 flow:
   nodes:
     review:
-      skip: true                 # 节点被裁剪，implement 的 pass 分支自动改接到 test
+      skip: true                 # 节点被裁剪：test 的 pass 分支自动改接到 review 的后继 acceptance
     acceptance:
       gate:
         criteria:

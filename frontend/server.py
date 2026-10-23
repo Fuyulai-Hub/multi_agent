@@ -19,6 +19,7 @@ API：
     GET /api/learning-report         自学习效果报告（Markdown）
     GET /api/llm                     当前 LLM 配置与凭据（Key 只返回掩码与是否已设置，不回显明文）
     GET /api/skills                  技能开关（runtime.skills.enabled / tools_enabled，与 system.yaml 同名同义）
+    GET /api/tools                   工具调用总开关（llm.tools_enabled，与 system.yaml 同名同义）
     GET /api/react                   ReAct 开关（runtime.react.enabled / max_steps / require_thought，与 system.yaml 同名同义）
     GET /api/store/status            MySQL/Redis 存储后端健康报告（docs/25）
     GET /api/mq/status               消息队列健康：运行流积压 / PEL / DLQ / worker（docs/26）
@@ -31,8 +32,12 @@ API：
     POST /api/llm                     保存 provider/model 到 system.yaml，凭据到 credentials.yaml
     POST /api/llm/test               用给定凭据探测 BASE_URL 的 /models，验证 Key 是否可用
     POST /api/skills                 保存技能开关到 system.yaml（下一次运行生效，无需重启服务）
+    POST /api/tools                  保存工具调用总开关（llm.tools_enabled）到 system.yaml
     POST /api/react                  保存 ReAct 开关到 system.yaml（下一次运行生效，无需重启服务）
-静态文件：/ 直接映射本目录（index.html / app.js / style.css）
+静态文件（前后端分离后可关闭）：
+    默认 --dist 指向项目根 frontend/，/ 映射到该目录（index.html / app.js / style.css）；
+    传 --no-static 则本进程只提供 /api/*，静态资源由独立前端宿主（如 python -m http.server）
+    提供，接口响应携带 CORS 头供跨源调用。两种模式下接口路径与响应体完全一致。
 """
 
 from __future__ import annotations
@@ -471,6 +476,60 @@ def save_skills_switch(enabled: bool, tools_enabled: bool) -> dict:
     return load_skills_switch()
 
 
+# ---------------- 工具调用总开关（llm.tools_enabled）----------------
+# 与技能开关同一模式：读取走 load_config、写回走 system.yaml 行级替换，保存后下一次运行生效。
+# 它是 function calling 的总闸：关闭后 Leader 不装配 ToolRunner（MCP 服务与技能工具都不下发）。
+
+
+def load_tools_switch() -> dict:
+    """读取工具调用总开关（字段名与 system.yaml 的 llm.tools_enabled 同名同义）。"""
+    from mas.config import load_config
+
+    config = load_config(PROJECT_ROOT / "config")
+    return {"enabled": bool(config.llm.get("tools_enabled", False))}
+
+
+def _rewrite_tools_switch(text: str, enabled: bool) -> str:
+    """行级替换 llm.tools_enabled，保留注释与其余内容原样。
+
+    必须跟踪顶层键定位（llm → 2 空格缩进的 tools_enabled）后精确替换：runtime.skills
+    下还有一个同名 ``tools_enabled``（4 空格缩进），只按键名匹配会误改技能工具开关。
+    目标键缺失时报 ValueError（不猜测插入位置）。
+    """
+    import re
+
+    found = False
+    out: list[str] = []
+    top = ""       # 当前顶层键（无缩进）
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):       # 注释行不改变层级状态
+            out.append(line)
+            continue
+        m_top = re.match(r"^([^\s#][^:]*):", line)
+        m_second = re.match(r"^  ([^\s#][^:]*):", line)
+        if m_top:
+            top = m_top.group(1)
+        elif m_second and top == "llm" and m_second.group(1) == "tools_enabled":
+            line = f"  tools_enabled: {str(enabled).lower()}"
+            found = True
+        out.append(line)
+    if not found:
+        raise ValueError("config/system.yaml 的 llm 段缺少字段: tools_enabled")
+    return "\n".join(out) + "\n"
+
+
+def save_tools_switch(enabled: bool) -> dict:
+    """把 llm.tools_enabled 写回 system.yaml（下一次运行生效，无需重启，见技能开关注释）。"""
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled 必须是布尔值（true/false）")
+    original = SYSTEM_YAML.read_text(encoding="utf-8")
+    SYSTEM_YAML.write_text(
+        _rewrite_tools_switch(original, enabled),
+        encoding="utf-8", newline="\n",
+    )
+    return load_tools_switch()
+
+
 # ---------------- ReAct 开关（runtime.react.enabled / max_steps / require_thought）----------------
 # 与技能开关同一模式：读取走 load_config、写回走 system.yaml 行级替换，保存后下一次运行生效。
 # nodes（节点白名单）仍手改 yaml：其值是列表且需与 llm.tools_nodes 取交集，前端不做。
@@ -860,6 +919,8 @@ class Handler(BaseHTTPRequestHandler):
     workspace: Path = PROJECT_ROOT / "workspace"
     token: str = ""                    # main() 从 MAS_PANEL_TOKEN 注入；空 = 回环免令牌模式
     allowed_origins: set[str] = set()  # main() 按绑定地址与 MAS_PANEL_ORIGINS 注入
+    # 前端静态资源目录；None = 只提供 /api/*（前后端分离：页面由独立前端宿主托管）
+    static_dir: Path | None = FRONTEND_DIR
     server_version = "mas-frontend/1.0"
 
     def log_message(self, fmt: str, *args) -> None:  # 静默访问日志
@@ -902,6 +963,9 @@ class Handler(BaseHTTPRequestHandler):
         if origin and self._origin_allowed():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
+            # 分离部署必须显式声明 credentials：前端跨源调用若带 Cookie 需它，
+            # 而通配符来源 ``*`` 与 credentials 互斥（此处只回显白名单具体来源，合法）。
+            self.send_header("Access-Control-Allow-Credentials", "true")
 
     def _reject_unauthorized(self) -> None:
         self._send_json(
@@ -952,6 +1016,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_OPTIONS(self) -> None:  # noqa: N802（标准库命名）
+        # 预检不是实际接口调用，只做来源校验：跨源分离部署时前端宿主的 OPTIONS
+        # 必须拿到 204 + CORS 头，否则浏览器直接掐断后续请求。
         if not self._origin_allowed():
             self._send_text("forbidden", 403)
             return
@@ -964,9 +1030,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static(self, path: str) -> None:
+        root = self.static_dir
+        if root is None:                    # 分离部署：本进程不托管页面
+            self._send_text("not found", 404)
+            return
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
-        target = (FRONTEND_DIR / rel).resolve()
-        if FRONTEND_DIR not in target.parents and target != FRONTEND_DIR:
+        target = (root / rel).resolve()
+        if root not in target.parents and target != root:
             self._send_text("forbidden", 403)
             return
         if not target.is_file() or target.suffix not in STATIC_TYPES:
@@ -1014,6 +1084,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(load_llm_defaults())
         elif route == "/api/skills":
             self._send_json(load_skills_switch())
+        elif route == "/api/tools":
+            self._send_json(load_tools_switch())
         elif route == "/api/react":
             self._send_json(load_react_switch())
         elif route == "/api/store/status":
@@ -1039,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path not in ("/api/run", "/api/run/cancel", "/api/upload", "/api/upload/remove",
                                "/api/upload_image", "/api/llm", "/api/llm/test", "/api/skills",
-                               "/api/react"):
+                               "/api/tools", "/api/react"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -1110,6 +1182,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(save_skills_switch(enabled, tools_enabled))
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/tools":
+            enabled = data.get("enabled")
+            if not isinstance(enabled, bool):
+                self._send_json({"error": "enabled 必须是布尔值（true/false）"}, 400)
+                return
+            try:
+                self._send_json(save_tools_switch(enabled))
             except (ValueError, OSError) as exc:
                 self._send_json({"error": str(exc)}, 400)
             return
@@ -1237,6 +1319,11 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--workspace", default=str(PROJECT_ROOT / "workspace"))
+    # 前后端分离开关：默认行为与改造前逐字节一致（同源托管页面）。
+    parser.add_argument("--dist", default=str(FRONTEND_DIR),
+                        help="静态资源目录（默认本目录）；前后端分离时由独立前端宿主提供")
+    parser.add_argument("--no-static", action="store_true",
+                        help="只提供 /api/*，不托管页面（前后端分离部署）")
     args = parser.parse_args()
 
     # 失败关闭：非回环绑定会暴露运行数据与写接口，没有令牌就不启动。
@@ -1247,6 +1334,7 @@ def main() -> int:
         return 2
     Handler.token = panel_token
     Handler.allowed_origins = allowed_panel_origins(args.host, args.port)
+    Handler.static_dir = None if args.no_static else Path(args.dist).resolve()
 
     workspace = Path(args.workspace).resolve()
     if not workspace.exists():
@@ -1287,6 +1375,10 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"前端面板：http://{args.host}:{args.port}  （数据目录：{workspace}）")
+    if Handler.static_dir is None:
+        print("静态资源：未托管（--no-static，仅提供 /api/*；页面由独立前端宿主提供）")
+    else:
+        print(f"静态资源：{Handler.static_dir}")
     if panel_token:
         print(f"访问控制：已启用令牌认证（{PANEL_TOKEN_ENV}）；"
               f"首次访问请打开 http://{args.host}:{args.port}/?token=<令牌>")

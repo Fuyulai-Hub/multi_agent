@@ -27,6 +27,13 @@ from .agents import create_agent
 from .blackboard import Blackboard
 from .bus import MessageBus
 from .config import SystemConfig, load_requirement
+from .contract import (
+    CONTRACT_RELATIVE,
+    ContractError,
+    hidden_suite_dir,
+    load_frozen_contract,
+    verify_frozen_contract,
+)
 from .envprobe import probe_environment
 from .errors import ConfigError
 from .events import EventLog
@@ -38,6 +45,10 @@ from .prompts import PromptBuilder
 from .sandbox import Sandbox
 from .schemas import AgentContext, AgentResult, NodeTask
 from .skills import build_tool_schema, list_skills, load_run_facts, run_skill_script
+from .verifier import (
+    TestVerifier, VerificationError, code_tree_hash, require_signing_secret, verify_signed,
+)
+from .verify.exec import execute_hidden_suite
 
 __all__ = ["Leader", "RunSummary", "upsert_run_index"]
 
@@ -231,6 +242,8 @@ class Leader:
 
     def __init__(self, config: SystemConfig) -> None:
         self.config = config
+        # release 模式缺稳定签名密钥时在启动阶段就拒绝（dev 模式仍允许进程随机密钥）
+        require_signing_secret(config)
         self._store_backends_cache: Any = None
 
     def _store_backends(self) -> Any:
@@ -896,6 +909,7 @@ class Leader:
                 "forced_fail": forced_fail, "canceled": canceled,
             },
         )
+        self._notify_run_end(summary, events)   # 旁路通知：失败不影响运行结论
         if canceled:
             print(
                 f"[CANCELED] 运行已终止 {run_id}｜步数 {steps}｜耗时 {duration_s}s"
@@ -916,6 +930,72 @@ class Leader:
                 f"｜错误 {mq_metrics.get('errors', 0)}"
             )
         return summary
+
+    # ================================================================= 运行结束通知
+    def _notify_run_end(self, summary: "RunSummary", events: EventLog) -> None:
+        """运行收尾后按 runtime.notify.feishu 调飞书自定义机器人 Webhook 发消息。
+
+        零第三方依赖：stdlib urllib 直发 POST；失败只落 notify_failed 事件，不改变运行结论；
+        webhook 未配置时落 notify_skipped；MAS_NOTIFY_DISABLE=1 可全局静默（测试用）。
+        若机器人开启了「签名校验」，配置 secret 即可自动附带 timestamp/sign。
+        """
+        cfg = (self.config.runtime.get("notify") or {}).get("feishu") or {}
+        if not cfg.get("enabled", False) or os.environ.get("MAS_NOTIFY_DISABLE"):
+            return
+        import base64
+        import hashlib
+        import hmac
+        import time
+        import urllib.request
+
+        url = os.environ.get("FEISHU_WEBHOOK_URL") or str(cfg.get("webhook") or "")
+        secret = os.environ.get("FEISHU_WEBHOOK_SECRET") or str(cfg.get("secret") or "")
+        if not url:
+            events.emit("notify_skipped", agent="leader",
+                        payload={"channel": "feishu", "reason": "未配置 webhook"})
+            return
+        payload: Dict[str, Any] = {
+            "msg_type": "text",
+            "content": {"text": self._notify_text(summary)},
+        }
+        if secret:      # 签名校验：string_to_sign = timestamp + "\n" + secret，HMAC-SHA256 空消息体
+            timestamp = str(int(time.time()))
+            key = f"{timestamp}\n{secret}".encode("utf-8")
+            payload["timestamp"] = timestamp
+            payload["sign"] = base64.b64encode(
+                hmac.new(key, digestmod=hashlib.sha256).digest()).decode("utf-8")
+        request = urllib.request.Request(
+            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=int(cfg.get("timeout_s", 10))) as resp:
+                result = json.loads(resp.read().decode("utf-8") or "{}")
+        except Exception as exc:  # noqa: BLE001 - 通知是旁路，任何失败都不影响运行结论
+            events.emit("notify_failed", agent="leader", severity="warning",
+                        payload={"channel": "feishu", "error": f"{type(exc).__name__}: {exc}"})
+            return
+        code = result.get("code", result.get("StatusCode", 0))
+        if code != 0:
+            events.emit("notify_failed", agent="leader", severity="warning", payload={
+                "channel": "feishu", "error": f"code={code} {result.get('msg') or result.get('StatusMessage') or ''}".strip(),
+            })
+            return
+        events.emit("notify_sent", agent="leader",
+                    payload={"channel": "feishu", "run_id": summary.run_id})
+
+    @staticmethod
+    def _notify_text(summary: "RunSummary") -> str:
+        """通知正文：结论 / 规模指标 / 运行号 / 报告路径。"""
+        verdict = "已终止" if summary.canceled else ("通过" if summary.verdict == "pass" else "未通过")
+        duration = (summary.metrics or {}).get("duration_s", "-")
+        return "\n".join([
+            f"[multi-agent] 运行结束：{summary.requirement_title}",
+            f"结论：{verdict}｜步数 {summary.steps}｜回退 {summary.rollbacks}"
+            f"｜缺陷 {summary.bugs_total}（闭环 {summary.bugs_fixed}）｜耗时 {duration}s",
+            f"运行：{summary.run_id}",
+            f"报告：{summary.report_path or '-'}",
+        ])
 
     # ================================================================= 流程沉淀
     def _requirement_path(self, requirement: str) -> Path:
@@ -1016,6 +1096,80 @@ class Leader:
                 "value": outcome.value if outcome.ok else None,
                 "reason": "" if outcome.ok else outcome.error,
             })
+        # 证据链硬校验（docs/39 门径优化）：不只看 attestation.valid 字段，而是由门禁
+        # 重新计算 code/test/env/requirement hash、重验签名与逐用例/覆盖率。
+        # 任何一项不匹配都直接判失败，防止「测试通过后代码又被改」的 TOCTOU。
+        evidence = self._verify_gate_evidence(ctx, snapshot, iteration=task.iteration)
+        evidence_reason = "" if evidence.get("passed") else \
+            "；".join(str(item) for item in (evidence.get("reasons") or []))[:500]
+        criteria_results.append({
+            "id": "测试证据链完整（框架重验）",
+            "expr": "verify_attestation + recompute(requirement/code/suite/env hash)",
+            "passed": bool(evidence.get("passed")),
+            "value": {"reasons": list(evidence.get("reasons") or []),
+                      "recomputed": dict(evidence.get("recomputed") or {})},
+            "reason": evidence_reason,
+        })
+        # 需求契约（门禁加固）：签名有效 + 需求原文/当前规格与冻结时完全一致 +
+        # 条款映射仍覆盖全部条款。任何改写需求或规格的行为都在这里失败关闭。
+        contract = self._verify_requirement_contract(ctx, snapshot)
+        criteria_results.append({
+            "id": "需求契约已冻结且未被篡改",
+            "expr": "verify_signature(requirement_contract) + recompute(requirement/spec hash) + clause coverage",
+            "passed": bool(contract.get("passed")),
+            "value": {"reasons": list(contract.get("reasons") or []),
+                      "coverage": dict(contract.get("coverage") or {})},
+            "reason": "" if contract.get("passed") else
+                      "；".join(str(item) for item in (contract.get("reasons") or []))[:500],
+        })
+        # 隐藏用例：只依据冻结契约生成、存放在 run 工作区之外，门禁现场只读执行。
+        # 可见 + 隐藏都通过才算验收通过（用户需求：hidden 与 visible 双门禁）。
+        hidden = self._verify_hidden_suite(ctx, snapshot, iteration=task.iteration)
+        criteria_results.append({
+            "id": "隐藏用例通过（契约冻结后独立生成）",
+            "expr": "execute_hidden(frozen_outside_workspace) + attest + verify_evidence + failed=0",
+            "passed": bool(hidden.get("passed")),
+            "value": {
+                "reasons": list(hidden.get("reasons") or []),
+                "summary": dict(hidden.get("summary") or {}),
+                "coverage": dict(hidden.get("coverage") or {}),
+                "manifest_digest": str(hidden.get("manifest_digest") or ""),
+            },
+            "reason": "" if hidden.get("passed") else
+                      "；".join(str(item) for item in (hidden.get("reasons") or []))[:500],
+        })
+        if isinstance(hidden.get("report"), dict):
+            ctx.blackboard.publish(
+                "hidden_test_report", hidden["report"], producer="leader", node=node.id,
+                iteration=task.iteration,
+                summary=str(hidden["report"].get("summary_text") or "隐藏用例执行报告"),
+            )
+        # 审查绑定（docs/39 门径优化）：review 在 test 之后执行，必须给**当前**代码签字。
+        # 只认 review_report 自带的 code_hash 与门禁现场重算的最终代码 hash 相等；
+        # optimize 改完代码若没重跑 review，旧审查会在这里失败关闭。lean profile
+        # 没有 review 节点，不添加该硬校验（否则所有精简流程任务都会被误伤）。
+        if "review" in self.config.flow.nodes:
+            review_binding = self._verify_review_binding(ctx, snapshot)
+            criteria_results.append({
+                "id": "审查结论绑定最终代码",
+                "expr": "review_report.verdict == pass + blocking == 0 + recompute(code_hash) == review_report.code_hash",
+                "passed": bool(review_binding.get("passed")),
+                "value": {
+                    "reasons": list(review_binding.get("reasons") or []),
+                    "review_code_hash": str(review_binding.get("review_code_hash") or ""),
+                    "final_code_hash": str(review_binding.get("final_code_hash") or ""),
+                },
+                "reason": "" if review_binding.get("passed") else
+                          "；".join(str(item) for item in (review_binding.get("reasons") or []))[:500],
+            })
+            ctx.events.emit(
+                "gate_review_checked", agent="leader", node=node.id, iteration=task.iteration,
+                severity="info" if review_binding.get("passed") else "error",
+                payload={"passed": bool(review_binding.get("passed")),
+                         "reasons": list(review_binding.get("reasons") or []),
+                         "review_code_hash": str(review_binding.get("review_code_hash") or ""),
+                         "final_code_hash": str(review_binding.get("final_code_hash") or "")},
+            )
         all_pass = all(item["passed"] for item in criteria_results)
 
         signoff: Dict[str, Any] = {}
@@ -1045,6 +1199,7 @@ class Leader:
             "criteria": criteria_results,
             "failed_criteria": failed,
             "signoff": {"verdict": signoff.get("verdict", ""), "opinion": signoff.get("opinion", "")},
+            "evidence": evidence,
             "iteration": task.iteration,
             "evaluated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -1053,8 +1208,16 @@ class Leader:
             summary=("全部通过" if passed else "未通过：" + "、".join(str(item["id"]) for item in failed)),
         )
         ctx.events.emit(
+            "gate_evidence_checked", agent="leader", node=node.id, iteration=task.iteration,
+            severity="info" if evidence.get("passed") else "error",
+            payload={"passed": bool(evidence.get("passed")),
+                     "reasons": list(evidence.get("reasons") or []),
+                     "recomputed": dict(evidence.get("recomputed") or {})},
+        )
+        ctx.events.emit(
             "gate_evaluated", agent="leader", node=node.id, iteration=task.iteration,
-            payload={"passed": passed, "failed_criteria": failed, "signoff": gate["signoff"]},
+            payload={"passed": passed, "failed_criteria": failed, "signoff": gate["signoff"],
+                     "evidence_passed": bool(evidence.get("passed"))},
         )
         topic = "acceptance_passed" if passed else "acceptance_rejected"
         self._broadcast(ctx, "leader", topic, {
@@ -1064,6 +1227,356 @@ class Leader:
         return {
             "status": "pass" if passed else "fail",
             "summary": gate["summary"] if "summary" in gate else ("验收通过" if passed else "验收未通过"),
+        }
+
+    def _verify_gate_evidence(self, ctx: AgentContext, snapshot: Dict[str, Any], *,
+                              iteration: int) -> Dict[str, Any]:
+        """门禁侧证据链校验：重算 code/test/env 等 hash、验签、核对逐用例与覆盖率。
+
+        失败关闭（fail-closed）：缺 test_report / 缺凭据 / 凭据文件不可读 / 签名无效 /
+        run_id 不符 / 任一 hash 不一致，都返回 passed=False，由 `_run_gate` 直接判失败。
+        该方法不抛异常，避免门禁因证据损坏而崩溃成「未判定」。
+        """
+        run_dir = getattr(ctx, "run_dir", None)
+        if run_dir is None:
+            return {"passed": False, "reasons": ["run_dir_missing"], "recomputed": {}}
+        test_report = snapshot.get("test_report") if isinstance(snapshot, dict) else None
+        if not isinstance(test_report, dict):
+            return {"passed": False, "reasons": ["test_report_missing"], "recomputed": {}}
+        embedded = test_report.get("verification_attestation")
+        if not isinstance(embedded, dict) or not embedded.get("signature"):
+            return {"passed": False, "reasons": ["verification_attestation_missing"],
+                    "recomputed": {}}
+
+        path = Path(run_dir) / "verification_attestation.json"
+        try:
+            attestation = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"passed": False,
+                    "reasons": [f"verification_attestation_unreadable:{type(exc).__name__}:{exc}"],
+                    "recomputed": {}}
+
+        reasons: List[str] = []
+        if str(embedded.get("signature") or "") != str(attestation.get("signature") or ""):
+            reasons.append("test_report_attestation_mismatch")
+        if str(embedded.get("per_case_digest") or "") != str(attestation.get("per_case_digest") or ""):
+            reasons.append("test_report_case_digest_mismatch")
+
+        sandbox = getattr(ctx, "sandbox", None)
+        sandbox_root = getattr(sandbox, "root", None) or (Path(run_dir) / "code")
+        run_id = str(getattr(ctx, "run_id", "") or "")
+        spec = snapshot.get("requirement_spec") if isinstance(snapshot, dict) else None
+        try:
+            verifier = TestVerifier(
+                Path(run_dir), Path(sandbox_root), events=getattr(ctx, "events", None),
+                config=self.config, sandbox=sandbox, run_id=run_id,
+            )
+            outcome = verifier.verify_evidence(
+                attestation,
+                requirement_spec=spec if isinstance(spec, dict) else {},
+                run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - 门禁必须给出明确失败，不能因证据异常崩溃
+            return {"passed": False,
+                    "reasons": reasons + [
+                        f"evidence_verification_error:{type(exc).__name__}:{exc}"],
+                    "recomputed": {}}
+
+        reasons.extend(list(outcome.get("reasons") or []))
+        unique = list(dict.fromkeys(reasons))
+        return {
+            "passed": not unique,
+            "reasons": unique,
+            "recomputed": dict(outcome.get("recomputed") or {}),
+            "signature_valid": bool(outcome.get("signature_valid")),
+            "attestation_path": "verification_attestation.json",
+            "iteration": int(iteration),
+        }
+
+    def _verify_review_binding(self, ctx: AgentContext,
+                               snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """门禁侧核验审查结论是否绑定最终代码。
+
+        要求 review_report 存在、verdict=pass、blocking=0、code_hash 非空且等于
+        门禁现场重算的交付代码树摘要。任一项不满足都失败关闭：旧审查（optimize
+        改过代码后未重跑）不能给新代码签字。
+        """
+        run_dir = getattr(ctx, "run_dir", None)
+        if run_dir is None:
+            return {"passed": False, "reasons": ["run_dir_missing"]}
+        review = snapshot.get("review_report") if isinstance(snapshot, dict) else None
+        if not isinstance(review, dict) or not review:
+            return {"passed": False, "reasons": ["review_report_missing"],
+                    "review_code_hash": "", "final_code_hash": ""}
+
+        reasons: List[str] = []
+        if str(review.get("verdict") or "") != "pass":
+            reasons.append("review_not_passed")
+        try:
+            blocking = int(review.get("blocking") or 0)
+        except (TypeError, ValueError):
+            blocking = -1
+        if blocking != 0:
+            reasons.append("review_blocking_not_zero")
+
+        sandbox = getattr(ctx, "sandbox", None)
+        sandbox_root = getattr(sandbox, "root", None) or (Path(run_dir) / "code")
+        final_hash = code_tree_hash(Path(sandbox_root))
+        review_hash = str(review.get("code_hash") or "")
+        if not review_hash:
+            reasons.append("review_code_hash_missing")
+        elif not final_hash:
+            reasons.append("final_code_hash_missing")
+        elif review_hash != final_hash:
+            reasons.append("review_code_hash_stale")
+        return {
+            "passed": not reasons,
+            "reasons": reasons,
+            "review_code_hash": review_hash,
+            "final_code_hash": final_hash,
+        }
+
+    def _verify_requirement_contract(self, ctx: AgentContext,
+                                     snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """门禁侧重验需求契约：签名、run_id、需求原文 hash、当前规格 hash、条款覆盖。"""
+        run_dir = getattr(ctx, "run_dir", None)
+        if run_dir is None:
+            return {"passed": False, "reasons": ["run_dir_missing"], "coverage": {}}
+        path = Path(run_dir) / CONTRACT_RELATIVE
+        reasons: List[str] = []
+        try:
+            frozen = load_frozen_contract(path, config=self.config)
+        except ContractError as exc:
+            return {"passed": False,
+                    "reasons": [f"requirement_contract_untrusted:{exc}"], "coverage": {}}
+
+        artifact = snapshot.get("requirement_contract") if isinstance(snapshot, dict) else None
+        if not isinstance(artifact, dict) or not artifact:
+            reasons.append("requirement_contract_artifact_missing")
+        else:
+            if str(artifact.get("contract_hash") or "") != str(frozen.get("contract_hash") or ""):
+                reasons.append("requirement_contract_artifact_hash_mismatch")
+            if str(artifact.get("signature") or "") != str(frozen.get("signature") or ""):
+                reasons.append("requirement_contract_artifact_signature_mismatch")
+
+        source = snapshot.get("requirement_source") if isinstance(snapshot, dict) else None
+        requirement_text = str((source or {}).get("text") or "")
+        spec = snapshot.get("requirement_spec") if isinstance(snapshot, dict) else None
+        reasons.extend(verify_frozen_contract(
+            frozen, spec if isinstance(spec, dict) else {}, requirement_text,
+            run_id=str(getattr(ctx, "run_id", "") or ""), config=self.config,
+        ))
+        unique = list(dict.fromkeys(reasons))
+        clauses = frozen.get("clauses") if isinstance(frozen.get("clauses"), list) else []
+        mapped = {
+            span.get("clause_id")
+            for fp in ((spec or {}).get("function_points") or [])
+            if isinstance(fp, dict)
+            for span in (fp.get("source_spans") or [])
+            if isinstance(span, dict)
+        }
+        out_ids = {
+            item.get("clause_id")
+            for item in (frozen.get("out_of_scope") or [])
+            if isinstance(item, dict)
+        }
+        coverage = {
+            "total": len(clauses),
+            "mapped": len(mapped),
+            "out_of_scope": len(out_ids),
+            "uncovered": sorted(
+                str(item.get("id")) for item in clauses
+                if item.get("id") not in mapped and item.get("id") not in out_ids
+            ),
+        }
+        result = {
+            "passed": not unique,
+            "reasons": unique,
+            "coverage": coverage,
+            "contract_hash": str(frozen.get("contract_hash") or ""),
+            "requirement_hash": str(frozen.get("requirement_hash") or ""),
+            "frozen_at": str(frozen.get("frozen_at") or ""),
+        }
+        events = getattr(ctx, "events", None)
+        if events is not None:
+            events.emit(
+                "gate_contract_checked", agent="leader", severity="info" if not unique else "error",
+                payload={"passed": not unique, "reasons": unique, "coverage": coverage,
+                         "contract_hash": result["contract_hash"]},
+            )
+        return result
+
+    def _verify_hidden_suite(self, ctx: AgentContext, snapshot: Dict[str, Any], *,
+                             iteration: int) -> Dict[str, Any]:
+        """门禁侧执行隐藏套件：只认 run 工作区外冻结副本 + 框架 runner 的逐用例记录。
+
+        要求：套件与契约绑定、清单签名有效、逐用例全部通过、功能点覆盖率 1.0、
+        证据包重验通过。隐藏用例失败即验收失败（可见用例通过不能替代）。
+        """
+        run_dir = getattr(ctx, "run_dir", None)
+        if run_dir is None:
+            return {"passed": False, "reasons": ["run_dir_missing"]}
+        run_id = str(getattr(ctx, "run_id", "") or "")
+        root = hidden_suite_dir(self.config.workspace_dir, run_id)
+        artifact = snapshot.get("hidden_suite") if isinstance(snapshot, dict) else None
+        contract = snapshot.get("requirement_contract") if isinstance(snapshot, dict) else None
+        spec = snapshot.get("requirement_spec") if isinstance(snapshot, dict) else None
+        reasons: List[str] = []
+        if not isinstance(artifact, dict) or not artifact:
+            return {"passed": False, "reasons": ["hidden_suite_artifact_missing"]}
+        if not root.is_dir():
+            return {"passed": False, "reasons": [f"hidden_suite_dir_missing:{root}"]}
+        sandbox = getattr(ctx, "sandbox", None)
+        sandbox_root = Path(getattr(sandbox, "root", None) or (Path(run_dir) / "code")).resolve()
+        try:
+            inside = root.resolve() == sandbox_root or sandbox_root in root.resolve().parents
+        except OSError:
+            inside = False
+        if inside:
+            return {"passed": False, "reasons": ["hidden_suite_inside_workspace"]}
+        if str(artifact.get("root") or "") and \
+                Path(str(artifact.get("root"))).resolve() != root.resolve():
+            reasons.append("hidden_suite_path_mismatch")
+        contract_hash = str((contract or {}).get("contract_hash") or "")
+        if not contract_hash:
+            reasons.append("requirement_contract_artifact_missing")
+        elif str(artifact.get("contract_hash") or "") != contract_hash:
+            reasons.append("hidden_suite_contract_mismatch")
+
+        verifier = TestVerifier(
+            root, root, events=getattr(ctx, "events", None), config=self.config,
+            sandbox=sandbox, run_id=run_id, code_root=sandbox_root,
+            attestation_path=Path(run_dir) / "hidden_attestation.json",
+        )
+        try:
+            manifest = verifier.load_manifest()
+        except VerificationError as exc:
+            return {"passed": False, "reasons": reasons + [f"hidden_manifest_untrusted:{exc}"]}
+        if manifest is None:
+            return {"passed": False, "reasons": reasons + ["hidden_manifest_missing"]}
+        if str(manifest.get("digest") or "") != str(artifact.get("manifest_digest") or ""):
+            reasons.append("hidden_manifest_digest_mismatch")
+        if set(manifest.get("test_ids") or []) != set(artifact.get("test_ids") or []):
+            reasons.append("hidden_test_ids_mismatch")
+
+        meta_path = root / "hidden_meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            meta = {}
+            reasons.append(f"hidden_meta_unreadable:{type(exc).__name__}")
+        if not meta or not verify_signed(meta, config=self.config):
+            reasons.append("hidden_meta_signature_invalid")
+        else:
+            if str(meta.get("contract_hash") or "") != contract_hash:
+                reasons.append("hidden_meta_contract_mismatch")
+            if str(meta.get("manifest_digest") or "") != str(manifest.get("digest") or ""):
+                reasons.append("hidden_meta_manifest_mismatch")
+            if str(meta.get("run_id") or "") != run_id:
+                reasons.append("hidden_meta_run_id_mismatch")
+        if reasons:
+            return {"passed": False, "reasons": list(dict.fromkeys(reasons)),
+                    "manifest_digest": str(manifest.get("digest") or "")}
+
+        execution = execute_hidden_suite(
+            sandbox, Path(run_dir), root, manifest, iteration=iteration, tag="hidden",
+        )
+        parsed = execution.result or {}
+        spec_fps = [
+            str(fp.get("id")) for fp in ((spec or {}).get("function_points") or [])
+            if isinstance(fp, dict) and fp.get("id")
+        ]
+        try:
+            attestation = verifier.attest(
+                parsed=execution.result,
+                exit_code=execution.exec.exit_code,
+                duration_ms=int(parsed.get("duration_ms") or execution.exec.duration_ms),
+                test_file=str(manifest.get("test_file") or ""),
+                iteration=iteration,
+                spec_fps=spec_fps,
+                requirement_spec=spec if isinstance(spec, dict) else {},
+                run_id=run_id,
+            )
+        except VerificationError as exc:
+            return {"passed": False, "reasons": reasons + [f"hidden_attest_failed:{exc}"],
+                    "manifest_digest": str(manifest.get("digest") or "")}
+        outcome = verifier.verify_evidence(
+            attestation, requirement_spec=spec if isinstance(spec, dict) else {}, run_id=run_id,
+        )
+        reasons.extend(list(outcome.get("reasons") or []))
+        total = int(attestation.get("total") or 0)
+        failed = int(attestation.get("failed") or 0)
+        coverage = dict(attestation.get("coverage") or {})
+        if total <= 0:
+            reasons.append("hidden_no_cases")
+        if failed > 0:
+            reasons.append(f"hidden_cases_failed:{failed}")
+        functional_rate = float((coverage.get("functional") or {}).get("rate") or 0.0)
+        if functional_rate < 1.0:
+            reasons.append(f"hidden_functional_coverage_incomplete:{functional_rate}")
+        unique = list(dict.fromkeys(reasons))
+
+        executions_dir = execution.io_dir
+        summary = {
+            "total": total,
+            "passed": int(attestation.get("passed") or 0),
+            "failed": failed,
+            "pass_rate": round((total - failed) / total, 4) if total else 0.0,
+            "duration_ms": int(parsed.get("duration_ms") or 0),
+            "exit_code": int(execution.exec.exit_code),
+        }
+        report = {
+            "title": f"《{(spec or {}).get('title', '')}》隐藏用例报告",
+            "suite": {
+                "root": str(root),
+                "test_file": str(manifest.get("test_file") or ""),
+                "manifest_digest": str(manifest.get("digest") or ""),
+                "test_ids": list(manifest.get("test_ids") or []),
+                "contract_hash": contract_hash,
+                "derived_from": "frozen-requirement-contract",
+            },
+            "summary": summary,
+            "coverage": coverage,
+            "verification_attestation": {key: value for key, value in attestation.items()
+                                         if key != "cases"},
+            "executions": [{
+                "cmd": " ".join(execution.cmd),
+                "exit_code": int(execution.exec.exit_code),
+                "log": str((executions_dir / "stdout.txt")),
+            }],
+            "failures": [
+                {"test": f"{case.get('class', '')}.{case.get('test', '')}",
+                 "fp_id": case.get("fp_id", ""), "category": case.get("category", ""),
+                 "message": case.get("message", "")}
+                for case in (attestation.get("cases") or [])
+                if case.get("status") != "passed"
+            ],
+            "summary_text": (f"隐藏用例 {total}（通过 {total - failed} / 失败 {failed}），"
+                             f"功能点覆盖率 {functional_rate}"),
+        }
+        # 原始执行日志落盘（与可见测试同一证据目录约定）
+        try:
+            executions_dir.mkdir(parents=True, exist_ok=True)
+            (executions_dir / "stdout.txt").write_text(execution.exec.stdout, encoding="utf-8")
+            (executions_dir / "stderr.txt").write_text(execution.exec.stderr, encoding="utf-8")
+        except OSError:
+            pass
+        events = getattr(ctx, "events", None)
+        if events is not None:
+            events.emit(
+                "gate_hidden_checked", agent="leader", severity="info" if not unique else "error",
+                payload={"passed": not unique, "reasons": unique, "summary": summary,
+                         "coverage": coverage,
+                         "manifest_digest": str(manifest.get("digest") or "")},
+            )
+        return {
+            "passed": not unique,
+            "reasons": unique,
+            "summary": summary,
+            "coverage": coverage,
+            "manifest_digest": str(manifest.get("digest") or ""),
+            "attestation": attestation,
+            "report": report,
         }
 
     # ================================================================= 协作

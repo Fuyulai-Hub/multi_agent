@@ -11,7 +11,7 @@
       → tool 消息回传，桩服务记录第二轮请求供断言
 
 同时覆盖：
-- Leader._build_tool_runner 装配/关闭（tools_enabled 默认 false 不装配）；
+- Leader._build_tool_runner 装配/关闭（tools_enabled 显式 false 不装配）；
 - tools 与 response_format(json_object) 的互斥；
 - 协议正确性：tool 消息前必须有携带 tool_calls 的 assistant 消息；
 - offline Provider + tools_enabled=true 不触网、行为不变。
@@ -152,6 +152,9 @@ class FunctionCallingE2ETests(unittest.TestCase):
         # 真实配置（项目 config），config_dir 指向临时目录并写入 mcp.yaml
         self.config = load_config(PROJECT_ROOT / "config", workspace=self.root / "workspace")
         self.config.runtime["verbose"] = False
+        # 本文件只验证 MCP 工具链路：system.yaml 现已默认开启技能工具（runtime.skills.tools_enabled），
+        # 此处显式关闭，避免技能工具混入本文件的 tools 清单/空工具断言（技能工具验证见 test_skill_tools.py）。
+        self.config.runtime["skills"] = {"enabled": False}
         # 本文件验证的是 ReAct 之前的工具闭环协议（docs/21）。system.yaml 现已默认开启
         # ReAct（docs/34），命中节点会被分流到 ReAct 分支（metrics 记 react_steps 而非
         # tool_rounds），故显式关闭以保持本文件的验证目标不变；
@@ -289,11 +292,12 @@ class FunctionCallingE2ETests(unittest.TestCase):
 
     # ---------------------------------------------------------------- Leader 装配
     def test_leader_build_tool_runner_gate(self):
-        """tools_enabled 默认 false 不装配；显式 true 时装配并发 tool_runner_ready 事件。"""
+        """tools_enabled 显式 false 不装配；默认 true（system.yaml）时装配并发 tool_runner_ready 事件。"""
         leader = Leader(self.config)
         events = _RecordingEvents()
 
-        # 默认（system.yaml 为 false）→ None，不拉任何 MCP 子进程
+        # 显式关闭 → None，不拉任何 MCP 子进程（system.yaml 现默认 true，可在前端关闭）
+        self.config.llm["tools_enabled"] = False
         self.assertIsNone(leader._build_tool_runner(events))
 
         self.config.llm["tools_enabled"] = True

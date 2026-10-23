@@ -13,7 +13,7 @@ collaboration:
     product: ["requirement_source", "env_probe"]
     developer: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "acceptance_gate", "env_probe"]
     reviewer: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "bug_reports", "test_report"]
-    tester: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "review_report", "bug_reports"]
+    tester: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "bug_reports"]
     reporter: ["requirement_spec", "solution_design", "code_manifest", "review_report", "test_report", "bug_reports", "fix_summary", "fix_test_report", "acceptance_gate"]
 
   # 关键事件广播矩阵：让相关 Agent 感知“其他人已完成的工作”

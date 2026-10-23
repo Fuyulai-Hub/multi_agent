@@ -153,7 +153,8 @@ class FrontendWiringTests(unittest.TestCase):
             self.assertIn(f'id="{control_id}"', html, control_id)
             self.assertIn(f'"#{control_id}"', js, control_id)
         # 读写接口与字段名（与后端 /api/skills、runtime.skills.* 一致）
-        self.assertGreaterEqual(len(re.findall(r'fetch\("/api/skills"', js)), 2)  # GET + POST
+        # GET + POST 两个调用点；接口路径前可能带部署基址（前后端分离的 ?api=），故只匹配路径本身
+        self.assertGreaterEqual(len(re.findall(r'fetch\([^;\n]*"/api/skills"', js)), 2)
         self.assertIn("enabled: $(CFG.skillsEnabled).checked", js)
         self.assertIn("tools_enabled: $(CFG.skillsToolsEnabled).checked", js)
         # 主界面入口：弹窗默认 hidden，主界面必须另有可见开关（否则界面上「看不到开关」）

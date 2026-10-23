@@ -35,7 +35,7 @@ class ConfigTests(unittest.TestCase):
     def test_lean_profile_skips_review(self):
         config = load_config(CONFIG_DIR, profile="lean")
         self.assertNotIn("review", config.flow.nodes)
-        # implement 的 pass 分支被自动改接到 review 的后继 test
+        # implement 的 pass 分支本身就是 test（test→review 的边随 review 一起被裁剪）
         self.assertEqual(config.flow.nodes["implement"].target("pass"), "test")
         # 引用被裁剪节点的回退策略被清理
         self.assertNotIn("review", config.collaboration.rollback)

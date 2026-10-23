@@ -250,6 +250,7 @@ class Sandbox:
         timeout: Optional[int] = None,
         env_extra: Optional[Dict[str, str]] = None,
         result_marker: Optional[str] = None,
+        extra_mounts: Optional[List[Tuple[str, ...]]] = None,
     ) -> ExecResult:
         workdir = self.resolve(cwd) if cwd else self.root
         self._check_command(cmd)
@@ -258,7 +259,7 @@ class Sandbox:
         container_name = ""
         if self.backend == "container":
             exec_cmd, exec_cwd, exec_env, container_name = self._container_invocation(
-                cmd, workdir, env, env_extra or {}
+                cmd, workdir, env, env_extra or {}, extra_mounts=extra_mounts
             )
             spawn_kwargs: Dict[str, Any] = {}
         else:
@@ -353,8 +354,14 @@ class Sandbox:
         workdir: Path,
         env: Dict[str, str],
         env_extra: Dict[str, str],
+        *,
+        extra_mounts: Optional[List[Tuple[str, ...]]] = None,
     ) -> Tuple[List[str], str, Dict[str, str], str]:
-        """把宿主命令改写成 ``docker run`` 调用；返回 (argv, client_cwd, client_env, name)。"""
+        """把宿主命令改写成 ``docker run`` 调用；返回 (argv, client_cwd, client_env, name)。
+
+        ``extra_mounts`` 只给框架自己的取证通道用（如 runner 的证据目录）：
+        这些目录刻意不在 ``/workspace`` 内，避免生成代码把结果写进模型工作区。
+        """
         relative = workdir.relative_to(self.root)
         container_cwd = "/workspace" if str(relative) in ("", ".") else f"/workspace/{relative.as_posix()}"
         inner = [self._container_executable(cmd[0])]
@@ -381,6 +388,14 @@ class Sandbox:
         if self.container["pids_limit"] > 0:
             argv += ["--pids-limit", str(self.container["pids_limit"])]
         argv += ["-v", f"{self.root}:/workspace:rw", "-w", container_cwd]
+        for mount in (extra_mounts or []):
+            # 2 元组默认 rw（既有行为）；3 元组显式指定 ro/rw——隐藏套件必须只读挂载，
+            # 否则被测代码在验收时仍能改写自己的隐藏用例。
+            host_path, container_path = mount[0], mount[1]
+            mode = str(mount[2]) if len(mount) > 2 else "rw"
+            if mode not in {"ro", "rw"}:
+                raise SandboxError(f"非法的挂载模式: {mode!r}（只支持 ro / rw）")
+            argv += ["-v", f"{Path(host_path).resolve()}:{container_path}:{mode}"]
         for key, value in sorted(self._container_env(env_extra).items()):
             argv += ["-e", f"{key}={value}"]
         argv += [self.container["image"]] + inner

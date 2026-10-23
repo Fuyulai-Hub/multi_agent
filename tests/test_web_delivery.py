@@ -167,9 +167,14 @@ class ProductRoutingTests(_CtxMixin, unittest.TestCase):
     def _apply_product(self, shape=None):
         agent = ProductAgent(self.ctx)
         spec = {
-            "id": "REQ-WEB", "title": "web 需求",
-            "function_points": [{"id": "FP-01", "title": "页面",
-                                 "samples": [{"input": "GET /", "expect": "200"}]}],
+            "id": "REQ-WEB", "title": "web 需求", "package": "web_shop",
+            "function_points": [{
+                "id": "FP-01", "title": "页面",
+                "samples": [{"input": "GET /", "expect": "200"}],
+                # 需求契约（门禁加固）：原文只有一行 → 唯一条款 C-01
+                "acceptance_criteria": ["GET / 返回 200"],
+                "source_spans": [{"clause_id": "C-01"}],
+            }],
         }
         if shape is not None:
             spec["delivery_shape"] = shape

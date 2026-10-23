@@ -27,6 +27,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import SystemConfig
+from ..contract import extract_clauses
 from ..prompts import PromptBundle
 from .ops import OPS, HELPERS, match_op, ops_for_spec
 
@@ -77,6 +78,7 @@ class OfflineProvider:
             "code_review": self._code_review,
             "design_review": self._design_review,
             "test_suite": self._test_suite,
+            "hidden_test_suite": self._hidden_test_suite,
             "acceptance_signoff": self._acceptance_signoff,
             "consultation": self._consultation,
             "acceptance_report": self._acceptance_report,
@@ -207,14 +209,34 @@ class OfflineProvider:
         if re.search(r"python", keywords, re.IGNORECASE):
             tags.append("python")
 
+        # 需求契约（门禁加固）：条款索引是确定性编号，功能点按章节标题归属条款；
+        # 技术约束/异常边界/验收标准这类全局条款映射到全部功能点（它们对所有 FP 生效）。
+        clauses = extract_clauses(text)
+        fp_sections = {str(fp.get("title", "")) for fp in function_points}
+        global_clauses = [item for item in clauses if str(item.get("section", "")) not in fp_sections]
+        for fp in function_points:
+            spans = [
+                {"clause_id": item["id"]}
+                for item in clauses
+                if str(item.get("section", "")) == str(fp.get("title", ""))
+            ]
+            spans.extend({"clause_id": item["id"]} for item in global_clauses)
+            fp["source_spans"] = spans
+            acceptance = [str(item) for item in (fp.get("acceptance") or []) if str(item).strip()]
+            fp["acceptance_criteria"] = acceptance or [
+                f"规则全部满足：{rule}" for rule in fp.get("rules", [])
+            ] or [f"{fp.get('id')} 行为与需求样例一致"]
+
         return {
             "id": f"REQ-{_sha(title)}",
             "title": title,
+            "package": self.package,
             "background": background,
             "constraints": constraints,
             "quality_requirements": quality_requirements,
             "tags": sorted(set(tags)),
             "function_points": function_points,
+            "out_of_scope": [],
             "acceptance_criteria": [
                 {"id": f"AC-{index + 1:02d}", "description": item}
                 for index, item in enumerate(criteria)
@@ -229,6 +251,7 @@ class OfflineProvider:
                 "acceptance_criteria": len(criteria),
                 "open_questions": len(questions),
                 "samples": sum(len(fp["samples"]) for fp in function_points),
+                "clauses": len(clauses),
             },
             "parser": "offline-markdown-rules",
         }
@@ -363,9 +386,11 @@ class OfflineProvider:
             key in actions for key in ("avoid_missing_module_docstring", "avoid_missing_function_docstring")
         )
 
-        # ---- 缺陷注入决策：首轮与审查返工轮均保留未知缺陷，直到缺陷单出现或经验守护生效
+        # ---- 缺陷注入决策：只在首轮草稿注入未知缺陷，直到缺陷单出现或经验守护生效。
+        # 流程已调整为 test 后再 review：rework 是审查驳回后的返工，此时测试刚通过，
+        # 再注入缺陷会凭空制造一轮 test→optimize 循环，不代表真实缺陷修复语义。
         buggy_ops = set()
-        if inject_defect and mode in ("first", "rework"):
+        if inject_defect and mode == "first":
             for op_key in defect_ops:
                 op = matched.get(op_key)
                 if not op or not op.get("bug_impl"):
@@ -377,17 +402,19 @@ class OfflineProvider:
                 buggy_ops.add(op_key)
 
         with_docstrings = True
-        if mode == "first" and strip_docstrings and not know_docstring_rule:
+        # test 后再 review：首轮与缺陷修复轮都可能缺少文档字符串，由审查驳回后
+        # 的 rework 补齐（与旧流程「review 驳回 → rework」的观测一致）。
+        if mode in ("first", "fix") and strip_docstrings and not know_docstring_rule:
             with_docstrings = False
         if mode == "rework":
-            with_docstrings = True   # 针对审查驳回（缺文档字符串）的返工
+            with_docstrings = True
 
         fp_mapping: Dict[str, str] = {}
         op_by_fp: Dict[str, str] = {}
         for fp in fps:
             op_key = fp.get("op_key") or match_op(fp)
             if op_key and op_key in matched:
-                fp_mapping[fp["id"]] = op_key
+                fp_mapping[fp["id"]] = f"{self.package}/core.py::{op_key}"
                 op_by_fp[op_key] = fp["id"]
 
         core_source = self._build_core(
@@ -573,10 +600,48 @@ class OfflineProvider:
         }
 
     # ================================================================= 测试用例
-    def _test_suite(self, bundle: PromptBundle, context: Dict[str, Any]) -> Dict[str, Any]:
+    def _hidden_test_suite(self, bundle: PromptBundle, context: Dict[str, Any]) -> Dict[str, Any]:
+        """隐藏套件（离线）：同一契约推导，但只接受可执行用例，文件名与可见套件区分。"""
+        spec = context.get("spec") or {}
+        package = str(context.get("package") or spec.get("package") or self.package)
+        data = self._test_suite(bundle, context, package=package)
+        executable = [case for case in data.get("cases", []) if case.get("call")]
+        covered = {case.get("fp_id") for case in executable if case.get("category") == "functional"}
+        missing = [
+            fp.get("id") for fp in spec.get("function_points", [])
+            if fp.get("id") and fp.get("id") not in covered
+        ]
+        if missing:
+            raise ValueError(
+                "隐藏用例无法从契约推出可执行功能用例（离线算子库未匹配）: "
+                + ", ".join(str(item) for item in missing)
+            )
+        data["cases"] = executable
+        by_category: Dict[str, int] = {}
+        for case in executable:
+            by_category[case["category"]] = by_category.get(case["category"], 0) + 1
+        data["case_count"] = {
+            "total": len(executable),
+            "functional": by_category.get("functional", 0),
+            "exception": by_category.get("exception", 0),
+            "boundary": by_category.get("boundary", 0),
+        }
+        data["files"] = [{
+            "path": f"tests/test_hidden_{package}.py",
+            "content": data["files"][0]["content"],
+        }]
+        data["negotiation"] = {"questions": [], "answers": [], "open": 0, "status": "closed"}
+        data["derived_from"] = "frozen-requirement-contract（仅契约规则/样例/阈值三态）"
+        return data
+
+    def _test_suite(
+        self, bundle: PromptBundle, context: Dict[str, Any], *,
+        package: Optional[str] = None,
+    ) -> Dict[str, Any]:
         spec = context.get("spec") or {}
         policies = context.get("policies") or {}
         epsilon = float(policies.get("boundary_epsilon", 0.01))
+        package = str(package or self.package)
         matched = ops_for_spec(spec)
         fps = spec.get("function_points", [])
 
@@ -624,7 +689,7 @@ class OfflineProvider:
                     "source": "requirement-sample",
                 })
 
-        test_file = self._build_test_file(spec, matched, cases, fp_by_op)
+        test_file = self._build_test_file(spec, matched, cases, package=package)
         by_category: Dict[str, int] = {}
         for case in cases:
             by_category[case["category"]] = by_category.get(case["category"], 0) + 1
@@ -639,8 +704,8 @@ class OfflineProvider:
             "status": "pending",
         }
         return {
-            "package": self.package,
-            "files": [{"path": f"tests/test_{self.package}.py", "content": test_file}],
+            "package": package,
+            "files": [{"path": f"tests/test_{package}.py", "content": test_file}],
             "cases": cases,
             "case_count": {
                 "total": len(cases),
@@ -715,31 +780,27 @@ class OfflineProvider:
         spec: Dict[str, Any],
         matched: Dict[str, Dict[str, Any]],
         cases: List[Dict[str, Any]],
-        fp_by_op: Dict[str, str],
+        *,
+        package: str = "",
     ) -> str:
         title = spec.get("title", "交付物")
+        package = str(package or self.package)
         import_statement = (
-            f"from {self.package} import {', '.join(sorted(matched.keys()))}"
+            f"from {package} import {', '.join(sorted(matched.keys()))}"
             if matched else "# （无可自动化的功能点）"
         )
         lines: List[str] = [
             f'"""{title} 业务测试用例。',
             "",
             "由测试 Agent 依据需求契约（功能点规则/样例/阈值三态）生成，覆盖功能 / 异常 / 边界三类。",
-            '执行：python tests/test_....py [--only 名称子串,名称子串]',
+            "本文件只定义用例：执行与取证由框架 runner 按冻结清单完成，stdout 不作为证据。",
             '"""',
             "from __future__ import annotations",
             "",
-            "import json",
-            "import sys",
-            "import time",
-            "import traceback",
             "import unittest",
             "from decimal import Decimal",
             "",
             import_statement,
-            "",
-            'MARKER = "<<<MASS_RESULT>>>"',
             "",
             "",
             "def _norm(value):",
@@ -760,11 +821,9 @@ class OfflineProvider:
                 continue
             grouped.setdefault(case["fp_id"], []).append(case)
 
-        class_names: Dict[str, str] = {}
         for fp_id, fp_cases in grouped.items():
             op_key = fp_cases[0].get("op", "")
             class_name = f"Test{fp_id.replace('-', '')}{_camel(op_key)}"
-            class_names[class_name] = fp_id
             lines.append(f"class {class_name}(unittest.TestCase):")
             lines.append(f'    """{fp_id} 用例组。"""')
             lines.append("")
@@ -789,83 +848,6 @@ class OfflineProvider:
                 else:
                     lines.append(f"        self.assertEqual(_norm({case['call']}), _norm({case['expect']}))")
                 lines.append("")
-        fp_map = "{" + ", ".join(f'"{name}": "{fp}"' for name, fp in class_names.items()) + "}"
-        runner = '''
-class _CollectResult(unittest.TestResult):
-    def __init__(self):
-        super().__init__()
-        self.records = []
-        self.started = time.time()
-
-    def startTest(self, test):
-        super().startTest(test)
-        self.records.append({"id": test.id(), "status": "passed", "message": ""})
-
-    def _mark(self, test, status, err):
-        for record in self.records:
-            if record["id"] == test.id():
-                record["status"] = status
-                record["message"] = "".join(
-                    traceback.format_exception_only(err[0], err[1])
-                )[-300:].strip()
-
-    def addError(self, test, err):
-        super().addError(test, err)
-        self._mark(test, "error", err)
-
-    def addFailure(self, test, err):
-        super().addFailure(test, err)
-        self._mark(test, "failed", err)
-
-
-def _filter(suite, keywords):
-    filtered = unittest.TestSuite()
-    for item in suite:
-        if isinstance(item, unittest.TestSuite):
-            filtered.addTests(_filter(item, keywords))
-        elif any(keyword in item.id() for keyword in keywords):
-            filtered.addTest(item)
-    return filtered
-
-
-def main():
-    keywords = []
-    if "--only" in sys.argv:
-        keywords = [part for part in sys.argv[sys.argv.index("--only") + 1].split(",") if part]
-    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    if keywords:
-        suite = _filter(suite, keywords)
-    result = _CollectResult()
-    suite.run(result)
-    cases = []
-    for record in result.records:
-        _, class_name, method = record["id"].rsplit(".", 2)[-3:]
-        category = method.split("_", 2)
-        cases.append({
-            "test": method,
-            "class": class_name,
-            "fp_id": FP_BY_CLASS.get(class_name, ""),
-            "category": category[1] if len(category) > 1 else "",
-            "status": record["status"],
-            "message": record["message"],
-        })
-    failed = sum(1 for case in cases if case["status"] != "passed")
-    summary = {
-        "total": result.testsRun,
-        "passed": result.testsRun - failed,
-        "failed": failed,
-        "duration_ms": int((time.time() - result.started) * 1000),
-        "cases": cases,
-    }
-    print(MARKER + json.dumps(summary, ensure_ascii=False))
-    return 0 if failed == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-        lines.append(f"FP_BY_CLASS = {fp_map}")
-        lines.append(runner.strip("\n"))
         lines.append("")
         return "\n".join(lines)
 

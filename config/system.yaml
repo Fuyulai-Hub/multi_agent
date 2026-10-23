@@ -41,10 +41,11 @@ llm:
   downgrade_reasoning_effort: "low,high"
   empty_output_retry: 2             # 最多降级重发几次（0=关闭降级）；与上面的阶梯长度取小者生效
   timeout: 600            # 该端点单次响应实测 150~200s（超时 120s 会导致 implement/optimize 读超时）
-  # function calling（默认关闭）：开启后从 config/mcp.yaml 的 enabled 服务拉取工具清单，
-  # 以 OpenAI tools 格式随请求下发；模型返回 tool_calls 时由 ToolRunner 真实执行并回传。
+  # function calling（默认开启，可在前端「模型配置」弹窗关闭）：开启后从 config/mcp.yaml 的
+  # enabled 服务拉取工具清单，以 OpenAI tools 格式随请求下发；模型返回 tool_calls 时由
+  # ToolRunner 真实执行并回传。无任何工具源时自动降级为无工具运行（发告警事件）。
   # 注意：tools 与 response_format(json_object) 互斥，开启后 JSON 约束改由 Prompt 契约保证。
-  tools_enabled: false
+  tools_enabled: true
   tool_choice: "auto"         # auto | required | {"type":"function","function":{"name":...}}
   tool_max_rounds: 2          # 单次生成的工具调用闭环轮数上限
   tools_nodes: ["intake"]     # 下发 tools 的节点白名单（空列表=全部节点=改造前行为）。
@@ -107,6 +108,14 @@ runtime:
     read_only: true                # 根文件系统只读，/tmp 用 tmpfs
     tmpfs: "/tmp:rw,noexec,nosuid,size=64m"
     user: ""                       # 空=POSIX 当前 uid:gid；Windows 交给 Docker Desktop
+  # 验证凭据签名（docs/37 P0-2 / 门径优化）：
+  #   release_mode=true 时必须有稳定的 MAS_VERIFIER_SECRET（>=32 字符），
+  #   缺失/过短时 Leader 启动即拒绝，绝不退回进程随机密钥；
+  #   也可用 MAS_VERIFIER_RELEASE=1 或 MAS_ENV=release/prod/production 触发 release。
+  #   dev 模式允许进程随机密钥（重启后旧 manifest/attestation 失效，属预期）。
+  #   生产建议把 HMAC 换为 Ed25519 或云 KMS 签名（见 mas/verifier.py 文件头）。
+  verifier:
+    release_mode: false
   # 静态分析并行度（按文件并行，IO 等待型负载；不配则用默认 min(8, cpu+4)）
   sandbox_analyze_workers: null
   # UI 证据采集（docs/15 方案 B）：默认关闭，行为与现状一致。
@@ -141,7 +150,7 @@ runtime:
     # 与上面的文本注入相互独立：文本注入约束「怎么做」（方法本体全文），工具调用提供
     # 「可执行动作」（scripts/*.py）；方法本体无法变成调用，只能走文本路径。
     # 开启后需配合 llm.tools_nodes 决定哪些节点下发工具（tools 与 response_format 互斥）。
-    tools_enabled: false
+    tools_enabled: true
     tools_timeout_s: 60           # 单次技能脚本执行超时（秒），独立于 sandbox_timeout
     max_items: 3                  # 单节点最多注入几个技能（按匹配度降序）
     min_score: 1                  # 匹配度阈值：1=作用域命中即注入
@@ -191,6 +200,16 @@ runtime:
     thought_max_chars: 2000     # 单步思考落事件的字符上限（0=不截断；只影响留痕，不影响回传）
     observation_max_chars: 1500 # 单条观察结果落事件的字符上限（同上）
     require_thought: false      # true=某步未抽出思考时发 react_thought_missing 告警（不阻断）
+  # 运行结束后的飞书通知：飞书群「自定义机器人」Webhook（stdlib urllib，零依赖）。
+  # 失败只落 notify_failed 事件，不改变运行结论；webhook 为空时静默跳过。
+  # 填法：群设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址。
+  # 环境变量可覆盖：FEISHU_WEBHOOK_URL / FEISHU_WEBHOOK_SECRET；MAS_NOTIFY_DISABLE=1 全局静默。
+  notify:
+    feishu:
+      enabled: true
+      webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/b1a4a31f-76b7-4e9a-a4bd-35da4cb0e309"
+      secret: ""                             # 机器人开启「签名校验」时填；仅开关键词校验则留空
+      timeout_s: 10
   # 数据存储后端（docs/25）：MySQL=索引/结构层（经验库/运行索引/产物索引），
   # Redis=跨进程协调层（运行注册表+心跳+取消键）。enabled=false 时全部走既有
   # jsonl/内存路径，行为与现状逐字节一致；任一后端连接失败也自动降级不报错。

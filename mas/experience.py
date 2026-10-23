@@ -72,6 +72,11 @@ RULE_ACTIONS = {
 }
 
 
+#: 当前节点指令逐字点名的经验标签（失败线索）对应的最终分加成。
+#: 这是一条强先验：返工原因必须被优先看到，不能被历史命中次数挤掉。
+_FOCUS_BONUS = 0.25
+
+
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -439,11 +444,19 @@ class ExperienceLibrary:
         role: str,
         tags: Optional[List[str]] = None,
         task_text: str = "",
+        focus_text: str = "",
         tier_keys: Optional[List[str]] = None,
         max_items: Optional[int] = None,
         current_run: str = "",
     ) -> RetrievalResult:
-        """按分层策略检索经验，产出可直接注入 Prompt 的文本。"""
+        """按分层策略检索经验，产出可直接注入 Prompt 的文本。
+
+        ``focus_text`` 是当前节点的具体失败线索（如 Leader 写给返工节点的指令，
+        其中点名了上轮审查规则）。经验标签在 focus_text 中原样出现时视为强相关
+        （见 ``_score`` 的 focus 分量）：流程改为 test 后再 review 后，审查驳回
+        常发生在多条缺陷守护经验之后，仅靠命中次数排序会把这条更贴近返工原因的
+        经验挤出 L1 配额，使其永远没有 hits、无法晋级。
+        """
         self.load() if not self._loaded else None
         if not self.config.enabled or not self.config.injection.get("enabled", True):
             return RetrievalResult(text="", skipped=[{"reason": "learning disabled"}])
@@ -478,7 +491,7 @@ class ExperienceLibrary:
                     result.skipped.append({"id": entry.id, "tier": tier_key, "reason": "非本次运行经验"})
                     continue
                 score, detail = self._score(
-                    entry, role, tags, task_text,
+                    entry, role, tags, task_text, focus_text=focus_text,
                     w_relevance=w_relevance, w_confidence=w_confidence, w_usage=w_usage, w_recency=w_recency,
                 )
                 candidates.append((score * tier.weight, entry, detail))
@@ -525,18 +538,29 @@ class ExperienceLibrary:
         tags: List[str],
         task_text: str,
         *,
+        focus_text: str = "",
         w_relevance: float,
         w_confidence: float,
         w_usage: float,
         w_recency: float,
     ) -> Tuple[float, Dict[str, Any]]:
         role_match = 1.0 if (not entry.roles or role in entry.roles or "all" in entry.roles) else 0.0
+        normalized_tags = {_normalize(tag) for tag in tags}
         tag_overlap = 0.0
         if tags:
-            normalized_tags = {_normalize(tag) for tag in tags}
             entry_tags = {_normalize(tag) for tag in entry.tags}
             tag_overlap = len(normalized_tags & entry_tags) / max(1, len(normalized_tags))
         keyword_overlap = self._semantic_overlap(task_text, f"{entry.lesson}{entry.action}")
+        # 当前节点的具体失败线索（如「上一轮审查阻塞问题：missing_module_docstring」）
+        # 若与经验标签逐字对应，说明该经验正是这次返工的直接教训，按强相关计入。
+        # 已出现在常规检索标签里的标签（域/角色/节点）不算线索，否则每条经验都会命中。
+        focus_overlap = 0.0
+        if focus_text:
+            normalized_focus = _normalize(focus_text)
+            focus_overlap = 1.0 if any(
+                _normalize(tag) not in normalized_tags and _normalize(tag) in normalized_focus
+                for tag in entry.tags if tag
+            ) else 0.0
         relevance = 0.5 * role_match + 0.3 * tag_overlap + 0.2 * min(1.0, keyword_overlap * 3)
         usage = min(1.0, entry.hits / 5.0)
         recency = 0.5
@@ -552,10 +576,15 @@ class ExperienceLibrary:
             + w_usage * usage
             + w_recency * recency
         )
+        # 失败线索加成放在最终分上（而不是塞进 relevance 后截断到 1.0）：当前返工
+        # 原因被指令逐字点名时，即使这条经验置信度低、尚未命中过，也必须优先注入，
+        # 否则它永远拿不到 hits、无法晋级（自学习闭环断裂）。
+        score += _FOCUS_BONUS * focus_overlap
         detail = {
             "role_match": round(role_match, 2),
             "tag_overlap": round(tag_overlap, 2),
             "keyword_overlap": round(keyword_overlap, 3),
+            "focus_overlap": round(focus_overlap, 2),
             "confidence": entry.confidence,
             "hits": entry.hits,
         }

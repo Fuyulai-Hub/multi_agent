@@ -152,7 +152,8 @@ class FrontendWiringTests(unittest.TestCase):
                            "cfg-react-max-steps", "cfg-react-note"):
             self.assertIn(f'id="{control_id}"', html, control_id)
             self.assertIn(f'"#{control_id}"', js, control_id)
-        self.assertGreaterEqual(len(re.findall(r'fetch\("/api/react"', js)), 2)   # GET + POST
+        # GET + POST 两个调用点；接口路径前可能带部署基址（前后端分离的 ?api=），故只匹配路径本身
+        self.assertGreaterEqual(len(re.findall(r'fetch\([^;\n]*"/api/react"', js)), 2)
         self.assertIn("enabled: $(CFG.reactEnabled).checked", js)
         self.assertIn("require_thought: $(CFG.reactRequireThought).checked", js)
         self.assertIn("max_steps: Number($(CFG.reactMaxSteps).value)", js)

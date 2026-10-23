@@ -592,19 +592,20 @@ class PermissionAndRetryTests(unittest.TestCase):
         self.assertTrue(leader._rollback_permitted("implement", node, "solution", agents_ok, events, 1))
 
     def test_only_declared_rollback_edges_count_as_rollback(self):
-        """普通转发边（optimize→test 修复闭环、implement→review 失败中转）不是回退。
+        """普通转发边（optimize→test 修复闭环、implement→test 失败中转）不是回退。
 
         attempt03 实测：optimize 修复后再测试被 _is_rollback 误判为回退，
         developer 无回退权限 → permission_denied → 闭环终止。修复后只有
         collaboration.rollback 声明的边（review/test/acceptance）才走回退策略。
+        流程已改为 test 后再 review：implement/test 的通过分支都是正常的向前流转。
         """
         with tempfile.TemporaryDirectory() as tmp:
             config = load_config(PROJECT_ROOT / "config", workspace=Path(tmp) / "ws")
             leader = Leader(config)
             # optimize → test：修复闭环的再测试，是迭代不是回退
             self.assertFalse(leader._is_rollback("optimize", "test", {"test": 1}, {}))
-            # implement → review：实现失败中转审查，是迭代不是回退
-            self.assertFalse(leader._is_rollback("implement", "review", {"review": 1}, {}))
+            # implement → test：实现失败后进入测试定位，是正常向前流转
+            self.assertFalse(leader._is_rollback("implement", "test", {"test": 1}, {}))
             # 三条显式回退边仍然是回退（次数受各自 max_attempts 约束）
             self.assertTrue(leader._is_rollback("review", "implement", {}, {}))
             self.assertTrue(leader._is_rollback("test", "optimize", {}, {}))

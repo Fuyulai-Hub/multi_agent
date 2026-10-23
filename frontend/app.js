@@ -1,6 +1,24 @@
 /* 多 Agent 协作系统前端面板 */
 const $ = (sel) => document.querySelector(sel);
 
+/* ---------------- 部署定位：同源托管与前后端分离共用同一份代码 ----------------
+   ?api=<后端地址>   接口基址，默认空串 = 同源（行为与改造前完全一致）；
+                     分离部署时指向 backend/server.py 的地址（该服务带 CORS 头）。
+   ?static=<路径根>  后端可见的路径根。上传接口返回的是**后端视角**的绝对路径，
+                     前后端同一台机器时无需填写；不同机器部署时填后端上的项目根，
+                     例如 ?static=/home/ops/multi_agent，前端按 workspace/uploads/<文件名> 拼接。
+   不要把 localhost 写死——局域网/手机访问时 localhost 指向访问者自己的机器。 */
+const PARAMS = new URLSearchParams(location.search);
+const API_BASE = (PARAMS.get("api") || "").replace(/\/+$/, "");
+const STATIC_BASE = (PARAMS.get("static") || "").replace(/\/+$/, "");
+
+/* 把上传返回的路径换成后端能解析的形式（STATIC_BASE 为空时原样返回）。 */
+function backendPath(absPath) {
+  if (!STATIC_BASE) return absPath;
+  const name = String(absPath || "").split(/[\\/]/).pop();
+  return name ? `${STATIC_BASE}/workspace/uploads/${name}` : absPath;
+}
+
 const state = {
   runs: [],
   selectedRun: null,
@@ -16,6 +34,8 @@ const state = {
   },
   // 当前生效的技能开关（与 system.yaml 的 runtime.skills.* 同名同义）
   skills: { enabled: false, tools_enabled: false },
+  // 当前生效的工具调用总开关（system.yaml 的 llm.tools_enabled）
+  tools: { enabled: false },
   // 当前生效的 ReAct 开关（enabled/max_steps/require_thought 可写；nodes/tools_nodes 只读回显）
   react: { enabled: false, max_steps: 4, require_thought: false, nodes: [], tools_nodes: [] },
 };
@@ -41,7 +61,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
 
 /* ---------------- 运行列表与详情 ---------------- */
 async function loadRuns() {
-  const res = await fetch("/api/runs");
+  const res = await fetch(API_BASE + "/api/runs");
   state.runs = await res.json();
   renderChat();   // 对话区里运行记录的状态随列表一起刷新
   const ul = $("#runs");
@@ -142,7 +162,7 @@ async function selectRun(runId) {
   document.querySelectorAll(".run-item").forEach((el, i) => {
     el.classList.toggle("selected", state.runs[i] && state.runs[i].run_id === runId);
   });
-  const res = await fetch(`/api/run?id=${encodeURIComponent(runId)}`);
+  const res = await fetch(API_BASE + `/api/run?id=${encodeURIComponent(runId)}`);
   const detail = await res.json();
   // 数据无变化时跳过重绘（避免轮询打断用户展开的折叠面板/滚动位置）
   const key = `${runId}|${(detail.events || []).length}|${(detail.llm_traces || []).length}|${detail.finished}`;
@@ -242,7 +262,7 @@ async function cancelRun(runId) {
   renderCache.runId = null;   // 强制重绘：按钮立即切到「终止中…」
   if (state.selectedRun === runId) await selectRun(runId);
   try {
-    const res = await fetch("/api/run/cancel", {
+    const res = await fetch(API_BASE + "/api/run/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ run_id: runId }),
@@ -382,6 +402,7 @@ const CFG = {
   apiKey: "#cfg-api-key", model: "#cfg-model", tokenName: "#cfg-token-name",
   status: "#cfg-status", modelList: "#cfg-model-list", contextWindow: "#cfg-context-window",
   skillsEnabled: "#cfg-skills-enabled", skillsToolsEnabled: "#cfg-skills-tools-enabled",
+  toolsEnabled: "#cfg-tools-enabled",
   reactEnabled: "#cfg-react-enabled", reactRequireThought: "#cfg-react-require-thought",
   reactMaxSteps: "#cfg-react-max-steps", reactNote: "#cfg-react-note",
 };
@@ -393,24 +414,31 @@ function setCfgStatus(text, cls) {
 }
 
 async function fetchLlmConfig() {
-  const res = await fetch("/api/llm");
+  const res = await fetch(API_BASE + "/api/llm");
   return res.json();
 }
 
 /* 技能开关（system.yaml 的 runtime.skills.enabled / tools_enabled，字段同名同义） */
 async function fetchSkillsConfig() {
-  const res = await fetch("/api/skills");
+  const res = await fetch(API_BASE + "/api/skills");
   return res.json();
 }
 
-/* tools_enabled 依赖 enabled（后端双开才注册技能工具）：总开关关闭时置灰，避免误存无效组合 */
+/* 工具调用总开关（system.yaml 的 llm.tools_enabled，字段同名同义） */
+async function fetchToolsConfig() {
+  const res = await fetch(API_BASE + "/api/tools");
+  return res.json();
+}
+
+/* 技能工具需三开同时成立（技能总开关 ∧ 技能工具开关 ∧ 工具调用总开关）：
+   任一关闭即置灰，避免存出无效组合 */
 function syncSkillsSwitchState() {
-  $(CFG.skillsToolsEnabled).disabled = !$(CFG.skillsEnabled).checked;
+  $(CFG.skillsToolsEnabled).disabled = !$(CFG.skillsEnabled).checked || !$(CFG.toolsEnabled).checked;
 }
 
 /* ReAct 开关（system.yaml 的 runtime.react.enabled / max_steps / require_thought，字段同名同义） */
 async function fetchReactConfig() {
-  const res = await fetch("/api/react");
+  const res = await fetch(API_BASE + "/api/react");
   return res.json();
 }
 
@@ -456,7 +484,7 @@ async function toggleSkills() {
   const el = $("#skills-toggle");
   const enabled = el.checked;
   try {
-    const res = await fetch("/api/skills", {
+    const res = await fetch(API_BASE + "/api/skills", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -489,7 +517,7 @@ async function toggleSkills() {
 
 /* 用弹窗里填写的（留空则用已保存的）凭据探测 /models，拿到该 Key 支持的模型列表 */
 async function fetchModels(apiKey, baseUrl) {
-  const res = await fetch("/api/llm/test", {
+  const res = await fetch(API_BASE + "/api/llm/test", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ api_key: apiKey || null, base_url: baseUrl || null }),
@@ -558,9 +586,10 @@ function openSettings() {
   setCfgStatus("正在读取当前配置……", "");
   Promise.all([
     fetchLlmConfig(),
+    fetchToolsConfig().catch(() => null),   // 工具调用总开关读取失败不阻塞弹窗
     fetchSkillsConfig().catch(() => null),   // 技能开关读取失败不阻塞弹窗，保存仍按表单值写入
     fetchReactConfig().catch(() => null),    // ReAct 开关同理
-  ]).then(([cfg, skills, react]) => {
+  ]).then(([cfg, tools, skills, react]) => {
     state.llm.apiKeySet = !!cfg.api_key_set;
     state.llm.apiKeyMasked = cfg.api_key_masked || "";
     $(CFG.provider).value = cfg.provider || "offline";
@@ -574,6 +603,10 @@ function openSettings() {
     $(CFG.apiKey).placeholder = cfg.api_key
       ? "输入新的 API Key（留空表示沿用已保存值）"
       : (cfg.api_key_masked ? `已保存 ${cfg.api_key_masked}（留空沿用）` : "输入你的 API Key");
+    if (tools) {
+      state.tools.enabled = !!tools.enabled;
+      $(CFG.toolsEnabled).checked = state.tools.enabled;
+    }
     if (skills) {
       $(CFG.skillsEnabled).checked = !!skills.enabled;
       $(CFG.skillsToolsEnabled).checked = !!skills.tools_enabled;
@@ -620,8 +653,11 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && !$(CFG.overlay).hidden) closeSettings();
 });
 
-/* 技能总开关联动：关闭时置灰「技能工具调用」勾选框（值保留，后端双开才生效） */
+/* 技能总开关联动：关闭时置灰「技能工具调用」勾选框（值保留，后端三开才生效） */
 $(CFG.skillsEnabled).addEventListener("change", syncSkillsSwitchState);
+
+/* 工具调用总开关联动：关闭时同样置灰「技能工具调用」（同上，需三开） */
+$(CFG.toolsEnabled).addEventListener("change", syncSkillsSwitchState);
 
 /* ReAct 总开关联动：关闭时置灰「强制思考」与「最大步数」，并重算生效节点提示 */
 $(CFG.reactEnabled).addEventListener("change", () => {
@@ -679,7 +715,7 @@ $("#cfg-save").addEventListener("click", async () => {
   }
   setCfgStatus("正在保存……", "running");
   try {
-    const res = await fetch("/api/llm", {
+    const res = await fetch(API_BASE + "/api/llm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -702,12 +738,24 @@ $("#cfg-save").addEventListener("click", async () => {
     state.llm.contextWindow = data.context_window || state.llm.contextWindow;
     updateContextUsage(state.llm.lastTraces);   // 改了上下文窗口立即重算进度条
     // 技能开关与模型配置同一次保存写回 system.yaml（下一次运行生效，无需重启服务）
-    const skillsRes = await fetch("/api/skills", {
+    // 工具调用总开关先落盘：技能工具开关的最终值取决于它（三开才注册技能工具）
+    const toolsRes = await fetch(API_BASE + "/api/tools", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: $(CFG.toolsEnabled).checked }),
+    });
+    const toolsData = await toolsRes.json();
+    if (!toolsRes.ok) {
+      setCfgStatus(toolsData.error || "工具调用开关保存失败（模型配置已保存）", "error");
+      return;
+    }
+    state.tools.enabled = !!toolsData.enabled;
+    const skillsRes = await fetch(API_BASE + "/api/skills", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         enabled: $(CFG.skillsEnabled).checked,
-        tools_enabled: $(CFG.skillsToolsEnabled).checked,
+        tools_enabled: $(CFG.skillsToolsEnabled).checked && state.tools.enabled,
       }),
     });
     const skillsData = await skillsRes.json();
@@ -716,7 +764,7 @@ $("#cfg-save").addEventListener("click", async () => {
       return;
     }
     // ReAct 开关同上：与模型配置、技能开关同一次保存写回 system.yaml
-    const reactRes = await fetch("/api/react", {
+    const reactRes = await fetch(API_BASE + "/api/react", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -736,6 +784,7 @@ $("#cfg-save").addEventListener("click", async () => {
     $("#skills-toggle").checked = state.skills.enabled;
     setCfgStatus(
       `已保存：${data.provider}${data.model ? " / " + data.model : ""}${data.api_key_masked ? " · Key " + data.api_key_masked : ""}` +
+      `｜工具调用 ${toolsData.enabled ? "开" : "关"}` +
       `｜技能 ${skillsData.enabled ? "开" : "关"}${skillsData.tools_enabled ? "（含工具调用）" : ""}` +
       `｜ReAct ${reactData.enabled ? "开" : "关"}${reactData.enabled ? `（≤${reactData.max_steps} 步）` : ""}`,
       "done"
@@ -809,7 +858,7 @@ async function startRun() {
   btn.disabled = true;   // 仅在提交请求期间禁用，发起后立即可继续输入新需求
   setComposerStatus("正在启动流水线……", "running");
   try {
-    const res = await fetch("/api/run", {
+    const res = await fetch(API_BASE + "/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -887,7 +936,7 @@ $("#new-requirement").addEventListener("keydown", (ev) => {
   }
 });
 $("#load-example").addEventListener("click", async () => {
-  const res = await fetch("/api/example");
+  const res = await fetch(API_BASE + "/api/example");
   const text = await res.text();
   if (text) {
     $("#new-requirement").value = text;
@@ -919,7 +968,7 @@ async function cancelUpload() {
   syncUploadUi();
   $("#upload-doc").value = "";   // 允许重新选择同一文件
   try {
-    const res = await fetch("/api/upload/remove", {
+    const res = await fetch(API_BASE + "/api/upload/remove", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: upload.path }),
@@ -963,7 +1012,7 @@ async function uploadDocFile(file, nameOverride) {
   setUploadName(`正在上传 ${name} ……`, "running");
   try {
     const content_base64 = await fileToBase64(file);
-    const res = await fetch("/api/upload", {
+    const res = await fetch(API_BASE + "/api/upload", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ filename: name, content_base64 }),
@@ -975,7 +1024,7 @@ async function uploadDocFile(file, nameOverride) {
       setUploadName(data.error || "上传失败", "error");
       return false;
     }
-    state.upload = { path: data.path, name: data.name };
+    state.upload = { path: backendPath(data.path), name: data.name };
     syncUploadUi();   // 出现「取消上传」按钮（上传错误时可撤销本次上传）
     setUploadName(`已选择：${data.name}（${data.kind}，发送时将替代输入框内容）`, "done");
     return true;
@@ -1046,7 +1095,7 @@ async function uploadImageFile(file, nameOverride) {
   setUploadName(`正在上传 ${name} ……`, "running");
   try {
     const dataUrl = await fileToDataUrl(file);
-    const res = await fetch("/api/upload_image", {
+    const res = await fetch(API_BASE + "/api/upload_image", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1059,7 +1108,7 @@ async function uploadImageFile(file, nameOverride) {
       setUploadName(data.error || "上传失败", "error");
       return false;
     }
-    state.images.push({ path: data.path, name: data.name, bytes: data.bytes, dataUrl });
+    state.images.push({ path: backendPath(data.path), name: data.name, bytes: data.bytes, dataUrl });
     return true;
   } catch (err) {
     setUploadName(`上传失败：${err.message}`, "error");
@@ -1125,7 +1174,7 @@ $("#new-requirement").addEventListener("paste", async (ev) => {
 
 /* ---------------- 经验库 ---------------- */
 async function loadExperience() {
-  const res = await fetch("/api/experience");
+  const res = await fetch(API_BASE + "/api/experience");
   state.experience = await res.json();
   renderExperience();
 }
@@ -1172,7 +1221,7 @@ function renderExperience() {
 
 /* ---------------- 自学习报告 ---------------- */
 async function loadLearning() {
-  const [metricsRes, reportRes] = await Promise.all([fetch("/api/metrics"), fetch("/api/learning-report")]);
+  const [metricsRes, reportRes] = await Promise.all([fetch(API_BASE + "/api/metrics"), fetch(API_BASE + "/api/learning-report")]);
   const metrics = await metricsRes.json();
   const report = await reportRes.text();
   renderMetricsChart(metrics);

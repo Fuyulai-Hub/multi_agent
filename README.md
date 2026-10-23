@@ -91,7 +91,16 @@ MAS_PANEL_TOKEN="换成一个随机长令牌" python frontend/server.py --host 0
 
 # ④ 同时指定数据目录（默认 <项目根>/workspace）
 python frontend/server.py --port 8080 --workspace workspace
+
+# ⑤ 前后端分离：后端只提供 /api/*，页面由独立宿主提供
+MAS_PANEL_TOKEN="换成一个随机长令牌" MAS_PANEL_ORIGINS="http://127.0.0.1:8001" \
+  python frontend/server.py --port 8000 --no-static
+python -m http.server 8001 --bind 127.0.0.1 --directory frontend
+#    浏览器打开 http://127.0.0.1:8001/index.html?api=http://127.0.0.1:8000&token=<令牌>
 ```
+
+> 分离模式下 `MAS_PANEL_ORIGINS` 必须显式列出前端宿主地址，否则跨源请求被 403 拒绝
+> （失败关闭：默认只允许同源）。前端地址里的 `api=` 参数指定后端，不填则视为同源。
 
 启动成功后终端会打印实际访问地址：
 
@@ -108,8 +117,10 @@ python frontend/server.py --port 8080 --workspace workspace
 | `--port` | `8000` | HTTP 监听端口；被占用时改用其他空闲端口（如 `8080`、`9000`） |
 | `--host` | `127.0.0.1` | 监听地址；`127.0.0.1` 仅本机可访问，改成 `0.0.0.0` 开放局域网访问（必须配令牌） |
 | `--workspace` | `<项目根>/workspace` | 面板读取的运行数据目录，应与 `python -m mas run/demo` 的产出目录一致 |
+| `--dist` | `frontend/` | 静态资源目录；页面迁出时指向新目录即可，接口路径不变 |
+| `--no-static` | 关 | 只提供 `/api/*`，不托管页面（前后端分离部署） |
 | `MAS_PANEL_TOKEN` | 空 | 面板访问令牌；非回环 `--host` 下为必填，空值会拒绝启动 |
-| `MAS_PANEL_ORIGINS` | 空 | 额外允许的跨域来源，逗号分隔（默认只允许同源） |
+| `MAS_PANEL_ORIGINS` | 空 | 额外允许的跨域来源，逗号分隔（默认只允许同源；分离部署必须配置） |
 
 > 端口、监听地址与数据目录**只能通过命令行参数指定**；只有访问令牌与跨域白名单走环境变量。
 > 面板没有对应的 `mas` CLI 子命令，必须直接运行 `frontend/server.py`。
@@ -129,13 +140,15 @@ python frontend/server.py --port 8080 --workspace workspace
 ## 流程与状态机
 
 ```text
-intake(产品) ─▶ solution(研发) ─▶ implement(研发) ─▶ review(评审) ─▶ test(测试) ─▶ acceptance(门禁) ─▶ report(报告)
-                    ▲                │    ▲            │                 │              │
-                    └── 审查驳回 ────┘    └── 测试失败/验收驳回 ──▶ optimize(研发: 修复+回归自测) ─┘
-                                             修复后重新测试，直至门禁通过
+intake(产品) ─▶ solution(研发) ─▶ implement(研发) ─▶ test(测试) ─▶ review(评审) ─▶ acceptance(门禁) ─▶ report(报告)
+                    ▲                │                  │    ▲            │              │
+                    │                │                  │    └── 审查驳回 ┘              │
+                    └── 测试失败/验收驳回 ──▶ optimize(研发: 修复+回归自测) ───────────────┘
+                                             修复后重新测试 → 重新审查，直至门禁通过
 ```
 
-- **审查不通过** → 退回研发修改（阻塞问题清零才能放行）
+- **先测试后审查**：审查必须拿到“冻结测试真实通过”的证据，才能核验功能点是否被测试 import/使用
+- **审查不通过** → 退回研发修改（阻塞问题清零才能放行）；审查结论带 `code_hash`，门禁会与最终代码重算值比对，旧审查不能给新代码签字
 - **测试失败** → 生成缺陷单（复现/期望/实际/堆栈）→ 退回研发修复 → 研发输出对应回归自测报告 → 测试复测闭环
 - **验收不通过** → 退回上一步优化并重新执行（门禁项、次数、升级策略全部可配置）
 - **回退次数耗尽** → 按升级策略 `fail_run_and_report` 出具“验收不通过”报告并标注原因

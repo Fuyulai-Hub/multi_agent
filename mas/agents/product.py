@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
+from ..contract import (
+    CONTRACT_RELATIVE,
+    ContractError,
+    extract_clauses,
+    freeze_contract,
+    validate_contract,
+)
+from ..hidden import HiddenSuiteError, build_generation_prompt, create_hidden_suite
 from ..intent import (
     DEFAULT_DELIVERY_SHAPE,
     DELIVERY_SHAPES,
@@ -12,10 +20,31 @@ from ..intent import (
 )
 from ..llm import Generation
 from ..projectdocs import directive_shape
+from ..prompts import PromptBundle
 from ..schemas import AgentResult, NodeTask
 from .base import BaseAgent, Perception
 
 __all__ = ["ProductAgent"]
+
+
+def _clause_index_section(clauses: List[Dict[str, Any]]) -> str:
+    """把确定性条款索引注入 Prompt（模型可引用的唯一编号来源）。"""
+    lines = [
+        "## 原始需求条款索引（框架按原文确定性抽取，编号不可改写）",
+        "",
+        "每个条款要么被某个功能点 ``source_spans`` 引用，要么写入 ``out_of_scope`` 并给出理由；"
+        "两份清单合起来必须覆盖下表全部 clause_id。",
+        "",
+        "| clause_id | 行号 | 章节 | 原文 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for clause in clauses:
+        text = str(clause.get("text", "")).replace("|", "\\|")
+        section = str(clause.get("section", "")).replace("|", "\\|")
+        lines.append(
+            f"| {clause.get('id', '')} | {clause.get('line', '')} | {section} | {text} |"
+        )
+    return "\n".join(lines)
 
 
 class ProductAgent(BaseAgent):
@@ -32,6 +61,7 @@ class ProductAgent(BaseAgent):
             "background": ["业务背景"],
             "constraints": ["技术约束"],
             "tags": ["领域标签"],
+            "package": "交付包名（Python import 名，如 order_pricing）",
             "function_points": [
                 {
                     "id": "FP-01",
@@ -44,9 +74,12 @@ class ProductAgent(BaseAgent):
                     "samples": [{"input": "样例输入", "expect": "期望输出"}],
                     "category": "功能/异常/边界",
                     "acceptance": ["功能点级验收要点"],
+                    "acceptance_criteria": ["该功能点可验证的验收要点（非空）"],
+                    "source_spans": [{"clause_id": "C-01", "quote": "原始需求条款的原文片段"}],
                     "ambiguous": False,
                 }
             ],
+            "out_of_scope": [{"clause_id": "C-xx", "reason": "明确不做的原因（无则空数组）"}],
             "acceptance_criteria": [{"id": "AC-01", "description": "验收标准"}],
             "open_questions": [{"id": "Q-1", "question": "待澄清问题"}],
             "metrics": {"function_points": 0},
@@ -75,6 +108,23 @@ class ProductAgent(BaseAgent):
             if item.get("path")
         ]
         return {"requirement_text": text, "source": source, "intent_hint": hint, "images": images}
+
+    def build_prompt(self, task: NodeTask, perception: Perception, experience: Any) -> PromptBundle:
+        """在通用 Prompt 后追加确定性条款索引（需求原文为空时不追加，Prompt 不变）。"""
+        bundle = super().build_prompt(task, perception, experience)
+        text = str((perception.found.get("requirement_source") or {}).get("text", ""))
+        clauses = extract_clauses(text) if text.strip() else []
+        if not clauses:
+            return bundle
+        section = _clause_index_section(clauses)
+        bundle.user += "\n\n" + section
+        if bundle.path:
+            try:
+                with bundle.path.open("a", encoding="utf-8") as fh:
+                    fh.write("\n\n" + section)
+            except OSError:
+                pass          # 留痕失败不影响需求分析
+        return bundle
 
     def apply(
         self,
@@ -137,6 +187,79 @@ class ProductAgent(BaseAgent):
                 result.summary = result.error
                 return
 
+        # 需求契约（门禁加固）：原文条款 → FP 映射 → 冻结签名 → 独立隐藏用例。
+        # 需求原文为空只可能来自直接调用 Agent 的单元测试；生产 run 的 intake 必发原文，
+        # 且门禁硬性要求已签名契约，因此退化分支无法绕过门禁。
+        requirement_text = str(context.get("requirement_text") or "")
+        if requirement_text.strip():
+            outcome = validate_contract(spec, requirement_text)
+            if not outcome["valid"]:
+                result.status = "fail"
+                result.error = "需求契约校验失败：" + "；".join(outcome["errors"][:8])
+                result.summary = result.error
+                result.metrics["contract_errors"] = outcome["errors"]
+                self.ctx.events.emit(
+                    "requirement_contract_rejected", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="error",
+                    payload={"errors": outcome["errors"][:20],
+                             "coverage": outcome["coverage"]},
+                )
+                return
+            try:
+                frozen = freeze_contract(
+                    self.ctx.run_dir, spec, requirement_text,
+                    run_id=str(self.ctx.run_id), config=self.ctx.config,
+                    clauses=outcome["clauses"],
+                )
+            except ContractError as exc:
+                result.status, result.error = "fail", str(exc)
+                result.summary = result.error
+                return
+            contract_artifact = {
+                "path": CONTRACT_RELATIVE.as_posix(),
+                "run_id": str(frozen.get("run_id") or ""),
+                "frozen_at": str(frozen.get("frozen_at") or ""),
+                "requirement_hash": str(frozen.get("requirement_hash") or ""),
+                "contract_hash": str(frozen.get("contract_hash") or ""),
+                "signature": str(frozen.get("signature") or ""),
+                "signature_alg": str(frozen.get("signature_alg") or ""),
+                "clauses": frozen.get("clauses") or [],
+                "out_of_scope": frozen.get("out_of_scope") or [],
+                "coverage": outcome["coverage"],
+                "package": outcome["package"],
+                "reused": bool(frozen.get("reused")),
+                "frozen": True,
+            }
+            self.publish(
+                "requirement_contract", contract_artifact, task,
+                summary=(f"条款 {outcome['coverage']['total']} 条：映射 {outcome['coverage']['mapped']}"
+                         f" / 范围外 {outcome['coverage']['out_of_scope']}，已签名冻结"),
+            )
+            result.artifacts["requirement_contract"] = contract_artifact
+            result.metrics["contract_coverage"] = outcome["coverage"]
+            self.evidence(result, "contract", path=contract_artifact["path"],
+                          contract_hash=contract_artifact["contract_hash"],
+                          reused=contract_artifact["reused"])
+            self.ctx.events.emit(
+                "requirement_contract_frozen", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration,
+                payload={"contract_hash": contract_artifact["contract_hash"],
+                         "requirement_hash": contract_artifact["requirement_hash"],
+                         "coverage": outcome["coverage"], "reused": contract_artifact["reused"]},
+            )
+            hidden = self._generate_hidden_suite(task, frozen, outcome, result)
+            if hidden is None and result.status == "fail":
+                return
+            if hidden is not None:
+                self.publish(
+                    "hidden_suite", hidden, task,
+                    summary=(f"隐藏用例 {hidden.get('case_count', 0)} 条（契约 "
+                             f"{str(hidden.get('manifest_digest', ''))[:12]}…，"
+                             f"存放在 run 工作区之外）"),
+                )
+                result.artifacts["hidden_suite"] = hidden
+                result.metrics["hidden_cases"] = int(hidden.get("case_count") or 0)
+
         self.publish(
             "requirement_spec", spec, task,
             summary=(f"功能点 {len(function_points)} 个，验收标准 {len(spec.get('acceptance_criteria', []))} 条，"
@@ -164,3 +287,110 @@ class ProductAgent(BaseAgent):
             "requirement_ready", agent=self.role_id, node=task.node_id, iteration=task.iteration,
             payload=result.broadcast_payload,
         )
+
+    # ---------------------------------------------------------------- 隐藏用例
+    def _generate_hidden_suite(
+        self,
+        task: NodeTask,
+        frozen: Dict[str, Any],
+        validation: Dict[str, Any],
+        result: AgentResult,
+    ) -> Optional[Dict[str, Any]]:
+        """用独立上下文（只含冻结契约）生成隐藏用例并冻结到 run 工作区之外。
+
+        返回 None 表示失败（``result.status == "fail"``）或跳过（单元测试无 LLM 客户端）。
+        """
+        if self.ctx.llm is None:
+            self.ctx.events.emit(
+                "hidden_suite_skipped", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"reason": "当前上下文没有 LLM 客户端（直接调用 Agent 的单元测试），跳过隐藏用例生成"},
+            )
+            return None
+        frozen_spec = frozen.get("spec") if isinstance(frozen.get("spec"), dict) else {}
+        package = str(validation.get("package") or frozen_spec.get("package") or "")
+        system, user = build_generation_prompt(
+            spec=frozen_spec,
+            clauses=list(frozen.get("clauses") or []),
+            package=package,
+            delivery_shape=str(frozen_spec.get("delivery_shape") or ""),
+        )
+        prompt_path = (self.ctx.run_dir / "prompts"
+                       / f"{task.node_id}_hidden_iter{task.iteration:02d}.md")
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(
+            f"<<<SYSTEM>>>\n{system}\n<<<USER>>>\n{user}", encoding="utf-8")
+        context = {
+            "spec": frozen_spec,
+            "clauses": list(frozen.get("clauses") or []),
+            "package": package,
+            "policies": dict(self.role.policies),
+        }
+        bundle = PromptBundle(
+            role=self.role_id, node=task.node_id, task_kind="hidden_test_suite",
+            iteration=task.iteration, system=system, user=user, context=context,
+            token_estimate=(len(system) + len(user)) // 3,
+            path=prompt_path,
+        )
+        try:
+            generation = self.ctx.llm.generate("hidden_test_suite", bundle, context)
+        except Exception as exc:  # noqa: BLE001 - 生成失败必须让节点明确失败
+            result.status = "fail"
+            result.error = f"隐藏用例生成失败: {type(exc).__name__}: {exc}"
+            result.summary = result.error
+            return None
+        result.metrics["hidden_generation"] = generation.to_dict()
+        if generation.error or generation.data is None:
+            result.status = "fail"
+            result.error = generation.error or "隐藏用例生成未返回可解析的 JSON"
+            result.summary = result.error
+            self.ctx.events.emit(
+                "hidden_suite_generation_failed", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"error": result.error, "prompt": str(prompt_path)},
+            )
+            return None
+        try:
+            artifact = create_hidden_suite(
+                config=self.ctx.config,
+                run_dir=self.ctx.run_dir,
+                sandbox=self.ctx.sandbox,
+                run_id=str(self.ctx.run_id),
+                spec=frozen_spec,
+                contract_hash=str(frozen.get("contract_hash") or ""),
+                data=generation.data,
+                iteration=task.iteration,
+                package=package,
+                generation=generation.to_dict(),
+            )
+        except HiddenSuiteError as exc:
+            result.status = "fail"
+            result.error = f"隐藏用例冻结失败: {exc}"
+            result.summary = result.error
+            self.ctx.events.emit(
+                "hidden_suite_generation_failed", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"error": result.error, "prompt": str(prompt_path)},
+            )
+            return None
+        self.evidence(
+            result, "hidden_suite", path=str(artifact.get("workspace_relative") or ""),
+            test_file=str(artifact.get("test_file") or ""),
+            manifest_digest=str(artifact.get("manifest_digest") or ""),
+            test_ids=len(artifact.get("test_ids") or []),
+            contract_hash=str(artifact.get("contract_hash") or ""),
+        )
+        self.ctx.events.emit(
+            "hidden_suite_generated", agent=self.role_id, node=task.node_id,
+            iteration=task.iteration,
+            payload={
+                "root": str(artifact.get("root") or ""),
+                "test_file": str(artifact.get("test_file") or ""),
+                "manifest_digest": str(artifact.get("manifest_digest") or ""),
+                "test_ids": len(artifact.get("test_ids") or []),
+                "contract_hash": str(artifact.get("contract_hash") or ""),
+                "prompt": str(prompt_path),
+                "note": "隐藏用例仅依据冻结契约生成，存放在 run 工作区之外",
+            },
+        )
+        return artifact

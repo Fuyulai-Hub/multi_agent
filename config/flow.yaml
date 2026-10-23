@@ -39,27 +39,31 @@ flow:
       iterable: true                     # 可被审查驳回/验收驳回重新进入
       inputs: ["requirement_spec", "solution_design", "review_report", "bug_reports", "acceptance_gate"]
       outputs: ["code_manifest", "implementation_summary"]
-      transitions: { pass: review, fail: review }
+      # 先测试后审查：审查要用「冻结测试真实通过」的证据核验功能点覆盖，
+      # 否则 review 时只能看代码清单自报（docs/37 P0-2 的同类漏洞）。
+      transitions: { pass: test, fail: test }
 
-    # ---------- 4. 评审 Agent：代码审查（不通过则退回研发） ----------
-    review:
-      title: "代码审查"
-      role: reviewer
-      kind: task
-      iterable: true
-      inputs: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary"]
-      outputs: ["review_report"]
-      transitions: { pass: test, fail: implement }
-
-    # ---------- 5. 测试 Agent：业务测试（功能/异常/边界） ----------
+    # ---------- 4. 测试 Agent：业务测试（功能/异常/边界） ----------
     test:
       title: "业务测试"
       role: tester
       kind: task
       iterable: true
-      inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report", "env_probe"]
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "env_probe"]
       outputs: ["test_report", "bug_reports", "ui_evidence"]
-      transitions: { pass: acceptance, fail: optimize }
+      transitions: { pass: review, fail: optimize }
+
+    # ---------- 5. 评审 Agent：代码审查（绑定最终代码 + 测试证据；不通过退回研发） ----------
+    review:
+      title: "代码审查"
+      role: reviewer
+      kind: task
+      iterable: true
+      inputs: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary",
+               "test_report", "bug_reports"]
+      outputs: ["review_report"]
+      # optimize 改完代码会先重跑 test，再重跑 review；旧审查不能给新代码签字。
+      transitions: { pass: acceptance, fail: implement }
 
     # ---------- 6. 研发 Agent：缺陷修复与优化（修复后重新测试） ----------
     optimize:

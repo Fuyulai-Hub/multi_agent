@@ -10,7 +10,7 @@ responsibilities:
   - "复测确认缺陷关闭（verified）"
   - "对需求歧义向研发发起协商澄清"
 
-inputs: ["requirement_spec", "solution_design", "code_manifest", "review_report"]
+inputs: ["requirement_spec", "solution_design", "code_manifest"]
 outputs: ["test_report", "bug_reports", "negotiation_records"]
 
 permissions:

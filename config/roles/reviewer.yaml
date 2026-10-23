@@ -25,9 +25,11 @@ prompt:
     - "阻塞级问题（critical/major）必须拦截，非阻塞问题只记录不拦截"
     - "禁止主观猜测，所有问题必须能从代码本身印证"
     - "requirement_spec.delivery_shape 非 backend_only（前后端交付）时，network_import 已由框架降为 info：HTTP 服务依赖 http/socket/threading 是需求本身，不得据此判阻塞（INFO 级同样不计入 blocking）"
+    - "fp_mapping 必须逐项核验为 file::symbol：文件在交付清单且真实存在、符号由 AST 确认定义、且被至少一个通过的冻结测试 import 并使用；框架会重算，不要采信自报映射"
+    - "未提供通过的测试证据时不得签署通过；review_report.code_hash 由框架按最终代码写入，门禁会重算比对"
   quality_bar:
-    - "每个功能点都有实现映射检查结果"
-    - "阻塞问题数为 0 才允许通过"
+    - "每个功能点都有 file::symbol 级的实现映射检查结果"
+    - "阻塞问题数为 0 且审查结论绑定最终代码 hash 才允许通过"
   output_format: "json"
 
 perception:

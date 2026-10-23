@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
+from ..verifier import TestVerifier, VerificationError
+from ..verify.exec import execute_frozen_suite
 from .base import BaseAgent, Perception
 
 __all__ = ["DeveloperAgent"]
@@ -35,7 +37,7 @@ class DeveloperAgent(BaseAgent):
             "mode": "first|rework|fix",
             "package": "",
             "files": [{"path": "", "content": ""}],
-            "fp_mapping": {"FP-01": "function_name"},
+            "fp_mapping": {"FP-01": "pkg/core.py::function_name"},
             "functions": [],
             "defects_injected": [],
             "fix_targets": [],
@@ -259,6 +261,14 @@ class DeveloperAgent(BaseAgent):
         open_bugs = context.get("open_bugs") or []
         test_report = perception.found.get("test_report") or {}
         test_file = test_report.get("test_file", "")
+        try:
+            frozen_suite = TestVerifier(
+                self.ctx.run_dir, self.ctx.sandbox.root, events=self.ctx.events,
+                config=self.ctx.config, sandbox=self.ctx.sandbox,
+                run_id=getattr(self.ctx, "run_id", ""),
+            ).load_manifest()
+        except VerificationError:
+            frozen_suite = None
         fix_items: List[Dict[str, Any]] = []
         all_ok = bool(self_check.get("ok"))
         for bug in open_bugs:
@@ -271,13 +281,15 @@ class DeveloperAgent(BaseAgent):
                 "regression": None,
                 "regression_ok": None,
             }
-            if test_file and bug.get("test"):
-                regression = self.sandbox_run(
-                    [self.ctx.sandbox.python, test_file, "--only", str(bug["test"])],
-                    env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
-                    result_marker="<<<MASS_RESULT>>>",
+            if frozen_suite is not None and bug.get("test"):
+                # 定向回归同样走框架 runner：--only 只在冻结清单内过滤，
+                # 测试文件没有 main/marker，不能再自行决定跑哪些 case。
+                execution = execute_frozen_suite(
+                    self.ctx.sandbox, self.ctx.run_dir, frozen_suite,
+                    iteration=task.iteration, only=str(bug["test"]), tag="developer",
                 )
-                parsed = regression.parsed or {}
+                regression = execution.exec
+                parsed = execution.result or {}
                 item["regression"] = {
                     "cmd": " ".join(regression.cmd),
                     "exit_code": regression.exit_code,
@@ -287,8 +299,16 @@ class DeveloperAgent(BaseAgent):
                     # traceback 在 stderr，只有 stdout_tail 会看到空输出无法诊断
                     "stderr_tail": regression.stderr.strip()[-400:],
                 }
-                item["regression_ok"] = bool(regression.ok)
-                all_ok = all_ok and bool(regression.ok)
+                regression_ok = bool(regression.ok) and int(parsed.get("total") or 0) > 0
+                item["regression_ok"] = regression_ok
+                all_ok = all_ok and regression_ok
+            elif test_report:
+                item["regression"] = {
+                    "cmd": "", "exit_code": 2, "failed": None,
+                    "error": "没有可用的冻结测试清单：拒绝用测试文件自行回传的结果做回归",
+                }
+                item["regression_ok"] = False
+                all_ok = False
             fix_items.append(item)
             self.ctx.events.emit(
                 "bug_fixed", agent=self.role_id, node=task.node_id, iteration=task.iteration,

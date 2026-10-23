@@ -95,21 +95,21 @@ class NegotiationRobustnessTests(unittest.TestCase):
             tmp.cleanup()
 
     def test_contract_declares_execution_protocol(self):
-        """交付契约必须包含执行协议（marker/--only/回传字段），LLM 才可能生成合规测试文件。"""
+        """执行权在框架：契约只要求文件定义用例，不再教模型写 main/marker。"""
         contract = TesterAgent.contracts["default"]
         protocol = contract.get("execution_protocol") or {}
-        self.assertEqual(protocol.get("marker"), "<<<MASS_RESULT>>>")
-        self.assertIn("--only", protocol.get("run_cmd", ""))
-        result_json = protocol.get("result_json") or {}
-        for key in ("total", "passed", "failed", "duration_ms", "cases"):
-            self.assertIn(key, result_json)
-        # cases 元数据必须带 op/name（缺陷跟踪按 test_{category}_{op}_{name} 反查）
+        self.assertEqual(protocol.get("runner"), "mas/verify/runner.py")
+        self.assertIn("test_ids", protocol.get("case_discovery", ""))
+        self.assertNotIn("marker", protocol)
+        self.assertNotIn("reference_runner", protocol)
+        self.assertTrue(any("只定义" in item for item in protocol.get("requirements") or []))
+        # cases 元数据必须带 op/name（runner 按 test_{category}_{op}_{name} 绑定 fp_id）
         case_schema = (contract.get("cases") or [{}])[0]
         self.assertIn("op", case_schema)
         self.assertIn("name", case_schema)
 
-    def test_offline_provider_unaffected_by_contract_change(self):
-        """契约扩展不得影响离线 Provider（其测试文件由模板生成，不读契约）。"""
+    def test_offline_provider_emits_case_only_suite(self):
+        """离线 Provider 的测试文件也只定义用例，不再内嵌 runner/marker。"""
         agent, ctx, tmp = _agent()
         try:
             from mas.providers.offline import OfflineProvider
@@ -122,8 +122,10 @@ class NegotiationRobustnessTests(unittest.TestCase):
                 ]}})
             self.assertTrue(data.get("files"))
             content = data["files"][0]["content"]
-            self.assertIn("<<<MASS_RESULT>>>", content)
-            self.assertIn("--only", content)
+            self.assertIn("import unittest", content)
+            self.assertNotIn("<<<MASS_RESULT>>>", content)
+            self.assertNotIn('if __name__ == "__main__"', content)
+            self.assertNotIn("--only", content)
         finally:
             tmp.cleanup()
 

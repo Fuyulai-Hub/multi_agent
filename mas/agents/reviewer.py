@@ -2,15 +2,72 @@
 
 from __future__ import annotations
 
+import ast
 import json
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..intent import resolve_delivery_shape, shape_family
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
+from ..verifier import FROZEN_DIR, code_tree_hash
 from .base import BaseAgent, Perception
 
 __all__ = ["ReviewerAgent"]
+
+# 功能点映射的声明格式：value 必须严格是「沙箱内相对路径::符号」。
+# 不再接受裸函数名（旧格式），也不接受一个 FP 对多个符号的拼接值。
+_MAPPING_SEPARATOR = "::"
+
+
+def _normalize_rel(path: Any) -> str:
+    value = str(path or "").strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value
+
+
+def _mapping_parts(value: Any) -> Tuple[str, str, str]:
+    """解析 file::symbol；返回 (file, symbol, error)。"""
+    if not isinstance(value, str):
+        return "", "", "映射值必须是字符串 file::symbol"
+    parts = value.split(_MAPPING_SEPARATOR)
+    if len(parts) != 2:
+        return "", "", "映射值必须恰好是一个 file::symbol（禁止裸函数名或多值拼接）"
+    file, symbol = parts[0].strip(), parts[1].strip()
+    if not file or not symbol:
+        return "", "", "file 或 symbol 为空"
+    file = _normalize_rel(file)
+    if not file or file.startswith("/") or ":" in file:
+        return "", "", "file 必须是沙箱内相对路径"
+    if any(segment in ("", ".", "..") for segment in file.split("/")):
+        return "", "", "file 必须是沙箱内相对路径（禁止 . / .. / 空段）"
+    if not all(part.isidentifier() for part in symbol.split(".")):
+        return "", "", "symbol 必须是以点分隔的合法标识符（如 func 或 Class.method）"
+    return file, symbol, ""
+
+
+def _module_name(file: str) -> str:
+    parts = file[:-3].split("/") if file.endswith(".py") else file.split("/")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(part for part in parts if part)
+
+
+def _defined_symbols(tree: ast.AST) -> Set[str]:
+    """模块级函数/类，以及类的方法（Class.method）。"""
+    names: Set[str] = set()
+
+    def visit(body: List[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}{node.name}"
+                names.add(name)
+                if isinstance(node, ast.ClassDef):
+                    visit(node.body, f"{name}.")
+
+    visit(tree.body, "")
+    return names
 
 
 class ReviewerAgent(BaseAgent):
@@ -29,6 +86,8 @@ class ReviewerAgent(BaseAgent):
             "blocking": 0,
             "stats": {"by_severity": {}, "by_rule": {}},
             "coverage": {"function_points": 0, "implemented": 0, "missing": []},
+            "code_hash": "（框架按沙箱最终代码写入，模型留空）",
+            "mapping_audit": {"format": "file::symbol", "total": 0, "valid": 0, "invalid": []},
             "verdict": "pass|reject",
             "summary": "",
             "recommendations": [],
@@ -126,6 +185,7 @@ class ReviewerAgent(BaseAgent):
             return {
                 "spec": perception.spec,
                 "code_manifest": manifest,
+                "test_report": perception.found.get("test_report") or {},
                 "static_analysis": {
                     "findings": findings,
                     "loc": analysis.loc,
@@ -246,6 +306,258 @@ class ReviewerAgent(BaseAgent):
             refs=[f"artifacts/{artifact_name}"],
         )
 
+    # ---------------------------------------------------------------- 功能点映射审计
+    def _read_code_text(self, relative: str) -> Optional[str]:
+        """读沙箱交付代码；不存在/越界均返回 None（由调用方记具体 finding）。"""
+        sandbox = getattr(self.ctx, "sandbox", None)
+        reader = getattr(sandbox, "read_file", None)
+        if callable(reader):
+            try:
+                return reader(relative)
+            except Exception:  # noqa: BLE001 - 缺失/越界都按不可读处理
+                return None
+        root = getattr(sandbox, "root", None)
+        if root is None:
+            return None
+        path = Path(root) / relative
+        try:
+            return path.read_text(encoding="utf-8") if path.is_file() else None
+        except OSError:
+            return None
+
+    def _frozen_test_sources(self) -> Dict[str, str]:
+        """冻结测试副本（生成方不可写）是「通过」结论的原始证据来源。"""
+        run_dir = getattr(self.ctx, "run_dir", None)
+        if run_dir is None:
+            return {}
+        root = Path(run_dir) / FROZEN_DIR
+        if not root.is_dir():
+            return {}
+        sources: Dict[str, str] = {}
+        for path in sorted(root.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                sources[path.relative_to(root).as_posix()] = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+        return sources
+
+    def _code_hash(self) -> str:
+        sandbox = getattr(self.ctx, "sandbox", None)
+        root = getattr(sandbox, "root", None)
+        if root is None:
+            run_dir = getattr(self.ctx, "run_dir", None)
+            if run_dir is None:
+                return ""
+            root = Path(run_dir) / "code"
+        return code_tree_hash(Path(root))
+
+    def _export_modules(self, file: str, base: str) -> Set[str]:
+        """符号可被 import 的模块集合：定义模块本身 + 逐层 __init__.py 的再导出。"""
+        module = _module_name(file)
+        exports: Set[str] = {module} if module else set()
+        directories = file.split("/")[:-1]
+        for depth in range(len(directories), 0, -1):
+            package = ".".join(directories[:depth])
+            if package in exports:
+                continue
+            init_file = "/".join(directories[:depth] + ["__init__.py"])
+            source = self._read_code_text(init_file)
+            if source is None:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            for node in tree.body:
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                imported = node.module or ""
+                if node.level:
+                    parts = package.split(".")
+                    keep = len(parts) - (node.level - 1)
+                    if keep < 0:
+                        continue
+                    imported = ".".join(parts[:keep] + ([imported] if imported else []))
+                names = {alias.name for alias in node.names}
+                reexports_target = any(
+                    imported == export or imported.startswith(f"{export}.")
+                    for export in exports
+                )
+                if (base in names and reexports_target) or ("*" in names and imported in exports):
+                    exports.add(package)
+                    break
+        return exports
+
+    def _covered_by_tests(
+        self, sources: Dict[str, str], exports: Set[str], symbol: str
+    ) -> str:
+        """返回覆盖该符号的测试文件；覆盖 = import 后确有使用（Name/Attribute）。"""
+        base, _, member = symbol.partition(".")
+        targets = {f"{export}.{base}" for export in exports if export}
+        if not targets:
+            return ""
+        for path, source in sorted(sources.items()):
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            bindings: Dict[str, str] = {}
+            stars: Set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.asname:
+                            bindings[alias.asname] = alias.name
+                        else:
+                            root = alias.name.split(".")[0]
+                            bindings[root] = root
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level:      # 测试套件使用绝对导入；相对导入不做推断
+                        continue
+                    module = node.module or ""
+                    for alias in node.names:
+                        if alias.name == "*":
+                            stars.add(module)
+                        else:
+                            bound = alias.asname or alias.name
+                            bindings[bound] = f"{module}.{alias.name}" if module else alias.name
+
+            def resolve(node: ast.AST) -> Optional[str]:
+                if isinstance(node, ast.Name):
+                    return bindings.get(node.id)
+                if isinstance(node, ast.Attribute):
+                    prefix = resolve(node.value)
+                    return f"{prefix}.{node.attr}" if prefix else None
+                return None
+
+            base_used = False
+            member_used = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute):
+                    if member and node.attr == member:
+                        member_used = True
+                    resolved = resolve(node)
+                    if not resolved:
+                        continue
+                    if resolved in targets:
+                        base_used = True
+                    if member and resolved in {f"{target}.{member}" for target in targets}:
+                        return path
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    if node.id == base and stars & exports:
+                        base_used = True
+                    if bindings.get(node.id) in targets:
+                        base_used = True
+            if base_used and (not member or member_used):
+                return path
+        return ""
+
+    def _audit_fp_mapping(
+        self, perception: Perception
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+        """把 fp_mapping 从「自报 key 列表」升级为可核验的符号级证据。
+
+        每个功能点必须：value 严格为 ``file::symbol`` → 文件在交付清单且真实存在
+        → 符号在 AST 中被定义 → 该符号被至少一个**通过的冻结测试** import 并使用。
+        任何一步失败都生成 critical finding，由 ``_recompute_blocking`` 计为阻塞。
+        """
+        manifest = perception.found.get("code_manifest") or {}
+        mapping = manifest.get("fp_mapping") or {}
+        manifest_files = {_normalize_rel(item) for item in (manifest.get("files") or [])}
+        fps = [fp for fp in (perception.spec.get("function_points") or []) if isinstance(fp, dict)]
+        first_file = _normalize_rel((manifest.get("files") or ["-"])[0])
+
+        test_report = perception.found.get("test_report") or {}
+        summary = test_report.get("summary") or {}
+        attestation = test_report.get("verification_attestation") or {}
+        try:
+            total = int(summary.get("total") or 0)
+            failed = int(summary.get("failed") or 0)
+        except (TypeError, ValueError):
+            total, failed = 0, 1
+        tests_ok = total > 0 and failed == 0 and attestation.get("valid") is True
+        tests = self._frozen_test_sources() if tests_ok else {}
+
+        findings: List[Dict[str, Any]] = []
+        invalid: List[Dict[str, str]] = []
+        valid = 0
+
+        def add(rule: str, fp_id: str, file: str, message: str) -> None:
+            findings.append({
+                "rule": rule, "severity": "critical", "file": file or first_file,
+                "line": 0, "symbol": fp_id, "message": message,
+            })
+            invalid.append({"fp_id": fp_id, "value": str(mapping.get(fp_id, "")),
+                            "reason": rule})
+
+        if not tests_ok:
+            findings.append({
+                "rule": "review_without_passing_tests", "severity": "critical",
+                "file": first_file, "line": 0, "symbol": "-",
+                "message": ("review 没有可采信的通过测试证据（需 total>0、failed=0 且 "
+                            "verification_attestation.valid=true），功能点 import/覆盖不可验证"),
+            })
+
+        for fp in fps:
+            fp_id = str(fp.get("id") or "")
+            value = mapping.get(fp_id)
+            if value in (None, ""):
+                add("unimplemented_function_point", fp_id, first_file,
+                    f"需求功能点 {fp_id} 未映射到任何实现函数")
+                continue
+            file, symbol, error = _mapping_parts(value)
+            if error:
+                add("invalid_fp_mapping_format", fp_id, first_file,
+                    f"功能点 {fp_id} 的映射值 {value!r} 非法：{error}")
+                continue
+            if file not in manifest_files:
+                add("fp_mapping_file_not_in_manifest", fp_id, file,
+                    f"功能点 {fp_id} 映射的文件 {file} 不在交付清单中")
+                continue
+            if not file.endswith(".py"):
+                add("fp_mapping_symbol_unverifiable", fp_id, file,
+                    f"功能点 {fp_id} 映射到非 Python 文件 {file}，AST 无法核验符号 {symbol}")
+                continue
+            source = self._read_code_text(file)
+            if source is None:
+                add("fp_mapping_file_missing", fp_id, file,
+                    f"功能点 {fp_id} 映射的文件 {file} 在沙箱中不存在或不可读")
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError as exc:
+                add("fp_mapping_file_unparsable", fp_id, file,
+                    f"功能点 {fp_id} 映射的文件 {file} 无法解析：{exc}")
+                continue
+            if symbol not in _defined_symbols(tree):
+                add("fp_mapping_symbol_missing", fp_id, file,
+                    f"功能点 {fp_id} 映射的符号 {symbol} 未在 {file} 中定义")
+                continue
+            if tests_ok:
+                covered = self._covered_by_tests(tests, self._export_modules(file, symbol.split(".")[0]), symbol)
+                if not covered:
+                    add("fp_mapping_not_covered_by_passing_test", fp_id, file,
+                        f"功能点 {fp_id} 的符号 {symbol} 未被任何通过的冻结测试 import/使用")
+                    continue
+            valid += 1
+
+        audit = {
+            "format": "file::symbol",
+            "total": len(fps),
+            "valid": valid,
+            "invalid": invalid,
+            "test_evidence": {
+                "passed": tests_ok,
+                "source": FROZEN_DIR if tests else "",
+                "files": len(tests),
+                "total": total,
+                "failed": failed,
+            },
+        }
+        return findings, audit, self._code_hash()
+
     def _recompute_blocking(
         self,
         task: NodeTask,
@@ -255,27 +567,39 @@ class ReviewerAgent(BaseAgent):
     ) -> Dict[str, Any]:
         """阻塞数由框架按确定性证据重算，不再采信模型 JSON（docs/37 P0-2）。
 
-        确定性来源：build_context 已算好的 AST/Web 静态 findings + 代码清单里
-        功能点到实现的映射缺口。LLM 的自报 findings 保留为 ``advisory_findings``，
-        但 ``blocking``/``blocking_items`` 只由框架写入——模型说 0 不能把
-        ``eval_usage``/语法错误/未实现功能点洗掉；模型虚报阻塞也无法改变计数。
+        确定性来源：build_context 已算好的 AST/Web 静态 findings + 功能点映射的
+        符号级审计（文件存在 / 符号定义 / 通过的冻结测试 import 或使用）。
+        LLM 的自报 findings 保留为 ``advisory_findings``，但 ``blocking``/
+        ``blocking_items`` 只由框架写入——模型说 0 不能把 ``eval_usage``/语法错误/
+        未实现功能点洗掉；模型虚报阻塞也无法改变计数。
         """
-        manifest = perception.found.get("code_manifest") or {}
         policies = dict(context.get("policies") or self.role.policies)
         blocking_severities = set(policies.get("blocking_severities") or ("critical", "major"))
         static = (context.get("static_analysis") or {}).get("findings") or []
         deterministic = [item for item in static if isinstance(item, dict)]
 
-        mapped = set((manifest.get("fp_mapping") or {}).keys())
-        first_file = (manifest.get("files") or ["-"])[0]
-        for fp in perception.spec.get("function_points", []) or []:
-            fp_id = str(fp.get("id") or "")
-            if fp_id and fp_id not in mapped:
-                deterministic.append({
-                    "rule": "unimplemented_function_point", "severity": "critical",
-                    "file": first_file, "line": 0, "symbol": fp_id,
-                    "message": f"需求功能点 {fp_id} 未映射到任何实现函数",
-                })
+        mapping_findings, mapping_audit, code_hash = self._audit_fp_mapping(perception)
+        deterministic.extend(mapping_findings)
+        data["code_hash"] = code_hash
+        data["mapping_audit"] = mapping_audit
+        data["coverage"] = {
+            "function_points": mapping_audit["total"],
+            "implemented": mapping_audit["valid"],
+            "missing": [item["fp_id"] for item in mapping_audit["invalid"]],
+        }
+        self.ctx.events.emit(
+            "review_mapping_checked", agent=self.role_id, node=task.node_id,
+            iteration=task.iteration,
+            severity="info" if not mapping_findings else "error",
+            payload={
+                "format": mapping_audit["format"],
+                "total": mapping_audit["total"],
+                "valid": mapping_audit["valid"],
+                "invalid": mapping_audit["invalid"],
+                "test_evidence": mapping_audit["test_evidence"],
+                "code_hash": code_hash,
+            },
+        )
 
         llm_findings = [item for item in (data.get("findings") or []) if isinstance(item, dict)]
         merged: List[Dict[str, Any]] = []

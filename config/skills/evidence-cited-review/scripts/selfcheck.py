@@ -24,7 +24,17 @@ def review(findings, function_points, fp_mapping=None):
             untraceable.append({"reason": "证据字段缺失", "message": finding.get("message", "")})
             continue
 
-        symbols = [value for value in fp_mapping.values() if str(finding.get("file")).endswith(str(value))]
+        # fp_mapping 的口径是 file::symbol；旧格式（裸函数名）仍兼容文件名后缀匹配。
+        target_file = str(finding.get("file"))
+        symbols = [
+            fp_id for fp_id, value in fp_mapping.items()
+            if "::" in str(value) and str(value).split("::", 1)[0] == target_file
+        ]
+        if not symbols:
+            symbols = [
+                fp_id for fp_id, value in fp_mapping.items()
+                if "::" not in str(value) and target_file.endswith(str(value))
+            ]
         fp_id = ""
         for candidate in (symbols or list(fp_mapping.keys())):
             if str(candidate) in fp_ids:

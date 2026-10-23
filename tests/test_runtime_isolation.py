@@ -75,9 +75,10 @@ class RuntimeIsolationTests(unittest.TestCase):
             # 事件全部属于本次运行（run_id 一致）
             foreign = [event for event in events if event.get("run_id") != summary.run_id]
             self.assertEqual(foreign, [], f"{name} 的 events.jsonl 混入其他运行的事件")
-            # 协商闭环事件数正确（顺序单跑每轮 2 条，实测基线）
+            # 协商闭环事件数正确（顺序单跑实测基线）：流程为 test 后再 review，
+            # 单轮执行 test 3 次（首轮失败 → 修复后 → 审查返工后），每次协商 1 个歧义。
             negotiations = [event for event in events if event["type"] == "negotiation_closed"]
-            self.assertEqual(len(negotiations), 2, f"{name} 的协商事件缺失或被写入他处")
+            self.assertEqual(len(negotiations), 3, f"{name} 的协商事件缺失或被写入他处")
             # 产物目录互不包含
             other = [item for key, item in results.items() if key != name]
             for summary_other in other:
@@ -94,7 +95,7 @@ class RuntimeIsolationTests(unittest.TestCase):
             foreign = [event for event in events if event.get("run_id") != summary.run_id]
             self.assertEqual(foreign, [])
             negotiations = [event for event in events if event["type"] == "negotiation_closed"]
-            self.assertEqual(len(negotiations), 2)
+            self.assertEqual(len(negotiations), 3)
 
     def test_consult_closure_uses_own_run(self):
         """consult 闭包读取的是本次运行的 bus/events/agents（而非共享引用）。"""
@@ -104,7 +105,7 @@ class RuntimeIsolationTests(unittest.TestCase):
         run_dir = Path(first.run_dir)
         events = self._events(run_dir)
         negotiations = [event for event in events if event["type"] == "negotiation_closed"]
-        self.assertEqual(len(negotiations), 2)
+        self.assertEqual(len(negotiations), 3)
 
 
 class ExperienceFeedbackLoopTests(unittest.TestCase):

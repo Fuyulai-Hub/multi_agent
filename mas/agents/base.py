@@ -609,6 +609,9 @@ class BaseAgent:
             role=self.role_id,
             tags=tags,
             task_text=task_text,
+            # Leader 给返工节点的指令里会点名上轮审查阻塞规则（implement iteration>1），
+            # 作为「具体失败线索」参与排序，避免该教训被更早积累的缺陷经验挤出配额。
+            focus_text=task.directive,
             tier_keys=self.role.learning_tiers,
             max_items=self.role.learning_max_items,
             current_run=self.ctx.run_id,

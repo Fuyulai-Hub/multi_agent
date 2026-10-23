@@ -167,6 +167,13 @@
           <input id="cfg-token-name" type="text" placeholder="例如 fa_244511009">
         </label>
         <div class="field">
+          <span class="field-label">工具调用（写入 config/system.yaml 的 llm.tools_enabled，保存后下一次运行生效）</span>
+          <label class="switch-row">
+            <input id="cfg-tools-enabled" type="checkbox">
+            启用 function calling（模型可发起 tool_calls，由 MCP 服务 / 技能工具真实执行）
+          </label>
+        </div>
+        <div class="field">
           <span class="field-label">技能系统（写入 config/system.yaml 的 runtime.skills，保存后下一次运行生效）</span>
           <label class="switch-row">
             <input id="cfg-skills-enabled" type="checkbox">
@@ -174,7 +181,7 @@
           </label>
           <label class="switch-row">
             <input id="cfg-skills-tools-enabled" type="checkbox">
-            启用技能工具调用（tools_enabled：模型可调用 skill_&lt;id&gt; 工具，需与上方同时开启）
+            启用技能工具调用（tools_enabled：模型可调用 skill_&lt;id&gt; 工具，需与上方同时开启及工具调用总开关）
           </label>
         </div>
         <div class="field">
@@ -203,5 +210,7 @@
   </div>
 
   <script src="app.js"></script>
+  <!-- 前后端分离：页面由本宿主提供、接口在另一端口时，用
+       index.html?api=http://<后端主机>:8000 指定接口地址（同源部署可省略）。 -->
 </body>
 </html>

@@ -61,6 +61,34 @@ class ExperienceTests(unittest.TestCase):
                                               current_run="run-1")
         self.assertGreaterEqual(len(result_tester.entries), 1)
 
+    def test_focus_text_prioritizes_named_failure_rule(self):
+        """返工指令点名的审查规则优先于命中次数更高的通用守护经验。
+
+        流程改为 test 后再 review 后，审查驳回发生在多条缺陷经验之后；
+        若只看命中次数，审查教训会被挤出 L1 配额，永远没有 hits、无法晋级。
+        """
+        generic = self._entry(action_key="guard_generic", tags=["订单", "缺陷修复"],
+                              lesson="通用缺陷守护经验", confidence=0.9, hits=4)
+        named = self._entry(action_key="avoid_missing_function_docstring",
+                            tags=["订单", "missing_function_docstring"],
+                            lesson="代码审查拦截函数文档字符串缺失",
+                            action="提交审查前补齐文档字符串", confidence=0.7)
+        self.library.add([generic, named])
+        result = self.library.retrieve(
+            role="developer", tags=["订单"], task_text="编码实现",
+            focus_text="上一轮审查阻塞问题：missing_function_docstring",
+            current_run="run-1", max_items=1,
+        )
+        self.assertEqual([entry.action_key for entry in result.entries],
+                         ["avoid_missing_function_docstring"])
+
+        # 常规检索标签（域/角色标签）不算失败线索：不能被 focus 全量加分
+        plain = self.library.retrieve(
+            role="developer", tags=["订单"], task_text="编码实现",
+            focus_text="订单需求", current_run="run-1", max_items=1,
+        )
+        self.assertEqual(plain.entries[0].action_key, "guard_generic")
+
     def test_merge_same_lesson(self):
         self.library.add([self._entry()])
         self.library.add([self._entry()])

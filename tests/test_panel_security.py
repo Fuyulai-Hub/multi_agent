@@ -258,5 +258,68 @@ class LlmNoEchoTests(PanelHTTPTestCase):
         self.assertTrue(payload["api_key_masked"])
 
 
+class SplitDeploymentTests(PanelHTTPTestCase):
+    """前后端分离：--no-static 只提供 /api/*，跨源调用由白名单放行。
+
+    覆盖三条边界：
+    - static_dir=None 时页面 404，接口不受影响（分离模式下后端不再是页面宿主）；
+    - 未声明的跨源来源即使在分离模式下也被拒（失败关闭未被放宽）；
+    - 白名单来源的预检与实际响应都带 CORS 头与 credentials 声明。
+    """
+
+    token = "split-token"
+    origins = {"http://127.0.0.1:9000"}
+
+    def setUp(self):
+        super().setUp()
+        self._old_static = frontend_server.Handler.static_dir
+        frontend_server.Handler.static_dir = None
+
+    def tearDown(self):
+        frontend_server.Handler.static_dir = self._old_static
+        super().tearDown()
+
+    def test_static_disabled_but_api_available(self):
+        for path in ("/", "/index.html", "/app.js"):
+            status, _, _ = self.request("GET", path)
+            self.assertEqual(status, 404, path)
+        status, _, body = self.request(
+            "GET", "/api/runs", headers={"Authorization": "Bearer split-token"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.json_body(body), [])
+
+    def test_default_still_serves_static(self):
+        """未传 --no-static 时页面照旧可达（默认行为不变）。"""
+        frontend_server.Handler.static_dir = SERVER_PATH.parent
+        status, _, body = self.request("GET", "/index.html")
+        self.assertEqual(status, 200)
+        self.assertIn(b"<html", body.lower())
+
+    def test_preflight_allowed_origin(self):
+        status, headers, _ = self.request(
+            "OPTIONS", "/api/run",
+            headers={"Origin": "http://127.0.0.1:9000",
+                     "Access-Control-Request-Method": "POST"})
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("access-control-allow-origin"), "http://127.0.0.1:9000")
+        self.assertEqual(headers.get("access-control-allow-credentials"), "true")
+        self.assertEqual(headers.get("vary"), "Origin")
+
+    def test_preflight_unknown_origin_rejected(self):
+        status, headers, _ = self.request(
+            "OPTIONS", "/api/run", headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn("access-control-allow-origin", headers)
+
+    def test_api_response_echoes_allowed_origin(self):
+        status, headers, _ = self.request(
+            "GET", "/api/runs",
+            headers={"Origin": "http://127.0.0.1:9000",
+                     "Authorization": "Bearer split-token"})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("access-control-allow-origin"), "http://127.0.0.1:9000")
+        self.assertEqual(headers.get("access-control-allow-credentials"), "true")
+
+
 if __name__ == "__main__":
     unittest.main()
