@@ -489,18 +489,18 @@ class UiEvidenceTests(_CtxMixin, unittest.TestCase):
 
 # --------------------------------------------------------------------------- 门禁表达式
 class GateExpressionTests(unittest.TestCase):
-    """文档 §6 两条 criterion 在三值形态下的真实求值结果。"""
+    """门禁 criterion 在三值形态下的真实求值结果（表达式已切到文件探测口径）。"""
 
-    _ASSERT_ZERO = ("requirement_spec.delivery_shape != 'full_stack_spa' "
+    _ASSERT_ZERO = ("ui_evidence.delivery_shape != 'full_stack_spa' "
                     "or ui_evidence.failed_asserts == 0")
-    _NON_EMPTY = ("requirement_spec.delivery_shape != 'full_stack_spa' "
+    _NON_EMPTY = ("ui_evidence.delivery_shape != 'full_stack_spa' "
                   "or len(ui_evidence.asserts) > 0")
 
     @staticmethod
     def _eval(expr, shape, ui):
         snapshot = {"requirement_spec": {"delivery_shape": shape}}
         if ui is not None:
-            snapshot["ui_evidence"] = ui
+            snapshot["ui_evidence"] = {**ui, "delivery_shape": shape}
         return evaluate(expr, snapshot)
 
     def test_backend_only_passes_with_disabled_evidence(self):
@@ -544,13 +544,17 @@ class RealFlowGateTests(_CtxMixin, unittest.TestCase):
     criterion 集合三者都是真的，只有 artifact 是构造的。
     """
 
-    def _publish_artifacts(self, shape, failed_asserts=0, asserts=None, has_ui=True):
+    def _publish_artifacts(self, shape, failed_asserts=0, asserts=None, has_ui=True,
+                           probe_version="", http_status=0):
         self._publish_spec(delivery_shape=shape)
         if has_ui:
             self.blackboard.publish(
                 "ui_evidence",
                 {"enabled": True, "failed_asserts": failed_asserts,
-                 "asserts": asserts if asserts is not None else []},
+                 "asserts": asserts if asserts is not None else [],
+                 # 门禁 SPA 条件引用的字段必须齐全（BoolOp 不短路，缺字段整条判失败）
+                 "delivery_shape": shape, "probe_version": probe_version,
+                 "http_status": http_status},
                 producer="tester", node="test", iteration=1, summary="t")
 
     def _evaluate_gate(self, profile=None):
@@ -602,9 +606,9 @@ class RealFlowGateTests(_CtxMixin, unittest.TestCase):
         results = self._evaluate_gate()
         self.assertFalse(results["Web UI 断言无失败（仅 SPA 形态要求）"],
                          "预期：ui_evidence 缺失时该 criterion 判失败")
-        # 其余 8 条不受影响（豁免/isolation 未外溢）
+        # 其余不受影响（豁免/isolation 未外溢）
         for cid, passed in results.items():
-            if not cid.startswith("Web UI"):
+            if not cid.startswith(("Web UI", "SPA")):
                 self.assertTrue(passed, f"非 UI criterion 被连带影响: {cid}")
 
     def test_ssr_passes_ui_criteria(self):
@@ -621,10 +625,30 @@ class RealFlowGateTests(_CtxMixin, unittest.TestCase):
         self.assertFalse(results["Web UI 证据非空（SPA 形态下不得证据不足）"])
 
     def test_spa_with_real_asserts_passes_ui_criteria(self):
-        self._publish_artifacts("full_stack_spa", asserts=[{"name": "导航到首页", "status": "passed"}])
+        self._publish_artifacts("full_stack_spa", asserts=[{"name": "导航到首页", "status": "passed"}],
+                                probe_version="uiprober/2", http_status=200)
+        results = self._evaluate_gate()
+        for cid in ("Web UI 断言无失败（仅 SPA 形态要求）",
+                    "Web UI 证据非空（SPA 形态下不得证据不足）",
+                    "SPA 浏览器证据由框架 probe 采集",
+                    "SPA 证据含真实 HTTP 状态"):
+            self.assertTrue(results[cid], cid)
+
+    def test_spa_shell_evidence_without_probe_fails_gate(self):
+        """agent 自填的空壳证据（只有 failed_asserts: 0 + asserts，没有 probe 版本和
+        真实 HTTP 状态）不得通过门禁——证据必须由框架 probe 采集。"""
+        self._publish_artifacts("full_stack_spa", asserts=[{"name": "导航", "status": "passed"}])
         results = self._evaluate_gate()
         self.assertTrue(results["Web UI 断言无失败（仅 SPA 形态要求）"])
         self.assertTrue(results["Web UI 证据非空（SPA 形态下不得证据不足）"])
+        self.assertFalse(results["SPA 浏览器证据由框架 probe 采集"])
+        self.assertFalse(results["SPA 证据含真实 HTTP 状态"])
+
+    def test_spa_probe_with_bad_http_status_fails_gate(self):
+        self._publish_artifacts("full_stack_spa", asserts=[{"name": "导航", "status": "passed"}],
+                                probe_version="uiprober/2", http_status=500)
+        results = self._evaluate_gate()
+        self.assertFalse(results["SPA 证据含真实 HTTP 状态"])
 
     def test_spa_failed_asserts_fails_gate(self):
         self._publish_artifacts("full_stack_spa", failed_asserts=2,

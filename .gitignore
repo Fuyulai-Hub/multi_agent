@@ -7,6 +7,9 @@ config/credentials.yaml
 # 本地临时跑测目录与改动前备份（一次性产物，禁止提交）
 .tmp-*/
 .bak-*/
+*.log
+# 端到端实测用的一次性评估工作区（真机跑测证据，不进版本库）
+tmp-eval-ws/
 # Python
 __pycache__/
 *.py[cod]

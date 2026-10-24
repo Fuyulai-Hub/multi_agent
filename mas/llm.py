@@ -113,6 +113,10 @@ class LLMClient:
         # （implement/optimize 全量代码）三次降级尝试全部空输出（实测 3×300s）。
         # 流式下 TTFB <1s、chunk 间隔远小于 300s，长生成不再触发网关上限。
         self.stream = bool(config.llm.get("stream", True))
+        # 流式总时长看门狗：urlopen 的 timeout 只约束单次 socket 读，服务端持续推流
+        # （思考链/心跳 chunk）时总时长无上限——实测 2026-10-24 一次请求挂 40 分钟无返回。
+        # 超过该值主动断开，抛 TimeoutError 走既有可重试通道，而不是无限等待。
+        self.stream_total_timeout = int(config.llm.get("stream_total_timeout", 1800))
         # function calling：tools 由运行时注入（ToolRunner）或 config.llm.tools 静态声明
         self.tool_choice = str(config.llm.get("tool_choice", "auto"))
         self.tool_max_rounds = max(1, int(config.llm.get("tool_max_rounds", 2)))
@@ -405,6 +409,7 @@ class LLMClient:
         for attempt in range(1, attempts + 1):
             text_parts, reasoning_parts, tool_calls_by_index = [], [], {}
             finish_reason, usage = "", {}
+            deadline = time.monotonic() + self.stream_total_timeout
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     content_type = str(response.headers.get("Content-Type") or "")
@@ -412,6 +417,10 @@ class LLMClient:
                         # 服务端未按 SSE 返回（如测试桩/不透流式的网关）：按普通 JSON 解析
                         return self._parse_response(json.loads(response.read().decode("utf-8")))
                     for raw_line in response:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(
+                                f"流式响应总时长超过 {self.stream_total_timeout}s，主动断开重试"
+                            )
                         line = raw_line.decode("utf-8", errors="replace").strip()
                         if not line.startswith("data:"):
                             continue

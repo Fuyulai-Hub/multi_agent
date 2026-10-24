@@ -446,23 +446,46 @@ class MCPClient:
 
     # ---------------------------------------------------------------- 协议
     def request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """发一次请求并返回**按 id 匹配**的响应。
+
+        MCP 服务会在响应之间插入通知帧（实测 Playwright MCP 会在 tools/call 前发
+        ``notifications/tools/list_changed``，该帧没有 id）。只读一行就当响应会导致
+        两层故障：
+          1. 读到通知帧 → payload 里既无 result 也无 error，call_tool 返回 {}；
+          2. 响应流整体错位一格 → 本次调用拿到上一次调用的结果。
+        表现为 browser_navigate 返回 {}、browser_evaluate 返回上一次导航的文本，
+        且是否发生取决于服务端发通知的时机（随机复现）。
+        因此这里循环读帧，跳过通知（无 id）与非本请求 id 的响应，直到匹配或超时。
+        """
         self._id += 1
         message = {"jsonrpc": "2.0", "id": self._id, "method": method}
         if params is not None:
             message["params"] = params
         self._transport.send(message)
-        try:
-            raw = self._transport.receive()
-        except queue.Empty as exc:
-            raise ConfigError(f"MCP 服务 {self.timeout}s 内无响应（method={method}）") from exc
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"MCP 服务返回了非 JSON 内容: {raw[:200]}") from exc
-        if "error" in payload:
-            error = payload["error"]
-            raise ConfigError(f"MCP 返回错误 {error.get('code')}: {error.get('message')}")
-        return payload
+
+        deadline = time.time() + self.timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise ConfigError(f"MCP 服务 {self.timeout}s 内无响应（method={method}）")
+            try:
+                raw = self._transport.receive()
+            except queue.Empty as exc:
+                raise ConfigError(f"MCP 服务 {self.timeout}s 内无响应（method={method}）") from exc
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ConfigError(f"MCP 服务返回了非 JSON 内容: {raw[:200]}") from exc
+            if not isinstance(payload, dict):
+                continue  # 批量/异常形态：与本次请求无关，跳过
+            if "id" not in payload:
+                continue  # 通知帧（如 notifications/tools/list_changed）
+            if payload.get("id") != self._id:
+                continue  # 非本请求的响应（错位残留）
+            if "error" in payload:
+                error = payload["error"]
+                raise ConfigError(f"MCP 返回错误 {error.get('code')}: {error.get('message')}")
+            return payload
 
     def initialize(self) -> Dict[str, Any]:
         return self.request("initialize", {

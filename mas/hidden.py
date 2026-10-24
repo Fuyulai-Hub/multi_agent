@@ -55,8 +55,9 @@ _PROTOCOL = """## 输出契约（必须只输出一个 JSON 对象）
    unittest 用例类与 ``test_*`` 方法，禁止 ``main``、结果标记、结果文件或读取实现源码。
 3. 方法名必须是 ``test_{category}_{op}_{name}``，其中 ``op``/``name`` 只含 ASCII
    字母、数字、下划线，且全局唯一；``cases`` 元数据必须与方法名一一对应。
-4. 每个功能点至少 1 条 functional 用例；契约里的异常与边界规则必须各自落到
-   exception / boundary 用例（阈值按 t、t-ε、t+ε 三态设计）。
+4. 每个功能点都必须有 functional 用例（无论其类别是功能/异常/边界——验收门禁按
+   functional 覆盖率 100% 口径核对）；类别为「异常」「边界」「约束」的功能点
+   另写对应的 exception / boundary 用例（阈值按 t、t-ε、t+ε 三态设计）。
 5. 期望值只能来自契约的规则与样例，禁止读取或猜测实现细节；不得把实现代码里可能存在的
    缺陷当成期望行为。
 6. 测试套件必须在沙箱超时内完成；不得启动常驻进程。若契约声明的是 HTTP 服务，在测试进程内
@@ -142,6 +143,43 @@ def _assertion_count(files: Iterable[Dict[str, str]]) -> int:
     return count
 
 
+def _is_test_case(node: ast.ClassDef) -> bool:
+    """与 verifier._is_test_case 同一口径：直接继承 ``*TestCase`` 才算。"""
+    for base in node.bases:
+        name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+        if str(name).endswith("TestCase"):
+            return True
+    return False
+
+
+def _collect_test_methods(
+    files: Iterable[Dict[str, str]],
+) -> Tuple[set, List[str]]:
+    """AST 枚举 TestCase 子类中的 ``test*`` 方法名。
+
+    「无可枚举用例 / 方法绑定不完整」原本要到 verifier.freeze（写盘之后）才发现，
+    一次尝试要 10 分钟级 LLM 生成才走到那里（task09-miniledger-04 attempt1 实测：
+    pytest 风格模块级函数通过本函数前置的结构校验，freeze 才报无可枚举用例）。
+    这里把同一口径提前到生成校验阶段，毫秒级发现同类协议违规。
+    """
+    methods: set = set()
+    errors: List[str] = []
+    for item in files:
+        try:
+            tree = ast.parse(item["content"])
+        except SyntaxError as exc:
+            errors.append(f"hidden_file_syntax_error:{item['path']}:{exc.msg}")
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not _is_test_case(node):
+                continue
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and child.name.startswith("test"):
+                    methods.add(child.name)
+    return methods, errors
+
+
 def validate_generated_suite(
     data: Dict[str, Any],
     spec: Dict[str, Any],
@@ -196,11 +234,29 @@ def validate_generated_suite(
                 "assert_kind": str(item.get("assert_kind") or "eq"),
             })
 
-    for fp_id in fps:
-        if "functional" not in covered.get(fp_id, set()):
+    for fp_id, fp in fps.items():
+        got = covered.get(fp_id, set())
+        if not got:
+            errors.append(f"hidden_case_missing:{fp_id}")
+        elif "functional" not in got:
+            # 门禁口径对齐（20261024-233917-897d 实测）：隐藏门禁要求
+            # hidden_functional_coverage rate >= 1.0（覆盖全部 FP，不限类别），
+            # 协议若只要求「功能类 FP 写 functional」，异常/边界 FP 只写 exception/
+            # boundary 用例会在验收时才暴露缺口——此时整条流水线已跑完，代价最大。
             errors.append(f"hidden_functional_case_missing:{fp_id}")
-    if files and _assertion_count(files) == 0:
-        errors.append("hidden_suite_has_no_assertions")
+    if files:
+        defined, syntax_errors = _collect_test_methods(files)
+        errors.extend(syntax_errors)
+        if not defined:
+            errors.append("hidden_suite_no_test_methods")
+        else:
+            expected = {_method_for(case) for case in cases}
+            for method in sorted(expected - defined):
+                errors.append(f"hidden_case_method_missing:{method}")
+            for method in sorted(defined - expected):
+                errors.append(f"hidden_method_without_case:{method}")
+        if _assertion_count(files) == 0:
+            errors.append("hidden_suite_has_no_assertions")
 
     return {"errors": list(dict.fromkeys(errors)), "files": files, "cases": cases}
 

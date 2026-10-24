@@ -29,10 +29,14 @@ from typing import Any, Dict, List, Optional
 from .config import SystemConfig
 from .sandbox import Sandbox
 
-__all__ = ["UiProber", "PORT_MARKER"]
+__all__ = ["UiProber", "PORT_MARKER", "PROBE_VERSION"]
 
 PORT_MARKER = "MAS_UI_PORT="
 _PORT_RE = re.compile(re.escape(PORT_MARKER) + r"(\d+)")
+
+#: 证据格式版本：门禁用它区分"probe 真实采集"与"agent 自填的空壳证据"。
+#: 只有 UiProber 会写这个值；tester 的 disabled/降级分支一律留空串。
+PROBE_VERSION = "uiprober/2"
 
 
 class UiProber:
@@ -46,23 +50,35 @@ class UiProber:
         probe_cfg = dict(config.runtime.get("ui_probe") or {})
         self.server_name = str(probe_cfg.get("server", ""))
         self.timeout = int(probe_cfg.get("timeout", 300))
+        self.console_tool = str(probe_cfg.get("console_tool", "browser_console_messages"))
 
     # ---------------------------------------------------------------- 入口
     def collect(self, *, service_cmd: List[str], checks: List[Dict[str, Any]],
                 startup_timeout: int = 30) -> Dict[str, Any]:
-        """执行全部 checks，返回 ui_evidence（mode 恒为 browser；fatal 时 failed_asserts>0）。"""
+        """执行全部 checks，返回 ui_evidence（mode 恒为 browser；fatal 时 failed_asserts>0）。
+
+        证据全部由本采集器（框架进程）产生并落盘 evidence/ui/probe_evidence.json：
+        - ``http_status``/``http_probe``：框架进程对被测服务发真实 HTTP GET 的状态码；
+        - ``console_errors``：经浏览器 MCP 采集的页面 console error（best-effort，
+          工具不可用时如实记录原因，不静默为空）；
+        - ``checks``：每条 DOM/文本断言的名称、期望值、实际结果与证据文件；
+        - ``probe_version``：证据格式版本，门禁据此拒绝"没有 probe 参与"的 ui_evidence。
+        """
         checks = [c for c in (checks or []) if isinstance(c, dict)]
         evidence: Dict[str, Any] = {
-            "mode": "browser", "server": self.server_name,
+            "mode": "browser", "server": self.server_name, "probe_version": PROBE_VERSION,
             "checks": [], "failed_asserts": 0, "screenshots": [], "error": "",
+            "http_status": 0, "http_probe": {}, "console_errors": [], "console_note": "",
         }
         if not checks:
             evidence["error"] = "web_fullstack 需求启用了 ui_probe，但测试契约未提供 ui_checks"
             evidence["failed_asserts"] = 1
+            self._save_probe_evidence(evidence)
             return evidence
         if not self.server_name:
             evidence["error"] = "runtime.ui_probe.server 未配置"
             evidence["failed_asserts"] = len(checks)
+            self._save_probe_evidence(evidence)
             return evidence
 
         proc: Optional[subprocess.Popen] = None
@@ -70,8 +86,13 @@ class UiProber:
         try:
             proc = self._spawn_service(service_cmd)
             base_url = self._await_port(proc, startup_timeout)
-            client = self._connect_mcp()
             evidence["base_url"] = base_url
+            # 真实 HTTP 状态由框架进程直接取证（不依赖浏览器 MCP、不依赖 agent 自报）
+            evidence["http_probe"] = self._http_probe(base_url)
+            evidence["http_status"] = int(evidence["http_probe"].get("status", 0))
+            if not 200 <= evidence["http_status"] < 400:
+                evidence["failed_asserts"] += 1
+            client = self._connect_mcp()
             for check in checks:
                 record = self._run_check(client, check, base_url)
                 evidence["checks"].append(record)
@@ -79,6 +100,7 @@ class UiProber:
                     evidence["failed_asserts"] += 1
                 if record.get("evidence_file"):
                     evidence["screenshots"].append(record["evidence_file"])
+            evidence["console_errors"], evidence["console_note"] = self._collect_console_errors(client)
         except Exception as exc:  # noqa: BLE001 - 致命错误按全部失败计，绝不空证据判过
             evidence["error"] = f"{type(exc).__name__}: {exc}"
             evidence["failed_asserts"] = max(1, len(checks))
@@ -87,7 +109,64 @@ class UiProber:
                                  payload={"error": evidence["error"]})
         finally:
             self._cleanup(client, proc)
+        self._save_probe_evidence(evidence)
         return evidence
+
+    # ---------------------------------------------------------------- 框架侧 HTTP 取证
+    @staticmethod
+    def _http_probe(base_url: str, timeout: int = 10) -> Dict[str, Any]:
+        """框架进程对被测服务发一次真实 GET，记录状态码/响应特征（probe 写，agent 不参与）。"""
+        import urllib.error
+        import urllib.request
+
+        started = time.time()
+        try:
+            with urllib.request.urlopen(base_url, timeout=timeout) as response:  # noqa: S310
+                body = response.read(4096).decode("utf-8", errors="replace")
+                return {"url": base_url, "status": int(response.status),
+                        "content_type": str(response.headers.get("Content-Type", "")),
+                        "body_head": body[:200], "error": "",
+                        "duration_ms": int((time.time() - started) * 1000)}
+        except urllib.error.HTTPError as exc:
+            return {"url": base_url, "status": int(exc.code), "content_type": "",
+                    "body_head": "", "error": f"HTTPError: {exc.reason}",
+                    "duration_ms": int((time.time() - started) * 1000)}
+        except Exception as exc:  # noqa: BLE001 - 连不上就是取不到证据，如实记录
+            return {"url": base_url, "status": 0, "content_type": "", "body_head": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "duration_ms": int((time.time() - started) * 1000)}
+
+    def _collect_console_errors(self, client: Any) -> tuple:
+        """经浏览器 MCP 采集 console error（best-effort）：返回 (errors, note)。
+
+        工具不存在/调用失败不判 fatal（checks 已各自入账），但必须留痕——
+        "console_errors 为空"要能区分"页面没有报错"和"根本没采到"。
+        """
+        try:
+            result = client.call_tool(self.console_tool, {})
+            text = self._text_of(result)
+        except Exception as exc:  # noqa: BLE001
+            return [], f"console 采集工具 {self.console_tool} 不可用：{type(exc).__name__}: {exc}"
+        errors = [line.strip()[:300] for line in text.splitlines()
+                  if re.search(r"\b(error|severe)\b", line, re.IGNORECASE)]
+        try:
+            directory = self.run_dir / "evidence" / "ui"
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "console_messages.txt").write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+        return errors, f"console 采集工具 {self.console_tool}，原始输出见 evidence/ui/console_messages.txt"
+
+    def _save_probe_evidence(self, evidence: Dict[str, Any]) -> None:
+        """把完整证据落盘（probe 写证据，不由 agent 填）；写失败留痕不抛出。"""
+        try:
+            directory = self.run_dir / "evidence" / "ui"
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "probe_evidence.json").write_text(
+                json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            evidence.setdefault("error", "")
+            evidence["error"] = (evidence["error"] + "; probe 证据落盘失败").lstrip("; ")
 
     # ---------------------------------------------------------------- 服务生命周期
     def _spawn_service(self, service_cmd: List[str]) -> subprocess.Popen:
@@ -151,12 +230,14 @@ class UiProber:
     def _run_check(self, client: Any, check: Dict[str, Any], base_url: str) -> Dict[str, Any]:
         name = str(check.get("name", "")) or "未命名检查"
         expect = str((check.get("expect") or {}).get("contains", ""))
-        record: Dict[str, Any] = {"name": name, "passed": False, "detail": "", "evidence_file": ""}
+        record: Dict[str, Any] = {"name": name, "passed": False, "detail": "", "evidence_file": "",
+                                  "expect": expect, "tools": []}
         last_text = ""
         try:
             for step in (check.get("steps") or []):
                 if not isinstance(step, dict) or not step.get("tool"):
                     raise ValueError(f"check「{name}」存在非法 step（缺 tool）")
+                record["tools"].append(str(step["tool"]))
                 arguments = self._subst(step.get("arguments") or {}, base_url)
                 result = client.call_tool(str(step["tool"]), arguments)
                 last_text = self._text_of(result)

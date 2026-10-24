@@ -176,23 +176,83 @@ class NegotiationClosureIntegrityTests(unittest.TestCase):
 
 
 class NonPythonDeliveryHonestyTests(unittest.TestCase):
-    """非 Python 交付物：度量与自检口径必须诚实，失败点要落在真正受限的环节。
+    """非 Python 交付物：有工具链就真实校验，没有就 fail closed 标 unsupported。
 
-    task04（C++ 智能指针）实测：manifest 报「2 个文件，0 行」（code_stats 只认 .py），
-    implement 因 `python -c import smartptr` ModuleNotFoundError 被判"导入自检失败"——
-    而真实边界在测试节点（沙箱只能执行 Python，无法编译验证 C++）。
+    task04（C++ 智能指针）历史漏洞：manifest 报「2 个文件，0 行」，`_self_check`
+    返回 not_applicable + ok=True——`.hpp` 从未被编译就让 implement 节点放行，
+    最终还拿到过 pass。现在：C/C++ 需要 g++/clang（存在且入沙箱白名单）做
+    -fsyntax-only 真实校验，否则 unsupported 判失败；JS 走白名单内的 `node --check`。
     """
 
-    def test_self_check_not_applicable_for_non_python(self):
+    @staticmethod
+    def _sandboxed_agent():
         from mas.agents.developer import DeveloperAgent
+        from mas.sandbox import Sandbox
 
-        agent, _ctx, tmp = _agent(DeveloperAgent)
+        agent, ctx, tmp = _agent(DeveloperAgent)
+        root = Path(tmp.name) / "sbx"
+        root.mkdir(parents=True, exist_ok=True)
+        ctx.sandbox = Sandbox(root, ctx.config)
+        return agent, ctx, tmp, root
+
+    def test_self_check_unsupported_for_cpp_without_toolchain(self):
+        agent, _ctx, tmp, root = self._sandboxed_agent()
         try:
+            agent.sandbox_write("include/smartptr.hpp", "template<class T> struct Ptr {};")
             task = NodeTask(node_id="implement", title="编码实现", role="developer",
                             kind="task", iteration=1)
             check = agent._self_check("smartptr", task, ["include/smartptr.hpp", "tests/t.cpp"])
-            self.assertTrue(check["ok"])
-            self.assertTrue(check["not_applicable"])
+            self.assertNotIn("not_applicable", check)
+            # 本机 g++/clang 不在沙箱白名单（allowed=python/node）→ 必须 fail closed
+            self.assertFalse(check["ok"])
+            self.assertTrue(check["unsupported"])
+        finally:
+            tmp.cleanup()
+
+    def test_self_check_runs_node_for_js_delivery(self):
+        """JS 交付走真实工具链：node --check 语法校验（node 在沙箱白名单内）。"""
+        import shutil
+
+        if not shutil.which("node"):
+            self.skipTest("本机没有 node")
+        agent, _ctx, tmp, root = self._sandboxed_agent()
+        try:
+            agent.sandbox_write("app/main.js", "const x = 1;\nmodule.exports = x;\n")
+            task = NodeTask(node_id="implement", title="编码实现", role="developer",
+                            kind="task", iteration=1)
+            check = agent._self_check("app", task, ["app/main.js"])
+            self.assertTrue(check["ok"], check)
+            self.assertIn("node --check", check["cmd"])
+            self.assertEqual(check["files"][0]["exit_code"], 0)
+        finally:
+            tmp.cleanup()
+
+    def test_self_check_node_catches_broken_js(self):
+        import shutil
+
+        if not shutil.which("node"):
+            self.skipTest("本机没有 node")
+        agent, _ctx, tmp, root = self._sandboxed_agent()
+        try:
+            agent.sandbox_write("app/bad.js", "const x = ;\n")
+            task = NodeTask(node_id="implement", title="编码实现", role="developer",
+                            kind="task", iteration=1)
+            check = agent._self_check("app", task, ["app/bad.js"])
+            self.assertFalse(check["ok"])
+            self.assertFalse(check.get("unsupported", False))
+        finally:
+            tmp.cleanup()
+
+    def test_self_check_static_assets_are_labeled_not_verified(self):
+        """纯静态资源（html/css）没有编译型校验：如实标 static_assets，不伪装成已验证。"""
+        agent, _ctx, tmp, root = self._sandboxed_agent()
+        try:
+            agent.sandbox_write("index.html", "<div id='root'></div>")
+            task = NodeTask(node_id="implement", title="编码实现", role="developer",
+                            kind="task", iteration=1)
+            check = agent._self_check("site", task, ["index.html"])
+            self.assertTrue(check["static_assets"])
+            self.assertNotIn("not_applicable", check)
         finally:
             tmp.cleanup()
 
@@ -215,23 +275,17 @@ class NonPythonDeliveryHonestyTests(unittest.TestCase):
         finally:
             tmp.cleanup()
 
-    def test_self_check_skips_test_only_round_for_cpp(self):
-        """C++ 任务的 optimize 轮只额外重写 tests/test_*.py 时，不得再跑 `import smartptr`。
-
-        task04-cpp-probe-03 optimize#1 实测：本轮 written = [include/smartptr.hpp,
-        tests/test_smartptr.cpp, tests/test_smartptr.py]，原判定只看"有没有 .py"，
-        于是对 C++ 包名发起导入、ModuleNotFoundError、节点被判"导入自检失败"。
-        """
-        from mas.agents.developer import DeveloperAgent
-
-        agent, _ctx, tmp = _agent(DeveloperAgent)
+    def test_self_check_cpp_optimize_round_fails_closed(self):
+        """C++ 任务的 optimize 轮（连带重写测试文件）同样 fail closed，不再放行。"""
+        agent, _ctx, tmp, root = self._sandboxed_agent()
         try:
+            agent.sandbox_write("include/smartptr.hpp", "template<class T> struct Ptr {};")
             task = NodeTask(node_id="optimize", title="缺陷修复", role="developer",
                             kind="task", iteration=1)
             check = agent._self_check("smartptr", task, [
                 "include/smartptr.hpp", "tests/test_smartptr.cpp", "tests/test_smartptr.py"])
-            self.assertTrue(check["ok"])
-            self.assertTrue(check["not_applicable"])
+            self.assertFalse(check["ok"])
+            self.assertTrue(check["unsupported"])
         finally:
             tmp.cleanup()
 
@@ -256,8 +310,12 @@ class NonPythonDeliveryHonestyTests(unittest.TestCase):
     def test_self_check_label_is_honest(self):
         from mas.agents.developer import DeveloperAgent
 
-        self.assertEqual(DeveloperAgent._self_check_label({"ok": True, "not_applicable": True}),
-                         "导入自检不适用（非 Python 交付物）")
+        self.assertEqual(
+            DeveloperAgent._self_check_label({"ok": False, "unsupported": True}),
+            "非 Python 交付不支持（缺工具链，fail closed）")
+        self.assertEqual(
+            DeveloperAgent._self_check_label({"ok": True, "static_assets": True}),
+            "静态资源交付（无编译型自检，验证通道为浏览器 probe）")
         self.assertEqual(DeveloperAgent._self_check_label({"ok": True}), "导入自检通过")
         self.assertEqual(DeveloperAgent._self_check_label({"ok": False}), "导入自检失败")
 

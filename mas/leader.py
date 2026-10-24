@@ -20,10 +20,12 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import sources
 from .agents import create_agent
+from .artifacts import ArtifactPolicy, gate_config_hash
 from .blackboard import Blackboard
 from .bus import MessageBus
 from .config import SystemConfig, load_requirement
@@ -46,7 +48,8 @@ from .sandbox import Sandbox
 from .schemas import AgentContext, AgentResult, NodeTask
 from .skills import build_tool_schema, list_skills, load_run_facts, run_skill_script
 from .verifier import (
-    TestVerifier, VerificationError, code_tree_hash, require_signing_secret, verify_signed,
+    TestVerifier, VerificationError, code_tree_hash, require_release_profile,
+    require_signing_secret, verify_signed,
 )
 from .verify.exec import execute_hidden_suite
 
@@ -244,6 +247,10 @@ class Leader:
         self.config = config
         # release 模式缺稳定签名密钥时在启动阶段就拒绝（dev 模式仍允许进程随机密钥）
         require_signing_secret(config)
+        # release 只允许 full/strict：lean 裁掉 review 且门禁只剩 5 条 criterion
+        require_release_profile(config)
+        # 产物发布策略（schema + 角色 ACL）：由角色/流程 outputs 确定性推导
+        self.artifact_policy = ArtifactPolicy.from_config(config)
         self._store_backends_cache: Any = None
 
     def _store_backends(self) -> Any:
@@ -467,7 +474,8 @@ class Leader:
                     "prefix": bus_mq.prefix,
                 },
             )
-        blackboard = Blackboard(run_dir / "artifacts", events, run_id)
+        blackboard = Blackboard(run_dir / "artifacts", events, run_id,
+                                policy=self.artifact_policy)
         sandbox = Sandbox(run_dir / "code", self.config, events=events)
         experience = ExperienceLibrary(self.config.workspace_dir, self.config.learning, events, run_id,
                                        mysql=backends.mysql)
@@ -724,7 +732,8 @@ class Leader:
                                  "strategy": collaboration.escalation.get("on_exhausted", "fail_run_and_report"),
                                  "notify": collaboration.escalation.get("notify", [])},
                     )
-                    self._publish_forced_gate(blackboard, "环境/证据通道缺口", unfixable, iteration)
+                    self._publish_forced_gate(blackboard, "环境/证据通道缺口", unfixable,
+                                              iteration, run_id=ctx.run_id)
                     target = "report" if "report" in flow.nodes else "halt"
                 elif branch == "fail" and self._is_rollback(node_id, target, iterations, rollback_counts):
                     # 权限落地：节点角色显式声明 can_rollback=false 时，拒绝回退并终止流程
@@ -766,7 +775,9 @@ class Leader:
                                 },
                             )
                             if str(collaboration.escalation.get("on_exhausted", "fail_run_and_report")) == "fail_run_and_report":
-                                self._publish_forced_gate(blackboard, "回退次数耗尽", pending_reason, iteration)
+                                self._publish_forced_gate(blackboard, "回退次数耗尽",
+                                                          pending_reason, iteration,
+                                                          run_id=ctx.run_id)
                                 target = "report"
                             else:
                                 target = "halt"
@@ -802,9 +813,28 @@ class Leader:
         # ---------------------------------------------------------------- 收尾
         duration_s = round((datetime.now().astimezone() - started).total_seconds(), 2)
         gate = blackboard.get("acceptance_gate") or {}
-        verdict = "pass" if gate.get("passed") and not forced_fail else "fail"
         bugs = blackboard.get("bug_reports") or {}
         report = blackboard.get("acceptance_report") or {}
+
+        # 报告对账（门禁加固）：gate 是唯一裁决源，报告只能渲染它。run_id/verdict
+        # 任一不一致直接判失败——防止「门禁判 fail、报告写 pass」或跨运行的陈旧
+        # 产物被拼在一起冒充本次结论。取消的运行没有自然终态，不做该判定。
+        if not canceled:
+            mismatch = self._reconcile_report_gate(gate, report, run_id)
+            if mismatch:
+                forced_fail = True
+                events.emit(
+                    "gate_report_mismatch", agent="leader", severity="error",
+                    payload={
+                        "run_id": run_id,
+                        "reasons": mismatch,
+                        "gate_run_id": str(gate.get("run_id") or ""),
+                        "report_run_id": str(report.get("run_id") or ""),
+                        "gate_passed": gate.get("passed"),
+                        "report_verdict": str(report.get("verdict") or ""),
+                    },
+                )
+        verdict = "pass" if gate.get("passed") and not forced_fail else "fail"
 
         if canceled:
             verdict = "fail"      # 手动终止的运行不参与验收结论（不显示为"通过"）
@@ -832,6 +862,7 @@ class Leader:
             "ts": started.isoformat(timespec="seconds"),
             "requirement_title": req_title,
             "profile": self.config.profile,
+            "gate_config_hash": str(gate.get("gate_config_hash") or ""),
             "acceptance": verdict == "pass",
             "node_executions": steps,
             "rollbacks": ctx.run_state["rollbacks"],
@@ -1053,7 +1084,8 @@ class Leader:
         events = EventLog(run_dir / "events.jsonl", run_id)
         events.load()
         bus = MessageBus(run_dir / "messages.jsonl", events, run_id)
-        blackboard = Blackboard(run_dir / "artifacts", events, run_id)
+        blackboard = Blackboard(run_dir / "artifacts", events, run_id,
+                                policy=self.artifact_policy)
         sandbox = Sandbox(run_dir / "code", self.config, events=events)
         experience = ExperienceLibrary(self.config.workspace_dir, self.config.learning, events, run_id)
         # 沉淀是 off-flow 动作，不再往历史运行目录追加 Prompt 留痕
@@ -1083,6 +1115,14 @@ class Leader:
         }
 
     # ================================================================= 门禁
+    def _gate_config_hash(self, node_id: str) -> str:
+        """当前门禁配置指纹（判定项 + profile + 协作守卫），写入裁决记录供审计。"""
+        try:
+            node = self.config.flow.node(node_id)
+        except Exception:  # noqa: BLE001 - 测试替身/无 flow 配置时按空判定项计算
+            return gate_config_hash(SimpleNamespace(id=node_id, criteria=[]), self.config)
+        return gate_config_hash(node, self.config)
+
     def _run_gate(self, ctx: AgentContext, task: NodeTask, agents: Dict[str, Any]) -> Dict[str, Any]:
         node = self.config.flow.node(task.node_id)
         snapshot = ctx.blackboard.snapshot()
@@ -1195,6 +1235,11 @@ class Leader:
         failed = [item for item in criteria_results if not item["passed"]]
         gate = {
             "node": node.id,
+            # 裁决记录（最小加固）：run_id 允许报告侧对账；profile 与门禁配置指纹
+            # 说明「这次通过是在哪套规则下产生的」，避免 lean 之类裁剪被静默带过。
+            "run_id": str(ctx.run_id),
+            "profile": str(self.config.profile or "base"),
+            "gate_config_hash": self._gate_config_hash(node.id),
             "passed": passed,
             "criteria": criteria_results,
             "failed_criteria": failed,
@@ -1787,7 +1832,9 @@ class Leader:
         与 collaboration.rollback 的回退是两套机制：retry 不改变流程位置（原地重试），
         rollback 退回到上游节点。默认 max_attempts=1（不重试），行为与原来一致。
         """
+        start_seq = self._event_count(ctx)
         result = agents[node.role].act(task)
+        result = self._enforce_declared_outputs(ctx, node, task, result, start_seq)
         max_attempts = max(1, int(getattr(node.retry, "max_attempts", 1) or 1))
         attempts = 1
         while result.status != "pass" and attempts < max_attempts:
@@ -1800,8 +1847,61 @@ class Leader:
                     "reason": (result.error or result.summary)[:200],
                 },
             )
+            start_seq = self._event_count(ctx)
             result = agents[node.role].act(task)
+            result = self._enforce_declared_outputs(ctx, node, task, result, start_seq)
         return result, result.status
+
+    @staticmethod
+    def _event_count(ctx: AgentContext) -> int:
+        event_log = getattr(getattr(ctx, "events", None), "events", None)
+        return len(event_log) if isinstance(event_log, list) else 0
+
+    def _enforce_declared_outputs(self, ctx: AgentContext, node: Any, task: NodeTask,
+                                  result: AgentResult, start_seq: int = 0) -> AgentResult:
+        """运行态校验节点声明产物：``require_declared_artifacts`` 不再只是配置。
+
+        只审计「本轮本节点确实发布到黑板」的产物（以本次执行新增的
+        ``artifact_published`` 事件为准，而非 Agent 自报的 result.artifacts）。
+        缺失时把节点改判失败并留下 ``artifact_missing`` 事件，让既有的
+        重试/回退逻辑接管。
+        """
+        if result.status != "pass":
+            return result
+        guards = getattr(getattr(self.config, "collaboration", None), "guards", None) or {}
+        if not guards.get("require_declared_artifacts"):
+            return result
+        declared = [str(name) for name in (getattr(node, "outputs", None) or [])]
+        if not declared:
+            return result
+        event_log = getattr(getattr(ctx, "events", None), "events", None)
+        if not isinstance(event_log, list):
+            return result       # 测试替身没有事件流，无法取证时保持原结论
+        node_id = str(getattr(node, "id", ""))
+        iteration = int(getattr(task, "iteration", 0) or 0)
+        published = set()
+        for event in event_log[max(0, int(start_seq)):]:
+            if getattr(event, "type", "") != "artifact_published":
+                continue
+            if str(getattr(event, "node", "")) != node_id:
+                continue
+            if int(getattr(event, "iteration", 0) or 0) != iteration:
+                continue
+            name = str((getattr(event, "payload", None) or {}).get("artifact") or "")
+            if name:
+                published.add(name)
+        missing = [name for name in declared if name not in published]
+        if not missing:
+            return result
+        result.status = "fail"
+        result.error = "缺少声明产物: " + "、".join(missing)
+        result.summary = result.error
+        ctx.events.emit(
+            "artifact_missing", agent=node.role or "leader", node=node_id, iteration=iteration,
+            severity="error",
+            payload={"missing": missing, "declared": declared},
+        )
+        return result
 
     def _rollback_permitted(
         self, node_id: str, node: Any, target: str, agents: Dict[str, Any],
@@ -2072,17 +2172,53 @@ class Leader:
         return ""
 
     def _publish_forced_gate(self, blackboard: Blackboard, criteria_id: str, reason: str,
-                             iteration: int) -> None:
+                             iteration: int, run_id: str = "") -> None:
         """发布「非交付物缺陷」导致的强制不通过门禁产物（回退耗尽 / 环境通道缺口共用同一结构）。"""
         blackboard.publish(
             "acceptance_gate",
-            {"node": "acceptance", "passed": False, "forced": True, "criteria": [],
+            {"node": "acceptance", "run_id": str(run_id),
+             "profile": str(getattr(self.config, "profile", "") or "base"),
+             "gate_config_hash": self._gate_config_hash("acceptance"),
+             "passed": False, "forced": True, "criteria": [],
              "failed_criteria": [{"id": criteria_id, "reason": reason}],
              "signoff": {"verdict": "reject", "opinion": f"{criteria_id}，验收不通过"},
              "evaluated_at": datetime.now().astimezone().isoformat(timespec="seconds")},
             producer="leader", node="acceptance", iteration=iteration,
             summary=f"{criteria_id}，判定不通过",
         )
+
+    @staticmethod
+    def _reconcile_report_gate(gate: Dict[str, Any], report: Dict[str, Any],
+                               run_id: str) -> List[str]:
+        """对账报告与裁决记录；返回不一致原因（空列表 = 一致）。
+
+        口径（失败关闭）：
+        - 没有 gate 却发布了 report → ``gate_missing``；
+        - gate/report 的 ``run_id`` 必须等于当前运行，且两者相等；
+        - report.verdict 必须严格等于 gate.passed 对应的 ``pass``/``fail``。
+        """
+        if not gate:
+            return ["gate_missing"] if report else []
+        expected_run_id = str(run_id)
+        gate_run_id = str(gate.get("run_id") or "")
+        reasons: List[str] = []
+        if gate_run_id != expected_run_id:
+            reasons.append(f"gate_run_id_mismatch:{gate_run_id or '-'}!={expected_run_id}")
+        if not report:
+            reasons.append("report_missing")
+            return reasons
+        report_run_id = str(report.get("run_id") or "")
+        if report_run_id != expected_run_id:
+            reasons.append(f"report_run_id_mismatch:{report_run_id or '-'}!={expected_run_id}")
+        if report_run_id != gate_run_id:
+            reasons.append(f"report_gate_run_id_mismatch:{report_run_id or '-'}!={gate_run_id or '-'}")
+        expected_verdict = "pass" if gate.get("passed") is True else "fail"
+        report_verdict = str(report.get("verdict") or "")
+        if report_verdict != expected_verdict:
+            reasons.append(
+                f"report_verdict_mismatch:{report_verdict or '-'}!={expected_verdict}"
+            )
+        return reasons
 
     @staticmethod
     def _logger(events: EventLog):

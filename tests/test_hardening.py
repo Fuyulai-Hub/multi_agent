@@ -614,10 +614,15 @@ class PermissionAndRetryTests(unittest.TestCase):
             self.assertFalse(leader._is_rollback("intake", "halt", {}, {}))
 
     def test_perception_brief_budget_configurable(self):
-        """感知段单产物预算可配置：默认 900 会把多功能点规格截到信息残缺。"""
+        """感知段单产物预算可配置：默认 900 会把多功能点规格截到信息残缺。
+
+        2026-10-24 task09-miniledger-02 实测：10 功能点规格 25494 字符，
+        10000 预算把 JSON 从 FP-07 起硬截断，implement 直接返回空文件列表。
+        故仓库默认值随本次修复提到 30000（超大产物仍应走 context_compression）。
+        """
         with tempfile.TemporaryDirectory() as tmp:
             config = load_config(PROJECT_ROOT / "config", workspace=Path(tmp) / "ws")
-            self.assertEqual(config.runtime.get("prompt_artifact_max_chars"), 10000)
+            self.assertEqual(config.runtime.get("prompt_artifact_max_chars"), 30000)
             blackboard = Blackboard(Path(tmp) / "artifacts")
             blackboard._latest["big"] = {"payload": "x" * 5000}
             blackboard._refs["big"] = [SimpleNamespace(version=1, producer="p")]

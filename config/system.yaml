@@ -41,6 +41,9 @@ llm:
   downgrade_reasoning_effort: "low,high"
   empty_output_retry: 2             # 最多降级重发几次（0=关闭降级）；与上面的阶梯长度取小者生效
   timeout: 600            # 该端点单次响应实测 150~200s（超时 120s 会导致 implement/optimize 读超时）
+  stream_total_timeout: 1800  # 流式单次尝试的总时长上限（秒）：urlopen 的 timeout 只管单次 socket 读，
+                              # 服务端持续推流时总时长无上限（实测挂 40 分钟无返回）；超此值主动断开并重试。
+                              # 须大于最长正常生成（实测流式完整响应 422s），不要设成与 timeout 相同。
   # function calling（默认开启，可在前端「模型配置」弹窗关闭）：开启后从 config/mcp.yaml 的
   # enabled 服务拉取工具清单，以 OpenAI tools 格式随请求下发；模型返回 tool_calls 时由
   # ToolRunner 真实执行并回传。无任何工具源时自动降级为无工具运行（发告警事件）。
@@ -118,14 +121,15 @@ runtime:
     release_mode: false
   # 静态分析并行度（按文件并行，IO 等待型负载；不配则用默认 min(8, cpu+4)）
   sandbox_analyze_workers: null
-  # UI 证据采集（docs/15 方案 B）：默认关闭，行为与现状一致。
-  # 启用后 tester 对 delivery_mode=web_fullstack 且声明了浏览器级验证的需求，
-  # 经 config/mcp.yaml 中注册的浏览器 MCP 服务（如 playwright）采集 UI 证据，
-  # 产出 ui_evidence artifact 供验收门禁第 9 条判定。
+  # UI 证据采集（docs/15 方案 B + 门禁加固）：默认开启。
+  # SPA 形态（含文件探测收紧出来的 SPA）强制走 browser 模式：ui_evidence 必须由
+  # UiProber（框架进程）写入真实 HTTP 状态、console error、DOM 断言清单与 probe_version，
+  # 浏览器 MCP 未接入时如实判失败（fail closed），不允许退化成只有 failed_asserts: 0。
   ui_probe:
-    enabled: false
+    enabled: true
     server: "playwright"          # mcp.yaml 中已注册且 enabled 的服务名
     timeout: 300                  # 单次 UI 探测总超时（秒），独立于 sandbox_timeout
+    console_tool: "browser_console_messages"   # 采集页面 console error 的 MCP 工具名
   # 项目指令文件（docs/36，对标 Codex 的 AGENTS.md）：从需求文件所在目录向上逐级收集到
   # 项目根，注入每个节点的 Prompt；文件头部可选 YAML front-matter，其中 delivery_shape
   # 由框架确定性采纳（优先于模型判定）。没有该文件时整段为空，Prompt 与未启用时逐字节一致。
@@ -161,7 +165,12 @@ runtime:
     # 参照量级：模型上下文窗口 131072 token 起（DeepSeek），英文正文约 4 字符/token，
     # 故满配注入约占窗口 1/4 以内；实际各节点按绑定技能注入，实测 4.6k~39k 字符。
     max_chars: 88000
-  prompt_artifact_max_chars: 10000  # Prompt 感知段单产物最大字符数：调高前的历史默认 900 会把 12 功能点的需求规格截到只剩 3 个 FP 片段（研发/测试/审查全程信息残缺，实测根因之一）；代码未配置时默认同为 10000
+  # Prompt 感知段单产物最大字符数：调高前的历史默认 900 会把 12 功能点的需求规格截到只剩
+  # 3 个 FP 片段（研发/测试/审查全程信息残缺，实测根因之一）；10000 对 13 功能点、带条款
+  # 引用的规格仍不够（task09-miniledger-02 实测 spec 25494 字符被硬切成半份 JSON，
+  # 模型自述"规格被截断"后无法实现）。30000 覆盖该类规格；再大仍会截断，届时改用
+  # runtime.context_compression 的结构化压缩（保留 FP 规则、丢 samples，不切坏 JSON）。
+  prompt_artifact_max_chars: 30000
   # 上下文压缩（docs/16 的 02 文档）：默认关闭，enabled=false 时恒等返回，行为与现状逐字节一致。
   # 开启后按白名单策略做结构化压缩（保 FP 的 id/title/rules、丢 samples/parameters 等明细），
   # 并向上游事件流发 context_compressed（含 before/after 字符数）；压缩不改黑板 artifact 数据。
@@ -171,6 +180,17 @@ runtime:
     total_chars: 32000           # 感知段总量预算；超出时按优先级裁剪低优先级明细
     llm_summary: false           # 可选 LLM 摘要（默认关：每次新增 LLM 调用都叠加网关超时风险）
   tool_result_max_chars: 4000    # tool 结果统一截断（头 60% + 尾 40%），0=不截断
+  # 隐藏用例生成的可修复次数（含首次）。结构校验失败（漏 FP、方法名非法、无断言、
+  # 无 TestCase 类、方法与 cases 不对应）属于输出协议未对齐，回灌错误清单 + 针对性
+  # 修复指引（见 ProductAgent._REPAIR_HINTS）重生成即可修复；task09-miniledger-03
+  # 实测漏写 FP-14 一条用例就让整轮 1690s 作废，-04 实测两轮修不对（第一轮修好结构
+  # 第二轮引入重名）也整轮作废。3 = 首次 + 两次修复；1 = 关闭修复（回到一次性生成）。
+  hidden_suite_max_attempts: 3
+  # 可见测试套件冻结前的覆盖率校验重试次数（含首次）。套件一旦冻结，FP×类别覆盖率
+  # 就被冻结清单永久固定（复测忽略新生成），而验收门禁要求三类覆盖率 >= 1.0；
+  # 20261024-233917-897d 实测首轮 10/9/7 of 12 被照单冻结后门禁永远失败。
+  # 缺口时回灌缺口清单重生成，仍缺口则测试节点判失败（不冻结），走回退重新生成。
+  test_coverage_max_attempts: 2
   # 上下文管理（docs/35）：对齐 Codex 的 truncation + compaction 分层机制。
   # 唯一生效点是 mas/llm.py 的请求组装；未启用或未超限时 fit 原样返回，请求体逐字节不变。
   # 分层：①truncate 单条 tool 结果头尾截断 → ②trim 从最老的「工具往返」整轮丢弃

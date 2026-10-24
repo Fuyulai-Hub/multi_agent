@@ -67,6 +67,30 @@ class _FakeTextResponse:
         return False
 
 
+def _sse_lines(text: str):
+    """最小 SSE 帧：一个 content chunk + [DONE]。"""
+    chunk = json.dumps({"choices": [{"delta": {"content": text}}]})
+    return [f"data: {chunk}\n".encode("utf-8"), b"data: [DONE]\n"]
+
+
+class _FakeSSEResponse:
+    """Content-Type 为 event-stream 且按行迭代，模拟持续推流的服务端。"""
+
+    headers = {"Content-Type": "text/event-stream"}
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
 class RetryClassificationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -163,6 +187,42 @@ class RetryClassificationTests(unittest.TestCase):
                 LLMClient(self.config).generate("requirement_spec", self.bundle, {})
         self.assertEqual(calls["n"], 1, "401 是明确的鉴权失败，重试无意义，应立即失败")
         self.assertIn("401", str(ctx.exception))
+
+
+    # ------------------------------------------------------ 流式总时长看门狗
+    def test_stream_total_timeout_retries_instead_of_hanging(self):
+        """持续推流但总时长超限：必须主动断开并重试，而不是无限挂起（2026-10-24 实测）。"""
+        self.config.llm["stream_total_timeout"] = 10
+        calls = {"n": 0}
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            clock["t"] += 100.0      # 每次调用前进 100s，模拟读行累计耗时超限
+            return clock["t"]
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            return _FakeSSEResponse(_sse_lines('{"ok": true}'))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                mock.patch("time.monotonic", side_effect=fake_monotonic):
+            generation = LLMClient(self.config).generate("requirement_spec", self.bundle, {})
+        self.assertEqual(calls["n"], 3, "超时应按 max_attempts 重试，而不是永久阻塞")
+        self.assertIsNotNone(generation.error)
+        self.assertIn("网络异常", generation.error)
+
+    def test_stream_normal_response_not_killed_by_watchdog(self):
+        """总时长未超限的正常流式响应：看门狗不得误伤。"""
+        self.config.llm["stream_total_timeout"] = 600
+
+        def fake_urlopen(request, timeout=None):
+            return _FakeSSEResponse(_sse_lines('{"ok": true}'))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                mock.patch("time.monotonic", return_value=0.0):
+            generation = LLMClient(self.config).generate("requirement_spec", self.bundle, {})
+        self.assertFalse(generation.error)
+        self.assertEqual(generation.data, {"ok": True})
 
 
 if __name__ == "__main__":

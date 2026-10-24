@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 from ..contract import (
@@ -198,11 +199,25 @@ class ProductAgent(BaseAgent):
                 result.error = "需求契约校验失败：" + "；".join(outcome["errors"][:8])
                 result.summary = result.error
                 result.metrics["contract_errors"] = outcome["errors"]
+                # 被拒规格必须完整落盘：llm_traces 的 output 有 12000 字符上限，
+                # 实测被拒时 trace 只剩半份 JSON，事后无法复核是哪条引文不匹配。
+                rejected_path = (self.ctx.run_dir / "rejected"
+                                 / f"requirement_spec_iter{task.iteration:02d}.json")
+                try:
+                    rejected_path.parent.mkdir(parents=True, exist_ok=True)
+                    rejected_path.write_text(json.dumps(
+                        {"spec": spec, "errors": outcome["errors"],
+                         "coverage": outcome["coverage"]},
+                        ensure_ascii=False, indent=2), encoding="utf-8")
+                    rejected_rel = str(rejected_path.relative_to(self.ctx.run_dir)).replace("\\", "/")
+                except OSError:
+                    rejected_rel = ""
                 self.ctx.events.emit(
                     "requirement_contract_rejected", agent=self.role_id, node=task.node_id,
                     iteration=task.iteration, severity="error",
                     payload={"errors": outcome["errors"][:20],
-                             "coverage": outcome["coverage"]},
+                             "coverage": outcome["coverage"],
+                             "rejected_spec": rejected_rel},
                 )
                 return
             try:
@@ -288,6 +303,28 @@ class ProductAgent(BaseAgent):
             payload=result.broadcast_payload,
         )
 
+    def _dump_rejected_hidden(
+        self, task: NodeTask, attempt: int, error: str, generation: Generation,
+    ) -> str:
+        """被拒的隐藏套件全量落盘（对齐 requirement_contract_rejected 的做法）。
+
+        llm_traces 对 output 有 12000 字符上限，且隐藏生成不经过 _trace_llm；
+        不落盘的话失败现场零留痕，事后无法复核模型到底输出了什么。
+        """
+        rejected = (self.ctx.run_dir / "rejected"
+                    / f"hidden_suite_iter{task.iteration:02d}_attempt{attempt:02d}.json")
+        try:
+            rejected.parent.mkdir(parents=True, exist_ok=True)
+            rejected.write_text(json.dumps({
+                "error": error,
+                "data": generation.data,
+                "raw": generation.text or "",
+                "finish_reason": getattr(generation, "finish_reason", ""),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            return str(rejected.relative_to(self.ctx.run_dir)).replace("\\", "/")
+        except OSError:
+            return ""
+
     # ---------------------------------------------------------------- 隐藏用例
     def _generate_hidden_suite(
         self,
@@ -315,64 +352,96 @@ class ProductAgent(BaseAgent):
             package=package,
             delivery_shape=str(frozen_spec.get("delivery_shape") or ""),
         )
-        prompt_path = (self.ctx.run_dir / "prompts"
-                       / f"{task.node_id}_hidden_iter{task.iteration:02d}.md")
-        prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_path.write_text(
-            f"<<<SYSTEM>>>\n{system}\n<<<USER>>>\n{user}", encoding="utf-8")
+        prompt_dir = self.ctx.run_dir / "prompts"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        base_prompt_path = prompt_dir / f"{task.node_id}_hidden_iter{task.iteration:02d}.md"
         context = {
             "spec": frozen_spec,
             "clauses": list(frozen.get("clauses") or []),
             "package": package,
             "policies": dict(self.role.policies),
         }
-        bundle = PromptBundle(
-            role=self.role_id, node=task.node_id, task_kind="hidden_test_suite",
-            iteration=task.iteration, system=system, user=user, context=context,
-            token_estimate=(len(system) + len(user)) // 3,
-            path=prompt_path,
-        )
-        try:
-            generation = self.ctx.llm.generate("hidden_test_suite", bundle, context)
-        except Exception as exc:  # noqa: BLE001 - 生成失败必须让节点明确失败
-            result.status = "fail"
-            result.error = f"隐藏用例生成失败: {type(exc).__name__}: {exc}"
-            result.summary = result.error
-            return None
-        result.metrics["hidden_generation"] = generation.to_dict()
-        if generation.error or generation.data is None:
-            result.status = "fail"
-            result.error = generation.error or "隐藏用例生成未返回可解析的 JSON"
-            result.summary = result.error
-            self.ctx.events.emit(
-                "hidden_suite_generation_failed", agent=self.role_id, node=task.node_id,
-                iteration=task.iteration, severity="error",
-                payload={"error": result.error, "prompt": str(prompt_path)},
+        # 结构校验失败是有界可修复的：把错误清单回灌给模型重生成整份 JSON。
+        # task09-miniledger-03 实测：模型漏写 FP-14 一条用例，一次性生成直接
+        # hidden_case_missing:FP-14 判 fail（整轮 1690s 作废）；同类错误还包括
+        # 方法名非法、断言为空——这些都是「输出没对齐协议」，不是需求不可实现。
+        max_attempts = max(1, int(self.ctx.config.runtime.get("hidden_suite_max_attempts", 2) or 2))
+        attempt = 1
+        repaired: List[str] = []
+        while True:
+            prompt_user = user
+            prompt_path = base_prompt_path
+            if attempt > 1:
+                prompt_user = user + "\n\n" + self._hidden_repair_block(repaired, attempt - 1)
+                prompt_path = base_prompt_path.with_name(
+                    f"{base_prompt_path.stem}_repair{attempt - 1:02d}.md")
+            prompt_path.write_text(
+                f"<<<SYSTEM>>>\n{system}\n<<<USER>>>\n{prompt_user}", encoding="utf-8")
+            bundle = PromptBundle(
+                role=self.role_id, node=task.node_id, task_kind="hidden_test_suite",
+                iteration=task.iteration, system=system, user=prompt_user, context=context,
+                token_estimate=(len(system) + len(prompt_user)) // 3,
+                path=prompt_path,
             )
-            return None
-        try:
-            artifact = create_hidden_suite(
-                config=self.ctx.config,
-                run_dir=self.ctx.run_dir,
-                sandbox=self.ctx.sandbox,
-                run_id=str(self.ctx.run_id),
-                spec=frozen_spec,
-                contract_hash=str(frozen.get("contract_hash") or ""),
-                data=generation.data,
-                iteration=task.iteration,
-                package=package,
-                generation=generation.to_dict(),
-            )
-        except HiddenSuiteError as exc:
-            result.status = "fail"
-            result.error = f"隐藏用例冻结失败: {exc}"
-            result.summary = result.error
-            self.ctx.events.emit(
-                "hidden_suite_generation_failed", agent=self.role_id, node=task.node_id,
-                iteration=task.iteration, severity="error",
-                payload={"error": result.error, "prompt": str(prompt_path)},
-            )
-            return None
+            try:
+                generation = self.ctx.llm.generate("hidden_test_suite", bundle, context)
+            except Exception as exc:  # noqa: BLE001 - 生成失败必须让节点明确失败
+                result.status = "fail"
+                result.error = f"隐藏用例生成失败: {type(exc).__name__}: {exc}"
+                result.summary = result.error
+                return None
+            result.metrics["hidden_generation"] = generation.to_dict()
+            result.metrics["hidden_generation_attempts"] = attempt
+            if generation.error or generation.data is None:
+                result.status = "fail"
+                result.error = generation.error or "隐藏用例生成未返回可解析的 JSON"
+                result.summary = result.error
+                self.ctx.events.emit(
+                    "hidden_suite_generation_failed", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="error",
+                    payload={"error": result.error, "prompt": str(prompt_path),
+                             "attempt": attempt,
+                             "rejected": self._dump_rejected_hidden(
+                                 task, attempt, result.error, generation)},
+                )
+                return None
+            try:
+                artifact = create_hidden_suite(
+                    config=self.ctx.config,
+                    run_dir=self.ctx.run_dir,
+                    sandbox=self.ctx.sandbox,
+                    run_id=str(self.ctx.run_id),
+                    spec=frozen_spec,
+                    contract_hash=str(frozen.get("contract_hash") or ""),
+                    data=generation.data,
+                    iteration=task.iteration,
+                    package=package,
+                    generation=generation.to_dict(),
+                )
+                break
+            except HiddenSuiteError as exc:
+                if attempt >= max_attempts:
+                    result.status = "fail"
+                    result.error = f"隐藏用例冻结失败: {exc}"
+                    result.summary = result.error
+                    self.ctx.events.emit(
+                        "hidden_suite_generation_failed", agent=self.role_id, node=task.node_id,
+                        iteration=task.iteration, severity="error",
+                        payload={"error": result.error, "prompt": str(prompt_path),
+                                 "attempt": attempt, "max_attempts": max_attempts,
+                                 "rejected": self._dump_rejected_hidden(
+                                     task, attempt, str(exc), generation)},
+                    )
+                    return None
+                repaired.append(str(exc))
+                self.ctx.events.emit(
+                    "hidden_suite_repair_requested", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="warning",
+                    payload={"attempt": attempt + 1, "errors": str(exc)[:500],
+                             "prompt": str(prompt_path)},
+                )
+                attempt += 1
+                continue
         self.evidence(
             result, "hidden_suite", path=str(artifact.get("workspace_relative") or ""),
             test_file=str(artifact.get("test_file") or ""),
@@ -390,7 +459,45 @@ class ProductAgent(BaseAgent):
                 "test_ids": len(artifact.get("test_ids") or []),
                 "contract_hash": str(artifact.get("contract_hash") or ""),
                 "prompt": str(prompt_path),
+                "attempts": attempt,
                 "note": "隐藏用例仅依据冻结契约生成，存放在 run 工作区之外",
             },
         )
         return artifact
+
+    # 结构校验错误键 → 针对性修复指引。只回灌裸错误码时模型不知道「怎么改」，
+    # task09-miniledger-04 实测：第 1 轮修好了类结构却引入方法名重复，两轮耗尽整轮作废。
+    _REPAIR_HINTS = (
+        ("hidden_suite_no_test_methods",
+         "测试文件必须是 unittest 风格：定义继承 unittest.TestCase 的类，用例写成类方法 "
+         "def test_xxx(self)；pytest 风格的模块级 test_ 函数不会被框架枚举"),
+        ("hidden_file_syntax_error",
+         "files 里每份 content 都必须是可被 Python 解析的完整源码（不要转义/折行/省略）"),
+        ("hidden_case_method_missing",
+         "cases 声明的每个用例都必须在 TestCase 类里有同名方法 test_{category}_{op}_{name}，一一对应"),
+        ("hidden_method_without_case",
+         "文件里每个 test_* 类方法都必须在 cases 中有对应条目；多余方法删除或补齐元数据"),
+        ("hidden_case_duplicate_method",
+         "同一 (category, op, name) 只能用一次；不同功能点的相似场景给 name 加区分后缀（如 _fp06/_fp10）"),
+        ("hidden_case_unknown_fp", "fp_id 只能引用契约 function_points 里真实存在的 id"),
+        ("hidden_case_missing", "cases 必须逐个覆盖契约的全部功能点（fp_id 逐个核对）"),
+        ("hidden_functional_case_missing", "每个功能点都必须有 functional 用例（不限 FP 类别，验收门禁按 functional 覆盖率 100% 核对）"),
+        ("hidden_case_invalid_category", "category 只能是 functional / exception / boundary"),
+        ("hidden_case_name_not_ascii", "op 与 name 只含 ASCII 字母、数字、下划线"),
+    )
+
+    @staticmethod
+    def _hidden_repair_block(errors: List[str], repair_index: int) -> str:
+        listed = "\n".join(f"- {item}" for item in errors) or "- （无错误详情）"
+        hints = [
+            hint for key, hint in ProductAgent._REPAIR_HINTS
+            if any(key in item for item in errors)
+        ]
+        hint_block = ("\n\n针对性修复指引：\n" + "\n".join(f"- {h}" for h in hints)) if hints else ""
+        return (
+            f"## 上一次输出未通过框架校验（第 {repair_index} 次修复）\n\n"
+            f"{listed}\n"
+            f"{hint_block}\n\n"
+            "请输出**修正后的完整 JSON**（files 与 cases 全量重写，不要输出差异或省略内容），"
+            "逐条消除上述错误；cases 必须覆盖冻结契约中的每一个功能点。"
+        )

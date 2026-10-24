@@ -662,7 +662,11 @@ class BaseAgent:
             directive = (directive + "；" if directive else "") + f"回退原因：{task.rollback_reason}"
         # ReAct 协议指令进 directive（因此随 prompts/*.md 一同落盘，留痕与实际下发一致）；
         # 未开启时 directive 逐字节不变。
-        if self._react_enabled(task):
+        # 只有「本节点真的会下发工具」时才注入协议：react.enabled/nodes 与 llm.tools_nodes
+        # 是两道独立闸门，只看前者会给无工具节点写下"发起工具调用"的指令（实测
+        # task09-miniledger-02 implement：模型按协议准备"先探查工作区"，请求里却没有
+        # tools，5 秒返回空文件清单 → 节点失败）。
+        if self._react_enabled(task) and self._tool_schemas(task) is not None:
             directive = (directive + "\n\n" if directive else "") + REACT_DIRECTIVE
         skills = self.match_skills(task, perception)
         skills_text = ""

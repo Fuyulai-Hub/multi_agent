@@ -455,19 +455,26 @@ class ReactLoopTests(unittest.TestCase):
             runner.close()
 
     def test_react_without_tools_degrades_to_single_round(self):
-        """react 开启但 tools_nodes 未放行该节点：无工具可用，退化为单轮生成，不报错。"""
+        """react 开启但 tools_nodes 未放行该节点：无工具可用，退化为单轮生成，不报错。
+
+        并且 directive 不得再注入 ReAct 协议——真机反例（task09-miniledger-02 implement）：
+        提示词按协议要求模型"先探查工作区再输出"，但请求里没有 tools，模型 5 秒返回
+        空文件清单，节点以「实现未产出任何文件」失败。
+        """
         self._set_react()
         self.config.llm["tools_nodes"] = ["intake"]
         _StubLLMHandler.requests = []
         _StubLLMHandler.script = [_final_answer]
         runner = self._runner()
+        prompts = _RecordingPrompts()
         try:
-            ctx = self._ctx(runner, _RecordingPrompts())
+            ctx = self._ctx(runner, prompts)
             result = _ReactAgent(ctx).act(self._task())
             self.assertEqual(result.status, "pass", result.error)
             self.assertEqual(len(_StubLLMHandler.requests), 1)
             self.assertNotIn("tools", _StubLLMHandler.requests[0])
             self.assertFalse([r for r in ctx.events.records if r["type"] == "react_step"])
+            self.assertNotIn("ReAct 执行协议", prompts.calls[0]["directive"])
         finally:
             runner.close()
 

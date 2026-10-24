@@ -13,11 +13,15 @@ flow:
             expr: "test_report.coverage.functional.rate >= 1.0"
           - id: "无未关闭缺陷"
             expr: "bug_reports.open == 0"
-          # docs/15 §6：仅 full_stack_spa（B 档）形态要求浏览器级 UI 证据（其余形态直接通过）
+          # SPA 判定以 ui_evidence.delivery_shape（文件探测口径）为准，证据必须由框架 probe 采集
           - id: "Web UI 断言无失败（仅 SPA 形态要求）"
-            expr: "requirement_spec.delivery_shape != 'full_stack_spa' or ui_evidence.failed_asserts == 0"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or ui_evidence.failed_asserts == 0"
           - id: "Web UI 证据非空（SPA 形态下不得证据不足）"
-            expr: "requirement_spec.delivery_shape != 'full_stack_spa' or len(ui_evidence.asserts) > 0"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or len(ui_evidence.asserts) > 0"
+          - id: "SPA 浏览器证据由框架 probe 采集"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or ui_evidence.probe_version != ''"
+          - id: "SPA 证据含真实 HTTP 状态"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or (ui_evidence.http_status >= 200 and ui_evidence.http_status < 400)"
 
 collaboration:
   rollback:

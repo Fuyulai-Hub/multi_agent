@@ -22,7 +22,9 @@ class ReporterAgent(BaseAgent):
     contracts = {
         "default": {
             "markdown": "完整验收报告（Markdown）",
-            "json": {"run_id": "", "verdict": "pass|fail", "test_summary": {}, "bugs": {}},
+            # run_id / verdict / gate_passed / profile / gate_config_hash 由框架按
+            # acceptance_gate 覆写（gate 是唯一裁决源），模型只需给证据统计。
+            "json": {"test_summary": {}, "bugs": {}},
         },
         "skill_distill": {
             "markdown": "技能补充说明（Markdown，可为空）",
@@ -55,10 +57,46 @@ class ReporterAgent(BaseAgent):
             result.summary = result.error
             return
 
+        # 门禁是唯一裁决源：报告只渲染 acceptance_gate，不再采信模型自报 verdict。
+        # gate 缺失或 run_id 不属于本次运行 → 报告节点失败（宁可没有报告，也不出假结论）。
+        gate = dict((context.get("facts") or {}).get("gate") or {})
+        gate_run_id = str(gate.get("run_id") or "")
+        if not gate:
+            result.status, result.error = "fail", "报告生成失败：缺少 acceptance_gate（无裁决记录）"
+            result.summary = result.error
+            return
+        if gate_run_id != str(self.ctx.run_id):
+            result.status = "fail"
+            result.error = (
+                f"报告生成失败：验收门禁 run_id 不匹配（gate={gate_run_id or '-'}，"
+                f"当前运行={self.ctx.run_id}）"
+            )
+            result.summary = result.error
+            return
+        gate_passed = gate.get("passed") is True
+        verdict = "pass" if gate_passed else "fail"
+        profile = str(gate.get("profile") or self.ctx.config.profile or "base")
+        gate_hash = str(gate.get("gate_config_hash") or "")
+        llm_verdict = str(json_summary.get("verdict") or "")
+        json_summary.update({
+            "run_id": gate_run_id,
+            "verdict": verdict,
+            "gate_passed": gate_passed,
+            "verdict_source": "acceptance_gate",
+            "profile": profile,
+            "gate_config_hash": gate_hash,
+        })
+        if llm_verdict and llm_verdict != verdict:
+            json_summary["llm_verdict"] = llm_verdict    # 留痕：模型自报只作审计
+        header = (
+            f"> 验收结论：**{verdict}**（来源：acceptance_gate；run_id={gate_run_id}；"
+            f"profile={profile}；gate_config_hash={gate_hash or '-'}）\n\n"
+        )
+
         reports_dir = self.ctx.run_dir / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
         report_path = reports_dir / "acceptance_report.md"
-        report_path.write_text(markdown, encoding="utf-8")
+        report_path.write_text(header + markdown, encoding="utf-8")
         json_path = reports_dir / "acceptance_report.json"
         json_path.write_text(json.dumps(json_summary, ensure_ascii=False, indent=2, default=str),
                              encoding="utf-8")
@@ -90,11 +128,15 @@ class ReporterAgent(BaseAgent):
             {
                 "path": str(report_path.relative_to(self.ctx.run_dir)).replace("\\", "/"),
                 "json_path": str(json_path.relative_to(self.ctx.run_dir)).replace("\\", "/"),
+                "run_id": gate_run_id,
                 "verdict": verdict,
+                "gate_passed": gate_passed,
+                "verdict_source": "acceptance_gate",
+                "gate_config_hash": gate_hash,
                 "summary": json_summary,
                 "archived": str(archived),
             },
-            task, summary=f"验收结论：{verdict}",
+            task, summary=f"验收结论：{verdict}（来源 acceptance_gate）",
         )
         self.publish(
             "evidence_index",

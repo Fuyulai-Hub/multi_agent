@@ -6,7 +6,30 @@
 # env / headers 中的 ${VAR} 在运行时从环境变量展开，避免明文落盘
 # 新增后可用 `python -m mas mcp check <name>` 做参数校验与握手冒烟
 # =============================================================================
-servers: []
+servers:
+  # 浏览器 MCP（docs/15 方案 B）：tester 节点经 mas/uiprober.py 直连本服务，
+  # 采集浏览器级 UI 证据（框架进程取证，不经模型自报）。服务名必须与
+  # config/system.yaml 的 runtime.ui_probe.server 一致。
+  # 实测（@playwright/mcp 1.64.0）：tools/list 返回 25 个工具；browser_navigate 与
+  # browser_snapshot 的返回都不含页面正文，断言须落在 browser_evaluate 的返回值上。
+  # 版本变化后先跑 `python -m mas mcp check playwright` 复核工具名与入参。
+  - name: playwright
+    transport: stdio
+    enabled: true
+    # 浏览器只服务框架侧取证（uiprober 直连），不下发给 LLM 工具面：
+    # 否则 intake 等节点会拿到 25 个 browser_* 工具，且每次 run 白起一个浏览器。
+    tools_for_llm: false
+    command: "C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2-6/npx.cmd"
+    args:
+      - "-y"
+      - "@playwright/mcp@latest"
+      - "--headless"                 # 默认 headed 会弹真实窗口，流水线必须无头
+      - "--isolated"                 # profile 常驻内存：每次跑都是干净上下文
+      # 截图/snapshot/console 日志默认写 cwd 下的 .playwright-mcp/，会把运行产物
+      # 撒进项目根。移到系统临时目录；${TEMP} 由 mcp.py 在启动时展开。
+      - "--output-dir"
+      - "${TEMP}/mas-playwright-mcp"
+    timeout_s: 180                   # 默认 10s 不够：npx 解析 + Chromium 冷启动 + 导航 60s
 
 # 说明：运行结束的飞书通知走「自定义机器人 Webhook」（见 config/system.yaml 的 runtime.notify.feishu），
 # 不经过 MCP，故此处无需配置 feishu 服务。

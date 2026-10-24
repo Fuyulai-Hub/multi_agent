@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..errors import SandboxError
-from ..intent import resolve_delivery_shape, shape_family
+from ..intent import SHAPE_STRICTNESS, probe_delivery_shape, resolve_delivery_shape, shape_family
 from ..llm import Generation
+from ..prompts import PromptBundle
 from ..schemas import AgentResult, NodeTask
 from ..verifier import TestVerifier, VerificationError
 from ..verify.exec import execute_frozen_suite
@@ -70,6 +71,9 @@ finally:
 # 不能无条件下发——ui_service_cmd 的默认值是 `python serve.py`，会诱导模型在 files 里
 # 输出 `serve.py`，而 tester 的 can_write_code=false，写入即抛 SandboxError 让整个节点崩溃
 # （web_todo_app 真实运行实测：test 节点 iter1/iter2 都栽在这里）。
+# 本串由 `section += _BROWSER_PROTOCOL` 直接拼接，**不经过 .format()**：花括号按字面下发，
+# 因此 {{base_url}} 必须保持两个花括号（uiprober._subst 的替换契约），写成四个会让模型
+# 照抄出非法 URL，浏览器导航必然失败。
 _BROWSER_PROTOCOL = '''
 浏览器级检查（full_stack_spa 形态必需，否则节点按"缺浏览器级证据"判失败）：
 6. ui_service_cmd：单条命令启动被测服务（默认 ["python", "serve.py"]）。服务绑定端口 0，
@@ -77,11 +81,20 @@ _BROWSER_PROTOCOL = '''
    注意：本角色没有写实现代码的权限，不要试图新建这个文件——它应由研发交付；
    只在这里声明启动命令。
 7. ui_checks：列表，每项形如
-   {{"name": "新增任务出现在列表页",
-     "steps": [{{"tool": "browser_navigate", "arguments": {{"url": "{{{{base_url}}}}/"}}}}],
-     "expect": {{"contains": "买牛奶"}}}}
-   tool 为浏览器 MCP 服务注册的工具名；arguments 中 {{{{base_url}}}} 占位符由框架替换为真实
+   {"name": "新增任务出现在列表页",
+     "steps": [{"tool": "browser_navigate", "arguments": {"url": "{{base_url}}/"}},
+               {"tool": "browser_evaluate",
+                "arguments": {"function": "() => document.body.textContent"}}],
+     "expect": {"contains": "买牛奶"}}
+   tool 为浏览器 MCP 服务注册的工具名；arguments 中 {{base_url}} 占位符由框架替换为真实
    服务地址；expect.contains 对最后一个 step 的文本结果做子串断言（唯一允许的断言方式）。
+   已实测（Playwright MCP）的三条硬约束：
+   - browser_navigate 只返回页面 URL / 标题等元信息，browser_snapshot 只返回 snapshot
+     文件链接，两者都不含页面正文——只写 navigate 加 expect 必然断言不中；
+   - 断言必须落在 browser_evaluate 的返回值上（它把 JS 求值结果以文本内联返回），
+     因此 steps 的最后一步须是 browser_evaluate 或其它内联返回正文的工具；
+   - 取正文用 textContent，不要用 innerText：无头浏览器里 innerText 依赖布局，实测
+     返回空串，断言必然不中。
 '''
 
 
@@ -189,6 +202,16 @@ class TesterAgent(BaseAgent):
             result.summary = result.error
             return
 
+        # 0.5) 冻结前覆盖率校验（20261024-233917-897d 实测）：套件一旦冻结，覆盖率就被
+        # 冻结清单的 fp_id 元数据永久固定——复测忽略新生成、套件只在自身失效时解冻，
+        # 而验收门禁要求三类覆盖率都 >= 1.0。首轮生成少覆盖（实测 10/9/7 of 12）时，
+        # 冻结 = 把缺口写进死档，门禁从此永远无法满足。必须在冻结前校验并给修复机会。
+        if frozen is None and fp_total:
+            data, generation = self._ensure_full_coverage(
+                task, generation, data, fps, result)
+            if result.status == "fail":
+                return
+
         generated_tests = [
             (str(item["path"]), str(item["content"]))
             for item in (data.get("files") or [])
@@ -265,10 +288,24 @@ class TesterAgent(BaseAgent):
 
         # 2.5) 验证口径与选型语言的一致性：非 Python 选型下，沙箱执行的 Python 测试文件
         # 不构成对交付物的证据（实测 probe-02 因此拿到 8 项门禁全绿）。
-        shape, _, _ = resolve_delivery_shape(spec)
+        # 交付形态以**沙箱真实文件探测**为准收紧（不由模型自报）：探测只升不降——
+        # 文件里有 package.json/index.html/框架配置等 SPA 特征时，即使 spec 申报
+        # backend_only 也按 full_stack_spa 走浏览器证据通道（fail-closed 方向）。
+        shape, shape_source, _ = resolve_delivery_shape(spec)
+        shape_probe = probe_delivery_shape(self.ctx.sandbox.root, self.ctx.sandbox.list_files())
+        if (shape_probe.get("shape")
+                and SHAPE_STRICTNESS.get(shape_probe["shape"], 0) > SHAPE_STRICTNESS.get(shape, 0)):
+            self.ctx.events.emit(
+                "intent_probed_from_files", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"declared_shape": shape, "probed_shape": shape_probe["shape"],
+                         "evidence": shape_probe["evidence"][:8],
+                         "note": "沙箱交付文件探测到更强的前端形态，覆盖模型/规格自报的交付形态"},
+            )
+            shape, shape_source = shape_probe["shape"], "file_probe"
         env_probe = perception.found.get("env_probe") or {}
         verification = self._verification_gap(
-            perception.found.get("solution_design") or {}, env_probe, spec)
+            perception.found.get("solution_design") or {}, env_probe, spec, shape=shape)
         if verification["gap"]:
             self.ctx.events.emit(
                 "test_verification_gap", agent=self.role_id, node=task.node_id,
@@ -408,6 +445,10 @@ class TesterAgent(BaseAgent):
             "protocol_note": protocol_note,
             "preexec_findings": preexec_findings,
             "verification": verification,
+            "delivery_shape": shape,
+            "delivery_shape_source": shape_source,
+            "shape_probe": {"probed": shape_probe.get("shape") or "",
+                            "evidence": shape_probe.get("evidence") or []},
             "root_cause": root_cause,
             "root_cause_note": self._root_cause_note(preexec_findings, root_cause),
             "environment": {"python": self.ctx.sandbox.python_version()},
@@ -585,7 +626,8 @@ class TesterAgent(BaseAgent):
 
     def _verification_gap(self, solution_design: Dict[str, Any],
                           env_probe: Optional[Dict[str, Any]] = None,
-                          spec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                          spec: Optional[Dict[str, Any]] = None,
+                          shape: str = "") -> Dict[str, Any]:
         """选型语言超出可执行范围（或缺少所需证据通道）时，本轮执行不构成验据。
 
         沙箱能用 `python <测试文件>`（以及白名单内的 node）执行证据。
@@ -602,7 +644,8 @@ class TesterAgent(BaseAgent):
         """
         language = str(((solution_design or {}).get("tech_choice") or {}).get("language", "")).strip()
         probe = dict(env_probe or {})
-        shape, _, _ = resolve_delivery_shape(spec or {})
+        if not shape:
+            shape, _, _ = resolve_delivery_shape(spec or {})
         tokens = self._language_tokens(language)
         has_python = any(token.startswith(_EXECUTABLE_LANGUAGE) for token in tokens)
         has_js = any(token in ("javascript", "typescript", "js", "ts") for token in tokens)
@@ -651,7 +694,9 @@ class TesterAgent(BaseAgent):
         """
         return {"enabled": False, "mode": "disabled", "delivery_shape": shape,
                 "channel": "", "asserts": [], "checks": [], "screenshots": [],
-                "console_errors": [], "failed_asserts": 0, "error": "", "note": note}
+                "console_errors": [], "console_note": "", "probe_version": "",
+                "http_status": 0, "http_probe": {},
+                "failed_asserts": 0, "error": "", "note": note}
 
     def _collect_ui_evidence(self, data: Dict[str, Any], summary: Dict[str, Any],
                              env_probe: Dict[str, Any], verification: Dict[str, Any],
@@ -677,6 +722,7 @@ class TesterAgent(BaseAgent):
                 return {
                     "enabled": True, "mode": "browser", "delivery_shape": shape, "channel": "",
                     "asserts": [], "checks": [], "screenshots": [], "console_errors": [],
+                    "console_note": "", "probe_version": "", "http_status": 0, "http_probe": {},
                     "failed_asserts": 1,
                     "error": ("full_stack_spa 需要浏览器级 UI 证据，当前不可得（"
                               + ("runtime.ui_probe 未启用" if not probe_cfg.get("enabled")
@@ -687,6 +733,7 @@ class TesterAgent(BaseAgent):
                 return {
                     "enabled": True, "mode": "browser", "delivery_shape": shape, "channel": "",
                     "asserts": [], "checks": [], "screenshots": [], "console_errors": [],
+                    "console_note": "", "probe_version": "", "http_status": 0, "http_probe": {},
                     "failed_asserts": 1,
                     "error": "测试契约未提供 ui_checks：SPA 形态无可执行文件清单，按证据不足判失败",
                 }
@@ -731,9 +778,15 @@ class TesterAgent(BaseAgent):
             "channel": f"mcp:{raw.get('server', '')}" if raw.get("server") else "mcp",
             "base_url": str(raw.get("base_url", "")),
             "asserts": asserts, "checks": asserts, "screenshots": list(raw.get("screenshots") or []),
-            "console_errors": [], "failed_asserts": failed,
+            "console_errors": list(raw.get("console_errors") or []),
+            "console_note": str(raw.get("console_note", "")),
+            # probe 版本/HTTP 状态由框架采集器写入：门禁据此拒绝"agent 自填"的空壳证据
+            "probe_version": str(raw.get("probe_version", "")),
+            "http_status": int(raw.get("http_status", 0)),
+            "http_probe": dict(raw.get("http_probe") or {}),
+            "failed_asserts": failed,
             "error": str(raw.get("error", "")),
-            "note": "浏览器级 UI 断言（UiProber 经 MCP 采集，证据落在 evidence/ui/）",
+            "note": "浏览器级 UI 断言（UiProber 经 MCP 采集，证据落在 evidence/ui/probe_evidence.json）",
         }
 
     # ---------------------------------------------------------------- 协商
@@ -799,6 +852,134 @@ class TesterAgent(BaseAgent):
         }
 
     # ---------------------------------------------------------------- 覆盖率
+    def _coverage_gaps(self, cases: Any, fps: List[Dict[str, Any]]) -> List[str]:
+        """返回「FP:类别」形式的覆盖缺口清单（门禁要求每个 FP 三类用例齐全）。"""
+        cases = [c for c in (cases or []) if isinstance(c, dict)]
+        covered: Dict[str, set] = {}
+        for case in cases:
+            if case.get("fp_id") and case.get("category"):
+                covered.setdefault(str(case["fp_id"]), set()).add(str(case["category"]))
+        gaps: List[str] = []
+        for fp in fps:
+            fp_id = str(fp.get("id") or "")
+            if not fp_id:
+                continue
+            for category in ("functional", "exception", "boundary"):
+                if category not in covered.get(fp_id, set()):
+                    gaps.append(f"{fp_id}:{category}")
+        return gaps
+
+    def _ensure_full_coverage(
+        self,
+        task: NodeTask,
+        generation: Generation,
+        data: Dict[str, Any],
+        fps: List[Dict[str, Any]],
+        result: AgentResult,
+    ) -> Tuple[Dict[str, Any], Generation]:
+        """冻结前校验覆盖并给一次带缺口清单的重生成（镜像隐藏套件的修复闭环）。
+
+        返回 (data, generation)；修复失败时置 result.status=fail（不冻结任何套件）。
+        """
+        gaps = self._coverage_gaps(data.get("cases"), fps)
+        if not gaps:
+            return data, generation
+        if self.ctx.llm is None:
+            # 直接调用 Agent 的单元测试没有 LLM 客户端（生产 Leader 必带）：
+            # 与 hidden_suite_skipped 同一先例，跳过校验并留痕，保持既有行为。
+            self.ctx.events.emit(
+                "test_coverage_skipped", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"gaps": gaps[:20],
+                         "reason": "当前上下文没有 LLM 客户端（单元测试直连），跳过冻结前覆盖校验"},
+            )
+            return data, generation
+        max_attempts = max(1, int(self.ctx.config.runtime.get("test_coverage_max_attempts", 2) or 2))
+        fp_view = [
+            {k: fp.get(k) for k in ("id", "title", "description", "category", "rules", "samples") if fp.get(k)}
+            for fp in fps
+        ]
+        attempt = 1
+        while gaps and attempt < max_attempts:
+            self.ctx.events.emit(
+                "test_coverage_repair_requested", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"attempt": attempt + 1, "gaps": gaps[:30],
+                         "gap_count": len(gaps)},
+            )
+            system = (
+                "你是业务测试工程师。上一轮测试套件的功能点覆盖不完整，验收门禁要求"
+                "每个功能点都有 functional / exception / boundary 三类用例。"
+                "你只能依据需求契约与既有用例补齐覆盖，看不到实现源码，期望值只能来自契约。"
+            )
+            user = (
+                "## 需求功能点（必须逐个、逐类覆盖）\n"
+                + json.dumps(fp_view, ensure_ascii=False, indent=1)
+                + "\n\n## 上一轮已生成的用例元数据（在此基础上补齐，不要删减）\n"
+                + json.dumps(data.get("cases") or [], ensure_ascii=False, indent=1)
+                + "\n\n## 上一轮已生成的测试文件（作为补齐基础全量重写）\n"
+                + json.dumps(data.get("files") or [], ensure_ascii=False, indent=1)
+                + "\n\n## 覆盖缺口（每个 FP:类别 至少补一条用例）\n"
+                + "\n".join(f"- {item}" for item in gaps)
+                + "\n\n## 输出契约（必须只输出一个 JSON 对象）\n"
+                + json.dumps({
+                    "files": [{"path": "tests/test_all.py",
+                               "content": "完整 Python 源码（全量重写，包含全部用例）"}],
+                    "cases": [{"id": "TC-FP-01-functional-xxx", "fp_id": "FP-01",
+                               "op": "被测函数名(ASCII)", "name": "用例短名(ASCII)",
+                               "category": "functional|exception|boundary",
+                               "call": "调用表达式", "expect": "期望值",
+                               "expect_error": "异常类名或空串",
+                               "assert_kind": "eq|truthy|falsy|empty|raises"}],
+                    "case_count": {"total": 0, "functional": 0, "exception": 0, "boundary": 0},
+                    "derived_from": "coverage-repair",
+                }, ensure_ascii=False, indent=1)
+                + "\n\n规则：方法名 test_{category}_{op}_{name}（ASCII、全局唯一）；"
+                "所有用例写在同一个 tests/ 下的 .py 文件里；仅用标准库 import 被测包公开接口；"
+                "禁止 main/结果标记/结果文件；cases 元数据与方法一一对应。"
+            )
+            bundle = PromptBundle(
+                role=self.role_id, node=task.node_id, task_kind="test_suite_repair",
+                iteration=task.iteration, system=system, user=user,
+                context={"task_kind": "test_suite_repair"},
+                token_estimate=(len(system) + len(user)) // 3, path=None,
+            )
+            try:
+                generation = self.ctx.llm.generate("test_suite_repair", bundle, {})
+            except Exception as exc:  # noqa: BLE001 - 修复失败按缺口如实判失败
+                result.status = "fail"
+                result.error = f"测试覆盖率修复生成失败: {type(exc).__name__}: {exc}"
+                result.summary = result.error
+                return data, generation
+            if generation.error or not isinstance(generation.data, dict):
+                result.status = "fail"
+                result.error = "测试覆盖率修复未返回可解析的 JSON: " + str(generation.error or "")
+                result.summary = result.error
+                return data, generation
+            data = generation.data
+            attempt += 1
+            gaps = self._coverage_gaps(data.get("cases"), fps)
+        if gaps:
+            result.status = "fail"
+            result.error = ("测试套件覆盖不全（冻结前校验，套件一旦冻结缺口将无法弥补）: "
+                            + ", ".join(gaps[:20]))
+            result.summary = result.error
+            self.ctx.events.emit(
+                "test_coverage_insufficient", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"gaps": gaps[:30], "gap_count": len(gaps),
+                         "attempts": attempt,
+                         "note": "未冻结任何套件；回退后测试节点将重新生成"},
+            )
+        else:
+            self.ctx.events.emit(
+                "test_coverage_repaired", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration,
+                payload={"attempts": attempt,
+                         "note": "覆盖缺口已在冻结前补齐"},
+            )
+        return data, generation
+
     def _coverage(self, cases: List[Dict[str, Any]], fp_total: int, data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         coverage: Dict[str, Dict[str, Any]] = {}
         for category in ("functional", "exception", "boundary"):

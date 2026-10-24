@@ -143,6 +143,54 @@ class ContractValidationTests(unittest.TestCase):
         outcome = validate_contract(spec, REQUIREMENT_TEXT)
         self.assertIn("source_span_quote_mismatch:FP-01:C-01", outcome["errors"])
 
+    def test_quote_formatting_variants_are_accepted(self):
+        """引文只差排版（反引号/全半角标点/空格/箭头）不应判编造。
+
+        背景（2026-10-24 task09-miniledger-01 真实运行）：条款原文是
+        「`save(path) -> None`；`load(path) -> Book`」，模型引用时去掉反引号或
+        换半角分号即触发 source_span_quote_mismatch，整轮 intake 直接 halt。
+        """
+        text = ("# 接口\n\n## 公共接口\n"
+                "- `save(path) -> None`；`load(path) -> Book`\n")
+        variants = [
+            "`save(path) -> None`；`load(path) -> Book`",   # 逐字
+            "save(path) -> None; load(path) -> Book",       # 去反引号 + 半角标点
+            "save(path) → None；load(path) → Book",          # 箭头变体
+            "  save(path)  ->  None ； load(path)  ->  Book ",  # 多余空白
+        ]
+        for quote in variants:
+            with self.subTest(quote=quote):
+                spec = {
+                    "package": "pkg",
+                    "function_points": [{
+                        "id": "FP-01",
+                        "samples": [{"input": "save", "expect": "None"}],
+                        "acceptance_criteria": ["save/load 可用"],
+                        "source_spans": [{"clause_id": "C-01", "quote": quote}],
+                    }],
+                    "out_of_scope": [],
+                }
+                outcome = validate_contract(spec, text)
+                self.assertTrue(outcome["valid"], outcome["errors"])
+
+    def test_paraphrased_quote_is_still_rejected(self):
+        """规范化只放过排版差异：改写用词的引文仍判 mismatch（门禁不被放松）。"""
+        text = ("# 接口\n\n## 公共接口\n"
+                "- `save(path) -> None`；`load(path) -> Book`\n")
+        spec = {
+            "package": "pkg",
+            "function_points": [{
+                "id": "FP-01",
+                "samples": [{"input": "save", "expect": "None"}],
+                "acceptance_criteria": ["save/load 可用"],
+                "source_spans": [{"clause_id": "C-01",
+                                  "quote": "save 保存账本，load 读取账本"}],
+            }],
+            "out_of_scope": [],
+        }
+        outcome = validate_contract(spec, text)
+        self.assertIn("source_span_quote_mismatch:FP-01:C-01", outcome["errors"])
+
     def test_unknown_clause_and_clause_used_twice_are_rejected(self):
         spec = _spec()
         spec["function_points"][0]["source_spans"] = [{"clause_id": "C-99"}]
@@ -299,6 +347,63 @@ class HiddenSuiteTests(unittest.TestCase):
             "test_functional_add_result", "test_boundary_add_zero")
         outcome = validate_generated_suite(boundary, self.spec)
         self.assertIn("hidden_functional_case_missing:FP-01", outcome["errors"])
+
+    def test_boundary_fp_accepts_boundary_case(self):
+        """边界类功能点：exception/boundary 用例照常接受，但 functional 用例不可缺。
+
+        2026-10-25 口径对齐（20261024-233917-897d 实测）：隐藏门禁要求
+        hidden_functional_coverage rate >= 1.0（覆盖全部 FP，不限类别）。
+        旧协议只要求「功能类 FP 写 functional」，异常/边界 FP 只写 boundary 用例
+        会在验收阶段才暴露 hidden_functional_coverage_incomplete——整条流水线
+        跑完后才发现，代价最大。校验器必须与门禁同口径，把缺口拦在 intake。
+        """
+        spec = {"function_points": [
+            {"id": "FP-01", "title": "两数相加", "category": "功能"},
+            {"id": "FP-02", "title": "上限截断", "category": "边界"},
+        ]}
+        # FP-02 只有 boundary 用例：旧口径放行，新口径（对齐门禁）必须拦截
+        only_boundary = self._data(cases=[
+            dict(HIDDEN_CASES[0]),
+            {**HIDDEN_CASES[0], "fp_id": "FP-02", "category": "boundary",
+             "op": "add", "name": "cap", "id": "TH-FP-02-boundary-add-cap"},
+        ], content=HIDDEN_SUITE)
+        outcome = validate_generated_suite(only_boundary, spec)
+        self.assertIn("hidden_functional_case_missing:FP-02", outcome["errors"])
+
+        # FP-02 同时有 functional + boundary 用例：通过（boundary 用例仍然被接受）
+        content = HIDDEN_SUITE + '''
+    def test_functional_add_cap(self):
+        self.assertEqual(add(99, 1), 100)
+
+    def test_boundary_add_cap(self):
+        self.assertEqual(add(99, 1), 100)
+'''
+        both = self._data(cases=[
+            dict(HIDDEN_CASES[0]),
+            {**HIDDEN_CASES[0], "fp_id": "FP-02", "category": "functional",
+             "op": "add", "name": "cap", "id": "TH-FP-02-functional-add-cap"},
+            {**HIDDEN_CASES[0], "fp_id": "FP-02", "category": "boundary",
+             "op": "add", "name": "cap", "id": "TH-FP-02-boundary-add-cap"},
+        ], content=content)
+        outcome = validate_generated_suite(both, spec)
+        self.assertEqual(outcome["errors"], [])
+
+    def test_functional_fp_still_requires_functional_case(self):
+        """类别为「功能」的 FP 只有 boundary 用例 → 仍旧报错（门禁没有被放松）。"""
+        spec = {"function_points": [{"id": "FP-01", "title": "两数相加", "category": "功能"}]}
+        data = self._data(cases=[{**HIDDEN_CASES[0], "category": "boundary", "name": "zero"}])
+        outcome = validate_generated_suite(data, spec)
+        self.assertIn("hidden_functional_case_missing:FP-01", outcome["errors"])
+
+    def test_fp_without_any_case_is_rejected(self):
+        """任何 FP 一条隐藏用例都没有 → hidden_case_missing（覆盖要求仍在）。"""
+        spec = {"function_points": [
+            {"id": "FP-01", "title": "两数相加", "category": "功能"},
+            {"id": "FP-02", "title": "上限截断", "category": "边界"},
+        ]}
+        outcome = validate_generated_suite(self._data(), spec)
+        self.assertIn("hidden_case_missing:FP-02", outcome["errors"])
+        self.assertNotIn("hidden_case_missing:FP-01", outcome["errors"])
 
     def test_validation_requires_assertions(self):
         empty = self._data(content=(

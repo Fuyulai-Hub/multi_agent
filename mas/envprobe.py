@@ -58,7 +58,10 @@ def _probe_ui_server(config: SystemConfig) -> Dict[str, Any]:
         entry["reason"] = f"{type(exc).__name__}: {exc}"
         return entry
     entry["available"] = bool(report.get("ok"))
-    entry["tools"] = [str(item.get("name", "")) for item in (report.get("tools") or [])][:40]
+    # check_server 的 report["tools"] 是工具名字符串列表（见 mcp.check_server），
+    # 不是 tools/list 的原始条目——此处曾按 dict 取 item.get("name")，
+    # 因 playwright 从未配置成功、这行从未被执行而潜伏；接入浏览器 MCP 后必崩。
+    entry["tools"] = [str(item) for item in (report.get("tools") or [])][:40]
     if not entry["available"]:
         entry["reason"] = f"{report.get('stage', '')}: {report.get('reason', '')}（{report.get('hint', '')}）"
     return entry

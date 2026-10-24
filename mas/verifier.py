@@ -64,7 +64,7 @@ from .verify.runner import RUNNER_NAME, RUNNER_VERSION
 
 __all__ = [
     "VerificationError", "TestVerifier", "verify_attestation",
-    "release_mode", "require_signing_secret",
+    "release_mode", "require_signing_secret", "require_release_profile",
     "canonical_hash", "sign_payload", "verify_signed",
     "code_tree_hash",
 ]
@@ -77,6 +77,9 @@ FROZEN_DIR = "frozen_tests"
 SIGNATURE_ALG = "hmac-sha256"
 _MIN_RELEASE_SECRET = 32
 _RELEASE_ENV_VALUES = {"release", "prod", "production"}
+# release 只允许完整/严格流程：lean 只剩 5 条 criterion 且裁掉 review，
+# 用它出「通过」结论等于绕过审查与证据绑定。
+_RELEASE_PROFILES = {"", "full", "strict"}
 _TRUTHY_VALUES = {"1", "true", "yes", "on"}
 # code_hash 的证据范围：交付代码，不含测试/框架 runner/缓存。tests 目录无论嵌套在哪层
 # 都排除（测试套件由 suite hash 单独绑定）。
@@ -136,6 +139,24 @@ def require_signing_secret(config: Any = None) -> None:
             f"release 模式的 MAS_VERIFIER_SECRET 过短（{len(secret)} 字符，至少 "
             f"{_MIN_RELEASE_SECRET}）：请使用 openssl rand -hex 32 生成。"
         )
+
+
+def require_release_profile(config: Any = None) -> None:
+    """release 模式只允许 full/strict（或未指定 = 完整基础流程）。
+
+    ``lean`` 会裁掉 review 节点并把门禁收敛到 5 条 criterion，与 release 的
+    「证据链 + 审查绑定」要求冲突。在 Leader 构造时拒绝，而不是产出一个
+    看起来合法的通过结论。
+    """
+    if not release_mode(config):
+        return
+    profile = str(getattr(config, "profile", "") or "").strip().lower()
+    if profile in _RELEASE_PROFILES:
+        return
+    raise ConfigError(
+        f"release 模式不允许使用 profile={profile!r}：lean 会裁掉审查并把门禁收敛到 "
+        "5 条 criterion，release 只允许 full/strict（或不指定 profile）。"
+    )
 
 
 def _resolve_secret(config: Any = None) -> bytes:

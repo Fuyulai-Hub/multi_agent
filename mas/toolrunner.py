@@ -47,6 +47,11 @@ class ToolRunner:
             name = str(server.get("name", ""))
             if not server.get("enabled", True) or (wanted is not None and name not in wanted):
                 continue
+            # 只给框架侧直连、不该进 LLM 工具面的服务（如浏览器：由 mas/uiprober.py
+            # 在 tester 节点直连取证）。不下发给模型，避免 25 个 browser_* 工具污染
+            # 工具面，也避免每次 run 无谓启动一个浏览器子进程。
+            if server.get("tools_for_llm") is False:
+                continue
             try:
                 client = MCPClient(server)
                 client.start()

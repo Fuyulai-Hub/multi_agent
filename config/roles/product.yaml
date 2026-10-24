@@ -10,7 +10,7 @@ responsibilities:
   - "标注待澄清问题（歧义），供测试与研发协商闭环"
 
 inputs: ["requirement_source"]
-outputs: ["requirement_spec"]
+outputs: ["requirement_spec", "requirement_contract", "hidden_suite"]
 
 permissions:
   can_write_code: false

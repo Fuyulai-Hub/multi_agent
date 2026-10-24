@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .artifacts import ArtifactPolicy
 from .events import EventLog
 from .filelock import file_lock
 
@@ -60,10 +61,13 @@ class ArtifactRef:
 class Blackboard:
     """基于文件系统的版本化产物存储。"""
 
-    def __init__(self, root: Path, events: Optional[EventLog] = None, run_id: str = "") -> None:
+    def __init__(self, root: Path, events: Optional[EventLog] = None, run_id: str = "",
+                 policy: Optional[ArtifactPolicy] = None) -> None:
         self.root = Path(root)
         self.events = events
         self.run_id = run_id
+        # 门禁加固：只有 Leader 创建的黑板挂策略；直接构造（测试 fixture）保持原行为
+        self.policy = policy
         self.root.mkdir(parents=True, exist_ok=True)
         self._latest: Dict[str, Any] = {}
         self._refs: Dict[str, List[ArtifactRef]] = {}
@@ -79,6 +83,10 @@ class Blackboard:
         iteration: int,
         summary: str = "",
     ) -> ArtifactRef:
+        # 发布时校验 schema + 角色 ACL：未声明的产物名、越权的发布者、
+        # 结构非法的数据都在落盘前失败（ConfigError 会让节点明确失败）。
+        if self.policy is not None:
+            self.policy.check(name, data, producer)
         directory = self.root / name
         directory.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(data, ensure_ascii=False, indent=2, default=str)

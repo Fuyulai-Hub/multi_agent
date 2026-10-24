@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
+from ..intent import probe_delivery_shape, resolve_delivery_shape
 from ..llm import Generation
 from ..schemas import AgentResult, NodeTask
 from ..verifier import TestVerifier, VerificationError
@@ -138,18 +139,27 @@ class DeveloperAgent(BaseAgent):
 
     @staticmethod
     def _self_check_label(check: Dict[str, Any]) -> str:
-        if check.get("not_applicable"):
-            return "导入自检不适用（非 Python 交付物）"
+        if check.get("unsupported"):
+            return "非 Python 交付不支持（缺工具链，fail closed）"
+        if check.get("static_assets"):
+            return "静态资源交付（无编译型自检，验证通道为浏览器 probe）"
         return "导入自检通过" if check.get("ok") else "导入自检失败"
 
     def _package_importable_dir(self, package: str) -> bool:
-        """沙箱工作区里是否已存在该包（上一轮交付的 Python 包目录或同名 .py）。"""
+        """沙箱工作区里是否已存在该 Python 包（上一轮交付的包目录或同名 .py）。
+
+        目录必须真的含 .py 才算：JS/静态交付也可能建出与 package 同名的目录，
+        Python 3 会把它当命名空间包 import 成功，让非 Python 交付借导入自检放行。
+        """
         sandbox = getattr(self.ctx, "sandbox", None)
         root = getattr(sandbox, "root", None)
         if not root or not package:
             return False
         root = Path(root)
-        return (root / package).is_dir() or (root / f"{package}.py").exists()
+        pkg_dir = root / package
+        if pkg_dir.is_dir():
+            return any(pkg_dir.rglob("*.py"))
+        return (root / f"{package}.py").exists()
 
     @staticmethod
     def _is_test_file(name: str) -> bool:
@@ -159,26 +169,113 @@ class DeveloperAgent(BaseAgent):
             path = path[2:]
         return path.startswith("tests/") or path.rsplit("/", 1)[-1].startswith("test_")
 
+    # 交付文件后缀 → 语言（只做非 Python 部分的工具链判定）
+    _LANGUAGE_BY_SUFFIX = {
+        ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
+        ".ts": "typescript", ".tsx": "typescript",
+        ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp",
+        ".java": "java", ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".cs": "csharp",
+    }
+    # 语言 → (可执行文件候选, 参数模板)：命中即用真实工具链做语法级校验；
+    # node 在沙箱白名单内（system.yaml sandbox_command_policy.allowed），g++/clang 需
+    # 同时满足"本机存在 + 已加入白名单"才会执行，否则走 unsupported fail closed。
+    _TOOLCHAINS = {
+        "javascript": (["node"], ["--check"]),
+        "c": (["gcc", "clang"], ["-fsyntax-only"]),
+        "cpp": (["g++", "clang++"], ["-fsyntax-only"]),
+    }
+    _STATIC_ASSET_SUFFIXES = (".html", ".htm", ".css", ".json", ".md", ".txt", ".svg", ".yml", ".yaml")
+
+    def _toolchain_command(self, language: str, file_name: str):
+        """返回 (cmd, reason)：找到可用工具链给 cmd，否则 cmd=None + 不可用原因。"""
+        entry = self._TOOLCHAINS.get(language)
+        if entry is None:
+            return None, f"没有 {language} 的编译/校验工具链映射"
+        import shutil
+
+        for binary in entry[0]:
+            if not shutil.which(binary):
+                continue
+            sandbox = getattr(self.ctx, "sandbox", None)
+            if (getattr(sandbox, "command_policy_enabled", False)
+                    and binary not in set(getattr(sandbox, "allowed_commands", ()) or ())):
+                return None, f"{binary} 在 PATH 中但不在沙箱命令白名单"
+            return [binary, *entry[1], file_name], ""
+        return None, f"PATH 中未找到 {'/'.join(entry[0])}"
+
+    def _nonpython_check(self, deliverables: List[str]) -> Dict[str, Any]:
+        """非 Python 交付：有工具链就真实执行校验，没有就 fail closed 标 unsupported。
+
+        历史漏洞（task04 C++）：原来这里返回 not_applicable + ok=True，`.hpp` 从未被
+        编译就让 implement 节点放行。现在：JS 走 `node --check`（白名单内、真实执行），
+        C/C++ 走 g++/clang -fsyntax-only（需本机存在且入白名单），其余语言或工具链
+        缺失一律 ok=False + unsupported=True——节点判 fail，绝不空证据放行。
+        """
+        per_file: List[Dict[str, Any]] = []
+        unsupported: List[str] = []
+        checked = 0
+        all_ok = True
+        for name in deliverables:
+            suffix = Path(str(name)).suffix.lower()
+            language = self._LANGUAGE_BY_SUFFIX.get(suffix, "")
+            if not language:
+                continue          # html/css/json 等静态资源：无编译型校验，见 static_assets
+            cmd, reason = self._toolchain_command(language, str(name))
+            if cmd is None:
+                unsupported.append(f"{name}（{language}）：{reason}")
+                all_ok = False
+                per_file.append({"file": name, "language": language, "ok": False,
+                                 "cmd": "", "reason": reason})
+                continue
+            try:
+                outcome = self.sandbox_run(cmd)
+            except Exception as exc:  # noqa: BLE001 - SandboxError/权限拒绝都按不可验证计
+                unsupported.append(f"{name}（{language}）：{type(exc).__name__}: {exc}")
+                all_ok = False
+                per_file.append({"file": name, "language": language, "ok": False,
+                                 "cmd": " ".join(cmd), "reason": str(exc)[:200]})
+                continue
+            checked += 1
+            file_ok = bool(outcome.ok)
+            all_ok = all_ok and file_ok
+            per_file.append({
+                "file": name, "language": language, "ok": file_ok,
+                "cmd": " ".join(cmd), "exit_code": outcome.exit_code,
+                "reason": (outcome.stderr.strip()[-200:] if not file_ok else ""),
+            })
+        if not per_file:
+            # 纯静态资源（html/css/json…）：沙箱里没有可执行校验，但也不允许伪装成
+            # "已验证"——如实标注 static_assets，真正的验证通道是 tester 的浏览器 probe
+            # （文件探测会把这类交付收紧为 full_stack_spa，SPA 无浏览器证据必判失败）。
+            return {
+                "cmd": "", "exit_code": 0, "ok": True, "static_assets": True,
+                "note": "纯静态资源交付：无编译型自检，验证由浏览器 probe 承担",
+                "files": [], "duration_ms": 0,
+            }
+        return {
+            "cmd": "; ".join(item["cmd"] for item in per_file if item["cmd"]),
+            "exit_code": 0 if all_ok else 1, "ok": all_ok,
+            "unsupported": bool(unsupported),
+            "note": ("非 Python 交付工具链校验"
+                     + (f"：{len(unsupported)} 个文件无工具链可验证，fail closed" if unsupported else "")),
+            "files": per_file,
+            "stdout_tail": "", "stderr_tail": "; ".join(unsupported)[:200], "duration_ms": 0,
+        }
+
     def _self_check(self, package: str, task: NodeTask,
                     files: Optional[List[str]] = None) -> Dict[str, Any]:
-        deliverable_py = [name for name in (files or [])
-                          if str(name).endswith(".py") and not self._is_test_file(name)]
+        deliverables = [name for name in (files or []) if not self._is_test_file(name)]
+        deliverable_py = [name for name in deliverables if str(name).endswith(".py")]
         if files is not None and not deliverable_py and not self._package_importable_dir(package):
-            # 非 Python 交付物没有可导入的包，`python -c import x` 必然 ModuleNotFoundError；
-            # 把它记成"导入自检失败"会让失败点失真（实测 task04：真正的边界在测试节点——
-            # 沙箱只能执行 Python，无法编译验证 C++）。此处如实标注"不适用"。
-            # 只看"交付包自身的 .py"：optimize 轮次会连带重写 tests/test_*.py（实测
-            # task04-cpp-probe-03 optimize#1 因这个纯测试文件被跑 import smartptr 而判失败）。
-            return {
-                "cmd": "", "exit_code": 0, "ok": True, "not_applicable": True,
-                "note": "非 Python 交付物：Python 导入自检不适用（沙箱只能执行 Python）",
-                "stdout_tail": "", "stderr_tail": "", "duration_ms": 0,
-            }
+            # 非 Python 交付物：`python -c import x` 必然 ModuleNotFoundError，跑它只会
+            # 让失败点失真。改为工具链判定——能真实校验就校验，不能就 unsupported 判失败。
+            # 只看"交付包自身文件"：optimize 轮次连带重写的 tests/test_*.py 不参与判定。
+            return self._nonpython_check(deliverables)
         check = self.sandbox_run(
             [self.ctx.sandbox.python, "-c", f"import {package}; print('import-ok')"],
             env_extra={"PYTHONPATH": str(self.ctx.sandbox.root)},
         )
-        return {
+        outcome = {
             "cmd": " ".join(check.cmd),
             "exit_code": check.exit_code,
             "ok": check.ok,
@@ -186,6 +283,23 @@ class DeveloperAgent(BaseAgent):
             "stderr_tail": check.stderr.strip()[-200:],
             "duration_ms": check.duration_ms,
         }
+        # 混合交付（Python + JS/C++ 等同轮出现）：导入自检之外，非 Python 代码文件
+        # 同样要过工具链校验，任何一侧不可验证都整体 fail closed。
+        code_non_py = [name for name in deliverables
+                       if Path(str(name)).suffix.lower() in self._LANGUAGE_BY_SUFFIX]
+        if code_non_py:
+            extra = self._nonpython_check(code_non_py)
+            outcome["toolchain_check"] = extra
+            outcome["ok"] = bool(outcome["ok"] and extra["ok"])
+            outcome["unsupported"] = bool(extra.get("unsupported"))
+        return outcome
+
+    def _shape_probe(self, spec: Dict[str, Any], written: List[str]) -> Dict[str, Any]:
+        """交付形态文件探测（审计留痕）：声明形态 vs 沙箱真实文件探测形态。"""
+        declared, _, _ = resolve_delivery_shape(spec or {})
+        probe = probe_delivery_shape(getattr(self.ctx.sandbox, "root", None), written)
+        return {"declared": declared, "probed": probe.get("shape") or "",
+                "evidence": probe.get("evidence") or []}
 
     def _apply_implementation(
         self, task: NodeTask, generation: Generation, perception: Perception,
@@ -208,6 +322,7 @@ class DeveloperAgent(BaseAgent):
             "functions": data.get("functions", []),
             "fp_mapping": data.get("fp_mapping", {}),
             "self_check": self_check,
+            "shape_probe": self._shape_probe(perception.spec, written),
             "mode": data.get("mode", context.get("mode")),
             "defects_injected": data.get("defects_injected", []),
             "notes": data.get("notes", ""),
@@ -241,7 +356,11 @@ class DeveloperAgent(BaseAgent):
             payload={"files": written, "loc": manifest["loc"], "mode": manifest["mode"]},
         )
         if not self_check.get("ok"):
-            result.error = f"导入自检失败: {self_check.get('stderr_tail', '')[:200]}"
+            if self_check.get("unsupported"):
+                result.error = ("交付语言不受支持（unsupported，fail closed）："
+                                + (self_check.get("stderr_tail") or self_check.get("note", ""))[:200])
+            else:
+                result.error = f"导入自检失败: {self_check.get('stderr_tail', '')[:200]}"
 
     # ---------------------------------------------------------------- 缺陷修复
     def _apply_fix(
@@ -329,6 +448,7 @@ class DeveloperAgent(BaseAgent):
             "functions": data.get("functions", []),
             "fp_mapping": data.get("fp_mapping", {}),
             "self_check": self_check,
+            "shape_probe": self._shape_probe(perception.spec, written),
             "mode": "fix",
             "defects_injected": [],
             "notes": data.get("notes", ""),

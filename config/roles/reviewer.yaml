@@ -9,7 +9,7 @@ responsibilities:
   - "验收签署：依据门禁证据给出验收意见"
 
 inputs: ["requirement_spec", "solution_design", "code_manifest", "implementation_summary", "test_report", "bug_reports"]
-outputs: ["review_report", "acceptance_opinion"]
+outputs: ["review_report", "design_review", "acceptance_opinion"]
 
 permissions:
   can_write_code: false          # 审查者不写代码（只做 AST 静态分析，不执行沙箱命令）
@@ -27,6 +27,7 @@ prompt:
     - "requirement_spec.delivery_shape 非 backend_only（前后端交付）时，network_import 已由框架降为 info：HTTP 服务依赖 http/socket/threading 是需求本身，不得据此判阻塞（INFO 级同样不计入 blocking）"
     - "fp_mapping 必须逐项核验为 file::symbol：文件在交付清单且真实存在、符号由 AST 确认定义、且被至少一个通过的冻结测试 import 并使用；框架会重算，不要采信自报映射"
     - "未提供通过的测试证据时不得签署通过；review_report.code_hash 由框架按最终代码写入，门禁会重算比对"
+    - "tests/ 目录下的测试文件由框架冻结（开发者改动会被还原），其风格类问题（文档字符串/类型注解/函数长度）已由框架豁免不计阻塞，也不得作为驳回理由；驳回只针对交付源码问题与功能点覆盖缺口"
   quality_bar:
     - "每个功能点都有 file::symbol 级的实现映射检查结果"
     - "阻塞问题数为 0 且审查结论绑定最终代码 hash 才允许通过"
@@ -76,3 +77,14 @@ policies:
     js_syntax_error: "info"              # 无 node 环境下只能做括号配平，属弱证据
   blocking_severities: ["critical", "major"]
   acceptance_severities: ["critical"]
+  # tests/ 目录风格豁免：测试文件首轮测试后被框架冻结（verifier.restore_if_changed
+  # 还原开发者改动，tester 复测时忽略新生成的 tests/），风格类阻塞项在后续迭代中
+  # 对开发者不可修复，计入 blocking 会与回退上限构成死锁（task09-miniledger-04
+  # 实测：54 条 docstring 阻塞项连续驳回，修复两次都被冻结副本还原）。
+  # 这些规则在 tests/ 路径下只记录不阻塞；危险类规则（bare_except/eval_usage 等）不受影响。
+  test_style_rules_exempt:
+    - "missing_function_docstring"
+    - "missing_module_docstring"
+    - "missing_type_hints"
+    - "function_too_long"
+    - "line_too_long"

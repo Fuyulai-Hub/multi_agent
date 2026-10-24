@@ -26,15 +26,19 @@ L1 只产提示不产结论、不覆盖 L2：它的作用是给 LLM 一条可追
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import json
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     "DELIVERY_SHAPES",
     "DEFAULT_DELIVERY_SHAPE",
     "UNKNOWN_SHAPE",
     "LEGACY_MODE_MAP",
+    "SHAPE_STRICTNESS",
     "classify_delivery_shape",
     "normalize_delivery_shape",
+    "probe_delivery_shape",
     "resolve_delivery_shape",
     "shape_family",
 ]
@@ -143,3 +147,90 @@ def classify_delivery_shape(text: str) -> Dict[str, Any]:
 def shape_family(shape: str) -> str:
     """形态所属档位：``backend`` / ``full_stack``（未知值按 backend 处理，取安全侧）。"""
     return "full_stack" if str(shape or "").startswith("full_stack_") else "backend"
+
+
+#: 形态严格度序（文件探测只允许"收紧"，不允许放松——fail-closed 方向）。
+SHAPE_STRICTNESS: Dict[str, int] = {
+    "backend_only": 0,
+    "full_stack_ssr": 1,
+    "full_stack_spa": 2,
+}
+
+# ---------------------------------------------------------------- L4 文件探测
+# 交付形态由沙箱里的**真实文件**探测，不由模型自报：模型可以把 SPA 交付申报成
+# backend_only 来绕开浏览器证据（历史漏洞：形态声明决定证据通道，声明权却在 LLM）。
+# 探测只认确定性文件特征，结果只用于把形态往更严格的方向收紧。
+_SPA_CONFIG_BASENAMES = (
+    "vite.config.js", "vite.config.ts", "vite.config.mjs",
+    "next.config.js", "next.config.mjs", "next.config.ts",
+    "nuxt.config.js", "nuxt.config.ts",
+    "angular.json", "svelte.config.js", "webpack.config.js", "craco.config.js",
+)
+_SPA_FRAMEWORK_DEPS = (
+    "react", "react-dom", "vue", "svelte", "@angular/core",
+    "next", "nuxt", "vite", "@vitejs/plugin-react",
+)
+_SSR_SERVER_DEPS = ("express", "koa", "fastify", "@nestjs/core", "hapi")
+_SPA_HTML_MARKERS = ('id="root"', "id='root'", 'id="app"', 'id="__next"', 'type="module"')
+_BROWSER_CODE_SUFFIXES = (".jsx", ".tsx", ".vue", ".svelte")
+
+
+def probe_delivery_shape(root: Any, files: Iterable[str]) -> Dict[str, Any]:
+    """按沙箱工作区的真实文件探测交付形态（L4，确定性，框架侧）。
+
+    返回 ``{"shape": full_stack_spa|full_stack_ssr|None, "evidence": [命中文件/特征]}``；
+    ``None`` 表示文件层面没有前端特征（不推翻声明，只放弃收紧）。
+    """
+    root = Path(root) if root else None
+    names = [str(name).replace("\\", "/") for name in (files or [])]
+    evidence: List[str] = []
+
+    def read(relative: str) -> str:
+        if root is None:
+            return ""
+        try:
+            return (root / relative).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    basenames = {name.rsplit("/", 1)[-1] for name in names}
+    html_files = [name for name in names if name.lower().endswith((".html", ".htm"))]
+    pkg_files = [name for name in names if name.rsplit("/", 1)[-1] == "package.json"]
+
+    pkg_deps: set = set()
+    for pkg_file in pkg_files[:1]:
+        try:
+            payload = json.loads(read(pkg_file) or "{}")
+            pkg_deps = set((payload.get("dependencies") or {})) | set((payload.get("devDependencies") or {}))
+        except (ValueError, TypeError):
+            evidence.append(f"{pkg_file}（package.json 存在但不可解析）")
+
+    spa_hits = [name for name in names if name.lower().endswith(_BROWSER_CODE_SUFFIXES)]
+    config_hits = sorted(basenames & set(_SPA_CONFIG_BASENAMES))
+    dep_hits = sorted(pkg_deps & set(_SPA_FRAMEWORK_DEPS))
+    marker_hits = [
+        name for name in html_files
+        if any(marker in read(name) for marker in _SPA_HTML_MARKERS)
+    ]
+
+    if spa_hits or config_hits or dep_hits or marker_hits:
+        evidence.extend(spa_hits[:5] + config_hits[:3] + [f"package.json 依赖 {dep}" for dep in dep_hits[:3]]
+                        + [f"{name} 含 SPA 挂载点/模块脚本标记" for name in marker_hits[:2]])
+        return {"shape": "full_stack_spa", "evidence": evidence}
+
+    if html_files:
+        server_dep_hits = sorted(pkg_deps & set(_SSR_SERVER_DEPS))
+        has_server_py = any(
+            name.endswith(".py") and any(framework in read(name) for framework in ("Flask(", "FastAPI(", "Django"))
+            for name in names if name.endswith(".py")
+        )
+        if server_dep_hits or has_server_py or any("/templates/" in name for name in html_files):
+            evidence.extend([f"package.json 依赖 {dep}" for dep in server_dep_hits[:3]]
+                            + html_files[:3])
+            return {"shape": "full_stack_ssr", "evidence": evidence}
+        # 纯静态 HTML（无服务端框架）：页面在浏览器里运行，按 SPA 收紧证据通道
+        evidence.extend(html_files[:3])
+        evidence.append("纯静态 HTML 交付（无服务端渲染框架特征），页面运行在浏览器")
+        return {"shape": "full_stack_spa", "evidence": evidence}
+
+    return {"shape": None, "evidence": evidence}

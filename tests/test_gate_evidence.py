@@ -500,7 +500,9 @@ class GateIntegrationTests(_EvidenceFixture):
                 "developer", "solution")
         publish("review_report", review, "reviewer", "review")
         publish("bug_reports", {"open": 0}, "tester", "test")
-        publish("ui_evidence", {"failed_asserts": 0, "asserts": []}, "tester", "test")
+        publish("ui_evidence", {"failed_asserts": 0, "asserts": [],
+                                "delivery_shape": "backend_only",
+                                "probe_version": "", "http_status": 0}, "tester", "test")
         publish("test_report", {
             "summary": {"failed": 0},
             "coverage": attestation["coverage"],

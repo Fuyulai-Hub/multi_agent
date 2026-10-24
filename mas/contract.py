@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -64,6 +65,19 @@ def _sha256_text(text: str) -> str:
 
 def _norm_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+#: 引文比对用的"实义字符"口径：NFKC 归一全角标点/字母后，只保留字母数字与汉字。
+#: 背景（task09-miniledger-01 实测）：契约条款里带 Markdown code span（反引号）、
+#: 中文分号与 `->`，模型引用时只要去掉反引号/换半角标点/多一个空格，精确子串
+#: 匹配就判 source_span_quote_mismatch，一条格式差异直接让整轮 intake 失败。
+#: 引文校验的用途是证明"没有编造条款"，不是逐字复刻排版，所以按实义字符比对。
+_QUOTE_NOISE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+
+
+def _quote_key(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
+    return _QUOTE_NOISE.sub("", normalized)
 
 
 def _is_open_question_section(section: str) -> bool:
@@ -227,9 +241,10 @@ def validate_contract(
                 probe = quote.strip("` ")
                 if probe.endswith(("…", "...")):
                     probe = re.sub(r"(?:…|\.\.\.)$", "", probe).strip()
-                    matched = bool(probe) and probe in _norm_text(clause["text"])
-                else:
-                    matched = probe in _norm_text(clause["text"])
+                # 实义字符子串比对：忽略反引号/全半角标点/空白差异，但改写用词仍判失败。
+                probe_key = _quote_key(probe)
+                matched = (len(probe_key) >= 4
+                           and probe_key in _quote_key(clause["text"]))
                 if not matched:
                     errors.append(f"source_span_quote_mismatch:{fp_id}:{clause_id}")
                     continue

@@ -24,17 +24,27 @@ from pathlib import Path
 from mas.config import load_config
 from mas.errors import ConfigError
 from mas.mcp import (
+    MCPClient,
     add_server,
     check_server,
     expand_env,
+    get_server,
     load_servers,
     remove_server,
     save_servers,
     validate_server,
 )
+from mas.toolrunner import ToolRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_mcp_server.py"
+
+
+def _content_text(result: dict) -> str:
+    """抽出 MCP tools/call 结果里的文本内容。"""
+    parts = [str(item.get("text", "")) for item in (result.get("content") or [])
+             if isinstance(item, dict) and item.get("type") == "text"]
+    return "\n".join(parts)
 
 _SSE_QUEUE: "queue.Queue[dict]" = queue.Queue()
 
@@ -190,6 +200,72 @@ class MCPStdioTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["stage"], "validate")
         self.assertTrue(report["hint"])
+
+    def test_register_from_mcp_skips_servers_excluded_from_llm(self):
+        """tools_for_llm=false 的服务只给框架侧直连，不进 LLM 工具面。"""
+        add_server(self.config, {
+            "name": "browser-like",
+            "transport": "stdio",
+            "enabled": True,
+            "command": sys.executable,
+            "args": [str(FAKE_SERVER)],
+            "timeout_s": 15,
+            "tools_for_llm": False,
+        })
+        runner = ToolRunner(self.config)
+        try:
+            runner.register_from_mcp()
+            self.assertEqual(runner.schemas, [], "被排除的服务不应下发工具")
+        finally:
+            runner.close()
+
+        # 对照：去掉该标记后同一服务应正常注册
+        add_server(self.config, {
+            "name": "browser-like",
+            "transport": "stdio",
+            "enabled": True,
+            "command": sys.executable,
+            "args": [str(FAKE_SERVER)],
+            "timeout_s": 15,
+        }, overwrite=True)
+        runner = ToolRunner(self.config)
+        try:
+            runner.register_from_mcp()
+            self.assertEqual(
+                sorted(tool["function"]["name"] for tool in runner.schemas),
+                ["echo", "ping"],
+            )
+        finally:
+            runner.close()
+
+    def test_call_tool_skips_notification_frames(self):
+        """响应前插入通知帧时客户端不能错位（回归 mcp.py request 的 id 匹配）。
+
+        修复前：request() 只读一行，把 notifications/tools/list_changed 当响应，
+        第一次 tools/call 返回 {}，第二次拿到第一次的结果（整体错位一格）。
+        真实 Playwright MCP 会在 tools/call 前发这帧，导致 browser_navigate 返回 {}、
+        browser_evaluate 返回上一次导航文本，UI 断言随机判失败。
+        """
+        add_server(self.config, {
+            "name": "notify",
+            "transport": "stdio",
+            "enabled": True,
+            "command": sys.executable,
+            "args": [str(FAKE_SERVER)],
+            "env": {"FAKE_MCP_NOTIFY": "1"},
+            "timeout_s": 15,
+        })
+        client = MCPClient(get_server(self.config, "notify"))
+        try:
+            client.start()
+            client.initialize()
+            first = _content_text(client.call_tool("echo", {"text": "first"}))
+            second = _content_text(client.call_tool("echo", {"text": "second"}))
+        finally:
+            client.close()
+        self.assertIn("first", first)
+        self.assertIn("second", second, "第二次调用拿到了第一次的结果：响应错位")
+        self.assertNotIn("first", second)
 
 
 class MCPSseTest(unittest.TestCase):

@@ -107,15 +107,23 @@ flow:
             expr: "solution_design.evaluation.selected != ''"
           - id: "待澄清问题均已闭环"
             expr: "test_report.negotiation.open == 0"
-          # docs/15 §6：仅 full_stack_spa（B 档）形态要求浏览器级 UI 证据，其余形态左支为 True 直接通过。
+          # docs/15 §6 + 门禁加固：SPA 判定以 ui_evidence.delivery_shape 为准——它来自
+          # tester 对沙箱真实文件的探测（mas/intent.py probe_delivery_shape，只升不降），
+          # 模型把 SPA 申报成 backend_only 也逃不掉浏览器证据。
           # 两条前置缺一不可，否则老任务会被批量误伤（expr.py 的 BoolOp 不短路求值，
           # 引用了缺失字段的 criterion 整条判失败）：
           #   1) requirement_spec.delivery_shape 由框架注入默认值（mas/intent.py L3 校验）；
-          #   2) ui_evidence 在任何形态下都被发布（tester.apply 第 6.5 步）。
+          #   2) ui_evidence 在任何形态下都被发布（tester.apply 第 6.5 步），
+          #      非 SPA 分支也带全 probe_version/http_status/asserts 字段。
           - id: "Web UI 断言无失败（仅 SPA 形态要求）"
-            expr: "requirement_spec.delivery_shape != 'full_stack_spa' or ui_evidence.failed_asserts == 0"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or ui_evidence.failed_asserts == 0"
           - id: "Web UI 证据非空（SPA 形态下不得证据不足）"
-            expr: "requirement_spec.delivery_shape != 'full_stack_spa' or len(ui_evidence.asserts) > 0"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or len(ui_evidence.asserts) > 0"
+          # 证据必须由框架 probe 采集（probe_version 只有 UiProber 会写），且含真实 HTTP 状态
+          - id: "SPA 浏览器证据由框架 probe 采集"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or ui_evidence.probe_version != ''"
+          - id: "SPA 证据含真实 HTTP 状态"
+            expr: "ui_evidence.delivery_shape != 'full_stack_spa' or (ui_evidence.http_status >= 200 and ui_evidence.http_status < 400)"
       transitions: { pass: report, fail: optimize }
 
     # ---------- 8. 报告 Agent：证据统计 + 验收报告 ----------

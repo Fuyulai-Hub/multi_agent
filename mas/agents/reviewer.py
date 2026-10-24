@@ -97,6 +97,16 @@ class ReviewerAgent(BaseAgent):
         "default": {},
     }
 
+    #: tests/ 目录的风格规则豁免集（可经 reviewer.yaml 的 test_style_rules_exempt 覆盖）。
+    #: 测试文件在首轮测试后被框架冻结（verifier.restore_if_changed 会还原开发者的改动，
+    #: tester 复测时也忽略新生成的 tests/），风格类阻塞项对开发者在后续迭代中不可修复，
+    #: 计入 blocking 会与回退上限构成死锁（task09-miniledger-04 实测：54 条 docstring
+    #: 阻塞项连续驳回，开发者两次修复都被冻结副本还原）。危险类规则不在豁免集内。
+    _TEST_STYLE_RULES = (
+        "missing_function_docstring", "missing_module_docstring",
+        "missing_type_hints", "function_too_long", "line_too_long",
+    )
+
     # 只有非纯后端形态才开启的规则：Web 服务生命周期（docs/15 补丁 3/4）与前端产物静态证据
     # （补丁 5）。backend_only 下 severity_map 不含这些键 → sandbox 不检出，行为零变更。
     _WEB_ONLY_SEVERITY = {
@@ -132,6 +142,32 @@ class ReviewerAgent(BaseAgent):
                 severity_map.pop(rule, None)
         policies["severity_map"] = severity_map
         return policies
+
+    def _exempt_test_style(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """过滤 tests/ 路径上的风格类 findings（见 _TEST_STYLE_RULES 注释）。"""
+        exempt = self.role.policies.get("test_style_rules_exempt")
+        if exempt is None:
+            exempt = self._TEST_STYLE_RULES      # 未配置才用默认；显式空列表=关闭豁免
+        exempt_set = {str(rule) for rule in exempt}
+        kept: List[Dict[str, Any]] = []
+        for item in findings:
+            path = _normalize_rel(item.get("file"))
+            if path.startswith("tests/") and str(item.get("rule", "")) in exempt_set:
+                continue
+            kept.append(item)
+        return kept
+
+    def _emit_test_style_exemption(self, task: NodeTask, dropped: int) -> None:
+        if dropped <= 0:
+            return
+        self.ctx.events.emit(
+            "review_test_style_exempt", agent=self.role_id, node=task.node_id,
+            iteration=task.iteration,
+            payload={
+                "dropped": dropped,
+                "note": "tests/ 冻结测试文件的风格类问题不计入审查证据与阻塞（开发者不可修复）",
+            },
+        )
 
     def _emit_exemption_trace(
         self, task: NodeTask, spec: Dict[str, Any], findings: List[Dict[str, Any]]
@@ -171,6 +207,8 @@ class ReviewerAgent(BaseAgent):
             policies = self._analysis_policies(perception.spec)
             analysis = self.ctx.sandbox.analyze(list(manifest.get("files", [])), policies)
             findings = [finding.to_dict() for finding in analysis.findings]
+            findings = self._exempt_test_style(findings)
+            self._emit_test_style_exemption(task, len(analysis.findings) - len(findings))
             self._emit_exemption_trace(task, perception.spec, findings)
             web_findings = self._web_asset_findings(manifest, policies)
             if web_findings:
@@ -230,7 +268,8 @@ class ReviewerAgent(BaseAgent):
             "classes": analysis.classes,
             "functions": analysis.functions,
             "syntax_errors": analysis.syntax_errors,
-            "findings": [finding.to_dict() for finding in analysis.findings],
+            "findings": self._exempt_test_style(
+                [finding.to_dict() for finding in analysis.findings]),
         }
         web_findings = self._web_asset_findings(manifest, policies)
         if web_findings:
@@ -288,6 +327,13 @@ class ReviewerAgent(BaseAgent):
         result.artifacts[artifact_name] = data
         result.status = "pass" if verdict == "pass" else "fail"
         result.summary = str(data.get("summary", "")) or f"{task.title}结论：{verdict}"
+        # 摘要与判决对账（20261024-233917-897d 实测）：模型自报 verdict=pass/阻塞 0 时
+        # summary 也写「通过，阻塞 0」，而框架重算 reject/blocking=N 才是节点真实状态——
+        # node_end 里「status=fail + 摘要说通过」自相矛盾，误导时间线与前端。
+        if (task.node_id == "review" and verdict != "pass") \
+                or int(data.get("blocking", 0) or 0) > 0:
+            result.summary += (f"（框架重算：verdict={verdict}，"
+                               f"阻塞 {data.get('blocking', 0)} 项）")
         result.events = ["review_passed" if verdict == "pass" else "review_rejected"]
         result.broadcast_payload = {
             "verdict": verdict,
@@ -576,7 +622,8 @@ class ReviewerAgent(BaseAgent):
         policies = dict(context.get("policies") or self.role.policies)
         blocking_severities = set(policies.get("blocking_severities") or ("critical", "major"))
         static = (context.get("static_analysis") or {}).get("findings") or []
-        deterministic = [item for item in static if isinstance(item, dict)]
+        deterministic = self._exempt_test_style(
+            [item for item in static if isinstance(item, dict)])
 
         mapping_findings, mapping_audit, code_hash = self._audit_fp_mapping(perception)
         deterministic.extend(mapping_findings)

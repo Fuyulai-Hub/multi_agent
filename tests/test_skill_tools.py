@@ -153,6 +153,11 @@ class _SkillToolsTestBase(unittest.TestCase):
             PROJECT_ROOT / "config", self.config_dir,
             ignore=shutil.ignore_patterns("credentials.yaml", "__pycache__"),
         )
+        # 隔离外部 MCP 服务：本文件只验证技能工具的装配与执行，不应因为生产
+        # config/mcp.yaml 里配了浏览器等 enabled 服务就把它们的工具也注册进来
+        # （否则「仅技能工具」类断言会随外部配置变动而变红）。
+        (self.config_dir / "mcp.yaml").write_text(
+            "servers: []\n", encoding="utf-8", newline="\n")
         self.config = load_config(self.config_dir, workspace=self.root / "workspace")
         self.config.runtime["verbose"] = False
         skills_cfg = dict(self.config.runtime.get("skills") or {})
