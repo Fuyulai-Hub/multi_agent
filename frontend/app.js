@@ -38,6 +38,8 @@ const state = {
   tools: { enabled: false },
   // 当前生效的 ReAct 开关（enabled/max_steps/require_thought 可写；nodes/tools_nodes 只读回显）
   react: { enabled: false, max_steps: 4, require_thought: false, nodes: [], tools_nodes: [] },
+  // 当前生效的联网搜索开关（config/inputs.yaml 的 websearch.*；provider/key 只读回显）
+  websearch: { enabled: false, provider: "", keyless: false, available: false, reason: "", tools_nodes: [] },
 };
 
 /* 附图上传约束：与后端 mas/sources.py 的 IMAGE_SUFFIXES / MAX_IMAGES、
@@ -515,6 +517,65 @@ async function toggleSkills() {
   }
 }
 
+/* ---------------- 主界面联网搜索开关（config/inputs.yaml 的 websearch.enabled）----------------
+   与技能开关同款范式：勾选即 POST /api/websearch 写回配置文件，下一次运行生效。
+   后端会一并回传「实际是否可用 + 原因」（免 Key 通道 / 缺 Key / function calling 总闸关闭），
+   写进控件 title 与状态条，避免"开关开了却没生效"的困惑。 */
+async function fetchWebsearchConfig() {
+  const res = await fetch(API_BASE + "/api/websearch");
+  return res.json();
+}
+
+function renderWebsearchHint(data) {
+  const label = $("#websearch-control");
+  const scope = (data.tools_nodes && data.tools_nodes.length)
+    ? `生效节点：${data.tools_nodes.join("、")}` : "生效节点：全部（llm.tools_nodes 为空）";
+  const tail = data.available
+    ? `${scope} · provider=${data.provider}${data.keyless ? "（免 Key）" : ""}`
+    : `当前不可用：${data.reason || "未知原因"}`;
+  label.title = `联网搜索：${data.enabled ? "已开启" : "已关闭"} · ${tail}\n`
+    + "开启后模型可自主调用 web_search 检索公开网页资料（标题/链接/摘要）。\n"
+    + "勾选即时写入 config/inputs.yaml 的 websearch.enabled，下一次运行生效。";
+  return tail;
+}
+
+async function refreshWebsearchToggle() {
+  try {
+    const data = await fetchWebsearchConfig();
+    Object.assign(state.websearch, data);
+    $("#websearch-toggle").checked = !!data.enabled;
+    renderWebsearchHint(data);
+  } catch { /* 读取失败不阻塞界面，保持上一次状态 */ }
+}
+
+async function toggleWebsearch() {
+  const el = $("#websearch-toggle");
+  const enabled = el.checked;
+  try {
+    const res = await fetch(API_BASE + "/api/websearch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      el.checked = !enabled;
+      setComposerStatus(data.error || "联网搜索开关保存失败", "error");
+      return;
+    }
+    Object.assign(state.websearch, data);
+    el.checked = !!data.enabled;
+    const hint = renderWebsearchHint(data);
+    setComposerStatus(
+      `联网搜索已${data.enabled ? "开启" : "关闭"}（下一次运行生效）· ${hint}`,
+      data.enabled && !data.available ? "error" : "done"
+    );
+  } catch (err) {
+    el.checked = !enabled;
+    setComposerStatus(`联网搜索开关保存失败：${err.message}`, "error");
+  }
+}
+
 /* 用弹窗里填写的（留空则用已保存的）凭据探测 /models，拿到该 Key 支持的模型列表 */
 async function fetchModels(apiKey, baseUrl) {
   const res = await fetch(API_BASE + "/api/llm/test", {
@@ -668,6 +729,9 @@ $(CFG.reactEnabled).addEventListener("change", () => {
 
 /* 主界面技能开关：勾选即时写回 system.yaml */
 $("#skills-toggle").addEventListener("change", toggleSkills);
+
+/* 主界面联网搜索开关：勾选即时写回 config/inputs.yaml 的 websearch.enabled */
+$("#websearch-toggle").addEventListener("change", toggleWebsearch);
 
 /* 显示/隐藏 API Key */
 $("#cfg-eye").addEventListener("click", () => {
@@ -1311,4 +1375,5 @@ function renderMarkdown(md) {
 /* ---------------- 启动 ---------------- */
 initLlmControls();
 refreshSkillsToggle();
+refreshWebsearchToggle();
 loadRuns();

@@ -1,7 +1,8 @@
 """联网搜索测试（docs/16 的 05 文档）。
 
 覆盖：
-- ``websearch.search``：本地 HTTP 桩返回固定结果（bing 形状）；超时 / 500 / 空结果三条路径不抛异常；
+- ``websearch.search``：本地 HTTP 桩返回固定结果（bing JSON 形状）；超时 / 500 / 空结果三条路径不抛异常；
+- ``bing_web`` 免 Key 通道：必应网页 RSS 输出的解析、条数截断、坏响应（风控 HTML）降级为空列表；
 - ``ToolRunner.register_local`` + ``_call_one`` 本地执行器的回传格式与失败约定；
 - ``BaseAgent._tool_schemas`` 的 ``tools_nodes`` 节点隔离（intake 有工具 / implement 无工具）。
 """
@@ -112,6 +113,98 @@ class SearchTests(unittest.TestCase):
 
     def test_empty_query_returns_empty(self):
         self.assertEqual(websearch.search("   ", provider="bing", api_key="k"), [])
+
+
+# ---------------- 免 Key 通道（bing_web：必应网页 RSS 输出）----------------
+_RSS_ITEMS = """\
+<item><title>结果一</title><link>https://a.example/1</link><description>摘要一</description></item>
+<item><title>结果二</title><link>https://a.example/2</link><description>摘要二</description></item>
+<item><title>无链接项</title><link></link><description>应被跳过</description></item>
+<item><title>结果三</title><link>https://a.example/3</link><description>摘要三</description></item>
+"""
+
+
+def _rss_body(items: str = _RSS_ITEMS) -> bytes:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f'<rss version="2.0"><channel><title>必应：测试</title>{items}</channel></rss>'
+    ).encode("utf-8")
+
+
+class _RssHandler(BaseHTTPRequestHandler):
+    mode = "ok"
+
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):  # noqa: N802
+        mode = type(self).mode
+        if mode == "badxml":
+            body = b"<html><body>captcha</body></html>"
+        elif mode == "empty":
+            body = _rss_body("")
+        else:
+            body = _rss_body()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class BingWebRssTests(unittest.TestCase):
+    """bing_web：无 Key、RSS 解析、条数截断、坏响应不抛异常。"""
+
+    def setUp(self):
+        self.events = []
+        _RssHandler.mode = "ok"
+        self.server = _StubServer(("127.0.0.1", 0), _RssHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}/search"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _sink(self, kind, payload):
+        self.events.append({"kind": kind, **payload})
+
+    def test_bing_web_is_keyless_provider(self):
+        self.assertIn("bing_web", websearch.PROVIDERS)
+        self.assertIn("bing_web", websearch.KEYLESS_PROVIDERS)
+        # 需要 Key 的官方 API 通道不受影响
+        self.assertNotIn("bing", websearch.KEYLESS_PROVIDERS)
+
+    def test_parses_rss_without_api_key(self):
+        results = websearch.search("个税扣除标准", provider="bing_web",
+                                   endpoint=self.endpoint, event_sink=self._sink)
+        self.assertEqual([item["title"] for item in results], ["结果一", "结果二", "结果三"])
+        self.assertEqual(results[0]["url"], "https://a.example/1")
+        self.assertEqual(results[0]["snippet"], "摘要一")
+        self.assertTrue(any(item["kind"] == "websearch_requested" for item in self.events))
+
+    def test_max_results_slices_server_side_oversupply(self):
+        """RSS 模式下服务端可能忽略 count（实测请求 5 条返回 10 条），由本地按 limit 截断。"""
+        results = websearch.search("x", provider="bing_web", max_results=2,
+                                   endpoint=self.endpoint, event_sink=self._sink)
+        self.assertEqual(len(results), 2)
+
+    def test_empty_channel_emits_empty_event(self):
+        _RssHandler.mode = "empty"
+        results = websearch.search("x", provider="bing_web",
+                                   endpoint=self.endpoint, event_sink=self._sink)
+        self.assertEqual(results, [])
+        self.assertTrue(any(item["kind"] == "websearch_empty" for item in self.events))
+
+    def test_non_rss_response_returns_empty_with_failed_event(self):
+        """被验证码 / 风控页拦截时返回 HTML：解析失败按「失败返回 []」处理，不抛异常。"""
+        _RssHandler.mode = "badxml"
+        results = websearch.search("x", provider="bing_web",
+                                   endpoint=self.endpoint, event_sink=self._sink)
+        self.assertEqual(results, [])
+        self.assertTrue(any(item["kind"] == "websearch_failed" for item in self.events))
 
 
 class LocalToolRunnerTests(unittest.TestCase):

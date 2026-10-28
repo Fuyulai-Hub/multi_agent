@@ -51,6 +51,11 @@
               <input id="skills-toggle" type="checkbox">
               <span class="control-label">技能</span>
             </label>
+            <label class="control switch-control" id="websearch-control"
+              title="联网搜索总开关：开启后模型可自主调用 web_search 工具检索公开网页资料（标题/链接/摘要），用于核实版本号、法规标准、API 规范等最新事实。勾选即时写入 config/inputs.yaml 的 websearch.enabled，下一次运行生效（运行中的流水线不受影响）。默认走免 Key 通道（必应网页 RSS）；改用 Bing / Tavily / SerpAPI 官方接口需自备 Key 并手改该文件的 provider 与 api_key">
+              <input id="websearch-toggle" type="checkbox">
+              <span class="control-label">联网</span>
+            </label>
           </div>
         </div>
         <textarea id="new-requirement" rows="9"

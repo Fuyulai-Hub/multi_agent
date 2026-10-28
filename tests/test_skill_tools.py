@@ -158,6 +158,20 @@ class _SkillToolsTestBase(unittest.TestCase):
         # （否则「仅技能工具」类断言会随外部配置变动而变红）。
         (self.config_dir / "mcp.yaml").write_text(
             "servers: []\n", encoding="utf-8", newline="\n")
+        # 隔离联网搜索：生产 config/inputs.yaml 的 websearch.enabled 已默认开启（面板「联网」
+        # 开关），Leader 会连本地 web_search 一起注册，同样会让「仅技能工具」类断言随外部
+        # 配置变动而变红。只在 websearch 段内改，不动其他段（如 feishu.enabled）。
+        inputs_path = self.config_dir / "inputs.yaml"
+        lines = inputs_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        start = next(i for i, line in enumerate(lines) if line.rstrip() == "websearch:")
+        for index in range(start + 1, len(lines)):
+            raw = lines[index]
+            if raw[:1] not in (" ", "\n") and not raw.lstrip().startswith("#"):
+                break                      # 已到下一个顶层键，段结束
+            if raw.lstrip().startswith("enabled:"):
+                lines[index] = raw.replace("enabled: true", "enabled: false", 1)
+                break
+        inputs_path.write_text("".join(lines), encoding="utf-8", newline="\n")
         self.config = load_config(self.config_dir, workspace=self.root / "workspace")
         self.config.runtime["verbose"] = False
         skills_cfg = dict(self.config.runtime.get("skills") or {})

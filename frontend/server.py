@@ -612,6 +612,115 @@ def save_react_switch(enabled: bool, max_steps: int, require_thought: bool) -> d
     return load_react_switch()
 
 
+# ---------------- 联网搜索开关（config/inputs.yaml 的 websearch.enabled）----------------
+# 与技能 / 工具 / ReAct 开关同一范式：读取走 yaml、写回走行级替换（保留注释与对齐），
+# 保存后下一次运行生效——Leader 每次 run 都重新 load_inputs 并装配 ToolRunner，无需重启。
+# 前端只暴露 enabled 一个写回字段：provider / api_key 涉及厂商选型与凭据，仍手改 yaml。
+# 可用性判定同时看 llm.tools_enabled（function calling 总闸）与 provider 是否需要 Key，
+# 面板据此显示「开了但不生效」的真实原因，而不是只回显一个勾选框。
+
+INPUTS_YAML = PROJECT_ROOT / "config" / "inputs.yaml"
+
+
+def load_websearch_switch() -> dict:
+    """读取联网搜索开关与实际可用性（``key_present`` 只报布尔，绝不回显 Key 明文）。"""
+    import yaml
+
+    from mas import websearch as ws
+    from mas.config import load_config
+    from mas.mcp import expand_env
+
+    raw: dict = {}
+    if INPUTS_YAML.exists():
+        raw = yaml.safe_load(INPUTS_YAML.read_text(encoding="utf-8")) or {}
+    section = dict(raw.get("websearch") or {})
+    provider = str(section.get("provider") or "bing_web")
+    keyless = provider in ws.KEYLESS_PROVIDERS
+    key_present = False
+    reason = ""
+    if keyless:
+        reason = f"免 Key 通道（provider={provider}）"
+    else:
+        detail = ""
+        try:
+            key_present = bool(
+                expand_env(section.get("api_key", ""), origin="inputs.yaml websearch.api_key")
+            )
+        except Exception as exc:  # noqa: BLE001 - 环境变量缺失等一律降级为「不可用 + 原因」
+            detail = f"api_key 无法展开：{exc}"
+        if not key_present:
+            reason = (f"provider={provider} 需要订阅 Key，但 websearch.api_key 未配置"
+                      + (f"（{detail}）" if detail else "")
+                      + "；免 Key 请把 provider 改为 bing_web")
+
+    config = load_config(PROJECT_ROOT / "config")
+    tools_enabled = bool(config.llm.get("tools_enabled", False))
+    tools_nodes = [str(node) for node in (config.llm.get("tools_nodes") or [])]
+    enabled = bool(section.get("enabled", False))
+
+    if not enabled:
+        reason = "开关关闭"
+    elif not tools_enabled:
+        reason = "config/system.yaml 的 llm.tools_enabled=false（function calling 总闸关闭）"
+    return {
+        "enabled": enabled,
+        "provider": provider,
+        "keyless": keyless,
+        "key_present": key_present,
+        "pre_enrich": bool(section.get("pre_enrich", False)),
+        "max_results": int(section.get("max_results", 5) or 5),
+        # 只读回显：工具实际下发到哪些节点（空列表 = 全部节点）
+        "tools_enabled": tools_enabled,
+        "tools_nodes": tools_nodes,
+        "available": bool(enabled and tools_enabled and (keyless or key_present)),
+        "reason": reason,
+    }
+
+
+def _rewrite_websearch_switch(text: str, enabled: bool) -> str:
+    """行级替换 ``websearch.enabled``，保留注释与其余内容原样（含行尾注释与对齐空格）。
+
+    必须跟踪顶层键定位：``feishu`` 段下也有同名 ``enabled``（同样 2 空格缩进），
+    只按缩进匹配会误改飞书开关。目标键缺失时报 ValueError（不猜测插入位置）。
+    """
+    found = False
+    out: list[str] = []
+    top = ""
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):       # 注释行不改变层级状态
+            out.append(line)
+            continue
+        m_top = re.match(r"^([^\s#][^:]*):", line)
+        m_second = re.match(r"^  ([^\s#][^:]*):", line)
+        if m_top:
+            top = m_top.group(1)
+        elif m_second and top == "websearch" and m_second.group(1) == "enabled":
+            head = re.match(r"^(  [^\s#][^:]*:\s*)", line)
+            if head:
+                prefix = head.group(1)
+                rest = line[len(prefix):]
+                tail_match = re.match(r"^[^\s#]+(\s*#.*)?$", rest)
+                tail = (tail_match.group(1) or "") if tail_match else ""
+                line = f"{prefix}{str(enabled).lower()}{tail}"
+            found = True
+        out.append(line)
+    if not found:
+        raise ValueError("config/inputs.yaml 的 websearch 段缺少字段: enabled")
+    return "\n".join(out) + "\n"
+
+
+def save_websearch_switch(enabled: bool) -> dict:
+    """把 ``websearch.enabled`` 写回 inputs.yaml（下一次运行生效；``newline="\\n"`` 防换行符改写）。"""
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled 必须是布尔值（true/false）")
+    original = INPUTS_YAML.read_text(encoding="utf-8")
+    INPUTS_YAML.write_text(
+        _rewrite_websearch_switch(original, enabled),
+        encoding="utf-8", newline="\n",
+    )
+    return load_websearch_switch()
+
+
 def test_llm_connection(api_key: str | None = None, base_url: str | None = None) -> dict:
     """用给定（或已保存的）凭据探测 BASE_URL 的 /models 接口，用于前端「测试连接」。"""
     from mas.config import load_config, mask_secret, resolve_credentials
@@ -1088,6 +1197,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(load_tools_switch())
         elif route == "/api/react":
             self._send_json(load_react_switch())
+        elif route == "/api/websearch":
+            self._send_json(load_websearch_switch())
         elif route == "/api/store/status":
             self._send_json(load_store_status())
         elif route == "/api/mq/status":
@@ -1111,7 +1222,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path not in ("/api/run", "/api/run/cancel", "/api/upload", "/api/upload/remove",
                                "/api/upload_image", "/api/llm", "/api/llm/test", "/api/skills",
-                               "/api/tools", "/api/react"):
+                               "/api/tools", "/api/react", "/api/websearch"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -1208,6 +1319,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(save_react_switch(enabled, max_steps, require_thought))
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/websearch":
+            enabled = data.get("enabled")
+            if not isinstance(enabled, bool):
+                self._send_json({"error": "enabled 必须是布尔值（true/false）"}, 400)
+                return
+            try:
+                self._send_json(save_websearch_switch(enabled))
             except (ValueError, OSError) as exc:
                 self._send_json({"error": str(exc)}, 400)
             return

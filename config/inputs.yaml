@@ -23,10 +23,16 @@ document_parse:
   formats: [".pdf", ".pptx", ".xlsx", ".html", ".epub", ".zip"]
 
 # 联网搜索（docs/16 的 05 文档）：路径 B 本地工具 + 路径 C 确定性预检索
+# 面板「对话」窗口的「联网」开关读写下面的 enabled（POST /api/websearch），默认开启。
+# provider=bing_web 是免 Key 通道（必应网页 RSS 输出，stdlib 解析）：开关一开即可用，
+# 不需要任何订阅凭据；若要换成官方 API，把 provider 改为 bing/tavily/serpapi，
+# 并把 api_key 填成 "${WEBSEARCH_API_KEY}"（运行时从环境变量展开，不落明文）。
+# 生效范围受 config/system.yaml 的 llm.tools_enabled（function calling 总闸）与
+# llm.tools_nodes（默认仅 intake 节点下发工具）约束，三者取交集。
 websearch:
-  enabled: false                          # 默认关闭，行为与现状一致
+  enabled: true                           # 面板「联网」开关；关闭后不注册 web_search 工具
   pre_enrich: false                       # 路径 C：Leader 入口预检索（默认关）
-  provider: "bing"                        # bing | tavily | serpapi
-  api_key: "${WEBSEARCH_API_KEY}"
+  provider: "bing_web"                    # bing_web（免 Key）| bing | tavily | serpapi
+  api_key: ""                             # bing_web 不需要；官方 API 通道填 "${WEBSEARCH_API_KEY}"
   max_results: 5
   timeout_s: 15
