@@ -22,3 +22,5 @@ deploy/.env
 # 外部开源仓库的本地副本（仅供架构对比参考，见 docs/27、docs/29）：codex monorepo ~800M，superpowers ~3.5M
 codex-code/
 tdd/
+# 项目快照压缩包（本地备份，禁止提交）
+multi_agent-*.zip
