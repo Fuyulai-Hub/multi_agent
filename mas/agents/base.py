@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from .. import compress
 from ..config import NodeConfig
-from ..errors import SandboxError
+from ..errors import RunCanceledError, SandboxError
 from ..llm import Generation, LLMClient
 from ..prompts import PromptBuilder, PromptBundle
 from ..schemas import AgentContext, AgentResult, NodeTask
@@ -204,6 +204,11 @@ class BaseAgent:
                 )
                 return result
             self.apply(task, generation, perception, context, result)
+        except RunCanceledError:
+            # 立即终止（docs/41）：取消信号不得被吞成"节点失败"——若吞掉，节点会走
+            # fail 分支继续回退/重试，下一个节点边界才发现取消。必须原样穿透给
+            # Leader 状态机的 except RunCanceledError 走取消收尾。
+            raise
         except Exception as exc:  # noqa: BLE001 - 任何 Agent 异常都转为节点失败
             result.status = "fail"
             result.error = f"{type(exc).__name__}: {exc}"

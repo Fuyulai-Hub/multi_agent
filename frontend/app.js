@@ -219,7 +219,7 @@ function renderRunDetail(detail, openTraces = []) {
   const cancelBar = detail.finished === false
     ? `<div class="detail-actions"><button id="cancel-run" class="danger-btn"
          data-run="${escapeHtml(detailRunId)}"${cancelPending ? " disabled" : ""}
-         title="终止该任务：当前节点会执行完毕再停止，运行标记为「已终止」，不做验收判定">${cancelPending ? "终止中…（当前节点执行完毕后停止）" : "■ 终止任务"}</button></div>`
+         title="终止该任务：立即中断当前模型调用并停止后续步骤（不含模型调用的执行段跑完后停止），运行标记为「已终止」，不做验收判定">${cancelPending ? "终止中…（正在中断当前步骤）" : "■ 终止任务"}</button></div>`
     : "";
 
   $("#run-detail").innerHTML = `
@@ -255,11 +255,12 @@ function renderRunDetail(detail, openTraces = []) {
 }
 
 /* ---------------- 终止运行任务（协作式取消，按钮在运行详情顶部） ---------------- */
-/* 请求成功仅代表取消信号已送达；Leader 在当前节点执行完毕后退出并收尾（状态「已终止」），
-   运行真正结束由轮询刷新呈现——期间按钮保持「终止中…」置灰态。 */
+/* 请求成功仅代表取消信号已送达；Leader 立即中断节点内的模型调用（流式读取中检测，
+   docs/41），随后走取消收尾（状态「已终止」），运行真正结束由轮询刷新呈现——
+   期间按钮保持「终止中…」置灰态。 */
 async function cancelRun(runId) {
   if (!runId) return;
-  if (!window.confirm(`确认终止运行 ${runId}？\n\n终止将在当前节点执行完毕后生效；该运行标记为「已终止」，不做验收判定。`)) return;
+  if (!window.confirm(`确认终止运行 ${runId}？\n\n当前模型调用会被立即中断并停止后续步骤；该运行标记为「已终止」，不做验收判定。`)) return;
   cancelingRuns.add(runId);
   renderCache.runId = null;   // 强制重绘：按钮立即切到「终止中…」
   if (state.selectedRun === runId) await selectRun(runId);
@@ -278,7 +279,7 @@ async function cancelRun(runId) {
       setComposerStatus(data.error || "终止失败", "error");
       return;
     }
-    setComposerStatus(`已请求终止 ${runId}：等待当前节点执行完毕后停止…`, "running");
+    setComposerStatus(`已请求终止 ${runId}：正在中断当前步骤…`, "running");
     activeRuns.add(runId);                   // 纳入轮询：结束提示「已终止」并清理置灰状态
     startPolling();
     await loadRuns();

@@ -37,7 +37,7 @@ from .contract import (
     verify_frozen_contract,
 )
 from .envprobe import probe_environment
-from .errors import ConfigError
+from .errors import ConfigError, RunCanceledError
 from .events import EventLog
 from .experience import Experience, ExperienceLibrary
 from .expr import evaluate
@@ -402,10 +402,12 @@ class Leader:
     ) -> RunSummary:
         """执行一次完整流水线。
 
-        ``cancel_event``（协作式取消，默认 None 行为与改造前一致）：非 None 时在每个
-        节点边界检查信号，被设置则停止调度后续节点并走收尾流程——summary.canceled=True、
-        verdict 强制 fail、跳过经验提炼/晋级/指标记录（半截运行不污染自学习数据）。
-        当前正在执行的节点（如 LLM 生成）不会被强行打断，在其执行完毕后生效。
+        ``cancel_event``（协作式取消，默认 None 行为与改造前一致）：在两个层级生效——
+        ① 节点边界检查信号，被设置则停止调度后续节点；② 下沉到 LLM 层（docs/41），
+        节点内的流式读取/重试退避/请求入口发现信号即抛 ``RunCanceledError``，当前
+        节点被立即中断。两种路径都走同一收尾：summary.canceled=True、verdict 强制
+        fail、跳过经验提炼/晋级/指标记录（半截运行不污染自学习数据）。节点内不含
+        LLM 调用的执行段（沙箱跑测试、MCP 工具调用）仍按原样跑完，在下个边界生效。
 
         ``registry``（运行注册表，docs/25 协调层；默认 None 行为与改造前一致）：
         非 None 时——运行开始自动 register（幂等）、每个节点边界 heartbeat
@@ -484,6 +486,18 @@ class Leader:
             # 项目指令文本不重扫：以检查点保存的内容为准，保证续跑前后 Prompt 一致
             prompts.project_docs_text = str(resume_state.get("project_docs_text") or "")
         llm = LLMClient(self.config)
+        # 立即终止（docs/41）：把取消信号下沉到 LLM 层。节点内的流式读取/重试退避/
+        # 请求入口发现信号即抛 RunCanceledError，由下方状态机的 except 捕获后直接走
+        # 既有取消收尾——不再等当前节点（可达数百秒的 LLM 调用）执行完毕。
+        # cancel_event 与 registry 两路信号都探：worker 模式只有 registry（无 event）。
+        def _llm_should_stop() -> bool:
+            if cancel_event is not None and cancel_event.is_set():
+                return True
+            if registry is not None:
+                return bool(registry.is_canceled(run_id))
+            return False
+
+        llm.should_stop = _llm_should_stop
 
         ctx = AgentContext(
             config=self.config, run_id=run_id, run_dir=run_dir, events=events, blackboard=blackboard,
@@ -661,8 +675,9 @@ class Leader:
             max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
 
             while node_id and node_id not in flow.terminal and steps < max_steps:
-                # 协作式终止（面板「终止任务」）：只在节点边界检查取消信号。
-                # 当前节点的执行（含 LLM 调用）不打断，跑完后在此退出循环、进入收尾。
+                # 协作式终止（面板「终止任务」）的节点边界检查点：取消在节点内已由
+                # LLM 层立即处理（docs/41），此处兜住的是节点不含 LLM 调用的中断场景
+                # （沙箱执行/MCP 工具调用期间置位 → 跑完当前节点后在此退出循环）。
                 # registry 非 None 时额外查跨进程取消键：CLI/其他进程发起的运行也可被终止。
                 if cancel_event is not None and cancel_event.is_set():
                     canceled = True
@@ -793,6 +808,17 @@ class Leader:
                     started_at=started.isoformat(timespec="seconds"),
                 )
 
+        except RunCanceledError:
+            # 立即终止（docs/41）：LLM 层在节点内（流式读取/退避等待/请求入口）发现
+            # 取消信号，不再等当前节点执行完毕，直接转入下方既有取消收尾——
+            # canceled=true、verdict=fail、跳过经验提炼/晋级/指标（防污染自学习），
+            # run_summary/timeline 照常落盘（面板据此显示「已终止」）。
+            canceled = True
+            events.emit(
+                "node_interrupted", agent="leader", node=node_id, severity="warning",
+                payload={"reason": "用户手动终止：节点内 LLM 调用被立即中断"},
+            )
+            node_id = "halt"
         finally:
             if tool_runner is not None:
                 tool_runner.close()

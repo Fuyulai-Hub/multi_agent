@@ -9,11 +9,11 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .config import SystemConfig, resolve_credentials
 from .context import ContextManager
-from .errors import AgentError
+from .errors import AgentError, RunCanceledError
 from .prompts import PromptBundle
 
 __all__ = ["Generation", "LLMClient", "parse_json_block"]
@@ -145,6 +145,14 @@ class LLMClient:
         # 因此未配置 / 未超限两种情况下请求体与改造前逐字节一致。
         self.context = ContextManager.from_config(config)
         self.last_fit = None      # 最近一次治理结果（供 Agent 层留痕，未治理时为 None）
+        # 协作式立即取消（docs/41）：由 Leader 在 run() 内注入的取消探测闭包；
+        # None（默认）时 _canceled() 恒 False，所有请求路径行为与改造前逐字节一致。
+        # 检查点：每次请求前（_attempt/重试迭代开头，force 探测）+ 流式读取逐行
+        # （节流，cancel_poll_interval 秒至多一次真实探测——Redis 后端 is_canceled
+        # 是网络往返，逐行不限频会把 SSE 高峰打成 Redis 风暴）+ 重试退避分段睡眠。
+        self.should_stop: Optional[Callable[[], bool]] = None
+        self.cancel_poll_interval = float(config.llm.get("cancel_poll_interval", 0.5) or 0)
+        self._last_cancel_check = 0.0
 
     @staticmethod
     def _parse_ladder(raw: Any) -> List[str]:
@@ -258,11 +266,46 @@ class LLMClient:
             generation.error = self._empty_output_error(generation)
         return generation
 
+    def _canceled(self, *, force: bool = False) -> bool:
+        """协作式取消探测（节流）：should_stop 未注入时恒 False。
+
+        force=True 绕过节流——只用于每次请求/重试迭代的入口探测（低频），流式逐行
+        检查走节流路径。探测本身抛异常（如 Redis 抖动）时按"未取消"处理，绝不把
+        取消通道的故障变成生成失败。
+        """
+        if self.should_stop is None:
+            return False
+        now = time.monotonic()
+        if not force and now - self._last_cancel_check < self.cancel_poll_interval:
+            return False
+        self._last_cancel_check = now
+        try:
+            return bool(self.should_stop())
+        except Exception:  # noqa: BLE001 - 取消探测失败不影响生成
+            return False
+
+    def _sleep_cancelable(self, seconds: float) -> None:
+        """重试退避分段睡眠：等待期间发现取消立即抛 RunCanceledError。
+
+        否则点击终止后要等完整退避（backoff × attempt，最长数秒）才能生效。
+        """
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            if self._canceled():
+                raise RunCanceledError("用户手动终止：取消重试退避等待")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.25, remaining))
+
     def _attempt(self, payload: Dict[str, Any], api_key: str, base_url: str) -> Generation:
         """发一次请求；可重试错误（网关 504 / 读超时）不抛出，返回 timed_out 标记的结果。
 
         这样超时与 length 截断走同一条降级链，而不是让节点直接崩掉。
+        请求入口先做一次取消探测（force）：已置取消信号时不再发起网络请求。
         """
+        if self._canceled(force=True):
+            raise RunCanceledError("用户手动终止：取消尚未发起的 LLM 请求")
         try:
             return self._request_generation(payload, api_key, base_url)
         except _RetryableLLMError as exc:
@@ -407,6 +450,8 @@ class LLMClient:
         finish_reason = ""
         usage: Dict[str, Any] = {}
         for attempt in range(1, attempts + 1):
+            if self._canceled(force=True):
+                raise RunCanceledError("用户手动终止：取消重试中的 LLM 请求")
             text_parts, reasoning_parts, tool_calls_by_index = [], [], {}
             finish_reason, usage = "", {}
             deadline = time.monotonic() + self.stream_total_timeout
@@ -421,6 +466,12 @@ class LLMClient:
                             raise TimeoutError(
                                 f"流式响应总时长超过 {self.stream_total_timeout}s，主动断开重试"
                             )
+                        # 立即终止（docs/41）：抛在 with 内部 → 连接随退出关闭，服务端
+                        # 流被真实中断；节流探测使 Redis 后端的取消轮询至多 2 次/秒。
+                        # 流静默期（模型长时间不吐 chunk）受限于 socket 读超时（llm.timeout），
+                        # 最坏等一次读超时后由重试入口的 force 探测兜住。
+                        if self._canceled():
+                            raise RunCanceledError("用户手动终止：中断 LLM 流式读取")
                         line = raw_line.decode("utf-8", errors="replace").strip()
                         if not line.startswith("data:"):
                             continue
@@ -470,7 +521,7 @@ class LLMClient:
                 retryable = True
             if not retryable or attempt == attempts:
                 raise _RetryableLLMError(last_error) if retryable else AgentError(last_error)
-            time.sleep(self.retry_backoff_s * attempt)
+            self._sleep_cancelable(self.retry_backoff_s * attempt)
         message: Dict[str, Any] = {}
         text = "".join(text_parts)
         reasoning = "".join(reasoning_parts)
@@ -531,6 +582,8 @@ class LLMClient:
         attempts = self.retry_max_attempts
         last_error = ""
         for attempt in range(1, attempts + 1):
+            if self._canceled(force=True):
+                raise RunCanceledError("用户手动终止：取消尚未发起的 LLM 请求")
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
@@ -548,7 +601,7 @@ class LLMClient:
                 retryable = True
             if not retryable or attempt == attempts:
                 raise _RetryableLLMError(last_error) if retryable else AgentError(last_error)
-            time.sleep(self.retry_backoff_s * attempt)
+            self._sleep_cancelable(self.retry_backoff_s * attempt)
         raise AgentError(last_error or "LLM 调用失败")  # pragma: no cover - 理论上不可达
 
     @staticmethod

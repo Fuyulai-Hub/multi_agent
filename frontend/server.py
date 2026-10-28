@@ -25,7 +25,7 @@ API：
     GET /api/mq/status               消息队列健康：运行流积压 / PEL / DLQ / worker（docs/26）
     POST /api/run                     发起一次流水线（requirement 文字 / requirement_path 上传文件，二选一；可另带 images 附图路径数组）
                                        runtime.mq 启用时只入队（返回 status=queued），由 worker 消费执行
-    POST /api/run/cancel              终止进行中的运行（置取消信号，Leader 在当前节点执行完毕后协作式退出）
+    POST /api/run/cancel              终止进行中的运行（置取消信号；Leader 立即中断节点内模型调用，docs/41）
     POST /api/upload                  上传需求文档（base64 JSON，落盘 workspace/uploads/）
     POST /api/upload/remove           取消一次已上传的需求文档（删除 uploads/ 内暂存文件）
     POST /api/upload_image            上传对话附图（base64 JSON，图片后缀白名单，落盘 workspace/uploads/）
@@ -911,9 +911,10 @@ def enqueue_run(
 
 
 def cancel_run(run_id: str) -> dict:
-    """请求终止一次运行：置取消信号，Leader 在当前节点执行完毕后协作式退出。
+    """请求终止一次运行：置取消信号，Leader 立即中断节点内的模型调用（docs/41）。
 
-    返回 ``{"run_id", "status": "canceling"}``（异步语义：信号已送达，退出在下个边界发生）。
+    返回 ``{"run_id", "status": "canceling"}``（异步语义：信号已送达，LLM 层在流式
+    读取/退避等待中检测到即中断；不含模型调用的执行段跑完后停止）。
     先查本进程 ``RUNNING_TASKS``（快路径）；未命中再查 ``REGISTRY``——Redis 后端下
     CLI/其他进程发起的运行同样可在此终止。两者都没有时抛 ``ValueError``——
     已完成，或从未注册（如实报错，不伪造送达）。
