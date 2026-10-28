@@ -461,6 +461,35 @@ class ZeroEvidenceIntegrityTests(unittest.TestCase):
         finally:
             tmp.cleanup()
 
+    def test_hidden_source_bugs_not_closed_by_visible_regression(self):
+        """source=hidden 的缺陷不由可见套件回归闭环（20261025-063338-26c1 实测）。
+
+        隐藏用例只在 acceptance 现场执行：可见套件跑不到它 ≠ 已修复。
+        若 tester 自动闭环，optimize 会看到「0 个缺陷」空转，acceptance→optimize
+        预算白耗。闭环证据只能来自 Leader._merge_hidden_bugs 的隐藏复跑结果。
+        """
+        import copy
+
+        agent, _ctx, tmp = _agent()
+        try:
+            prior = [
+                {"id": "BUG-bbbb2222", "test": "T.test_functional_x", "status": "open",
+                 "fp_id": "FP-01", "category": "functional", "source": "hidden"},
+                {"id": "BUG-aaaa1111", "test": "T.test_functional_y", "status": "open",
+                 "fp_id": "FP-01", "category": "functional"},
+            ]
+            task = NodeTask(node_id="test", title="业务测试", role="tester", kind="task",
+                            iteration=3)
+            executed = [{"class": "T", "test": "test_boundary_other", "status": "passed",
+                         "category": "boundary", "fp_id": "FP-01"}]
+            bugs = agent._track_bugs(executed, [], task, self._perception(copy.deepcopy(prior)))
+            by_id = {item["id"]: item for item in bugs["items"]}
+            self.assertEqual(by_id["BUG-bbbb2222"]["status"], "open", bugs)
+            self.assertEqual(by_id["BUG-aaaa1111"]["status"], "fixed", bugs)
+            self.assertEqual(bugs["open"], 1)
+        finally:
+            tmp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

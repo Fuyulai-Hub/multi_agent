@@ -358,13 +358,35 @@ class TestVerifier:
         test_ids = self._collect_test_ids()
         if not test_ids:
             raise VerificationError("冻结测试文件中没有可枚举的 unittest 用例")
+        bound_meta = self._bind_case_meta(test_ids, case_meta)
+        if case_meta is not None:
+            # 绑定完整性兜底（20261025-035830-af5d 两轮复现）：文件里的 test_* 方法若
+            # 无 cases 元数据（或 fp_id 为空/category 非法），清单会带着 fp_id="" 的
+            # 用例签名，执行后凭证必带 case_missing_fp_id → 套件解冻 → 测试节点失败
+            # 回退，连续复现即撞回退上限（实测 90 方法仅绑定 83）。生成方提交了元数据
+            # 就必须完整绑定；未提交（单元测试直连）时维持旧口径不动。
+            bad: List[str] = []
+            for test_id in test_ids:
+                meta = bound_meta.get(test_id)
+                method = test_id.rsplit(".", 1)[-1]
+                if meta is None:
+                    bad.append(f"unbound:{method}")
+                elif not meta.get("fp_id"):
+                    bad.append(f"empty_fp:{method}")
+                elif meta.get("category") not in _CATEGORIES:
+                    bad.append(f"bad_category:{method}")
+            if bad:
+                raise VerificationError(
+                    "测试套件元数据与方法不一致（每个 test_* 方法都需要 fp_id 非空、"
+                    "category 合法的 cases 元数据）: " + ", ".join(bad[:8])
+                    + (f" 等 {len(bad)} 项" if len(bad) > 8 else ""))
         manifest = _signed({
             "version": 2,
             "test_file": test_file,
             "files": hashes,
             "digest": self._tree_digest(hashes),
             "test_ids": test_ids,
-            "case_meta": self._bind_case_meta(test_ids, case_meta),
+            "case_meta": bound_meta,
             "iteration": int(iteration),
             "frozen_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "invalidated": False,

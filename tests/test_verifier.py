@@ -65,9 +65,11 @@ class TestFreezeTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_freeze_creates_manifest_and_copies(self):
-        manifest = self.verifier.freeze("tests/test_all.py", 1, case_meta=[{
-            "fp_id": "FP-01", "category": "functional", "op": "add", "name": "",
-        }])
+        manifest = self.verifier.freeze("tests/test_all.py", 1, case_meta=[
+            {"fp_id": "FP-01", "category": "functional", "op": "add", "name": ""},
+            {"fp_id": "FP-01", "category": "exception", "op": "div", "name": ""},
+            {"fp_id": "FP-01", "category": "boundary", "op": "zero", "name": ""},
+        ])
         self.assertTrue((self.run_dir / "test_manifest.json").exists())
         self.assertTrue((self.run_dir / "frozen_tests" / "tests" / "test_all.py").exists())
         self.assertEqual(manifest["test_file"], "tests/test_all.py")
@@ -80,6 +82,41 @@ class TestFreezeTests(unittest.TestCase):
             manifest["case_meta"]["tests.test_all.TestFp01.test_functional_add"]["fp_id"], "FP-01")
         self.assertTrue(verify_attestation(manifest))
         self.assertIsNotNone(self.verifier.load_manifest())
+
+    def test_freeze_rejects_unbound_methods_when_meta_provided(self):
+        """生成方提交了元数据时，绑定不完整直接拒绝冻结（20261025-035830-af5d 实测）。
+
+        文件方法无元数据 → 清单带着 fp_id="" 签名 → 执行后凭证必带
+        case_missing_fp_id → 套件解冻回退；连续复现即撞回退上限。
+        """
+        with self.assertRaises(VerificationError) as ctx:
+            self.verifier.freeze("tests/test_all.py", 1, case_meta=[{
+                "fp_id": "FP-01", "category": "functional", "op": "add", "name": "",
+            }])
+        self.assertIn("unbound:test_exception_div", str(ctx.exception))
+        self.assertIn("unbound:test_boundary_zero", str(ctx.exception))
+        # 拒绝时不得落清单（否则半冻结状态会让下一轮误判已冻结）
+        self.assertFalse((self.run_dir / "test_manifest.json").exists())
+
+    def test_freeze_rejects_empty_fp_and_bad_category_meta(self):
+        self.test_path.write_text('''"""测试。"""
+import unittest
+
+
+class TestFp01(unittest.TestCase):
+    def test_functional_add(self):
+        pass
+
+    def test_smoke_div(self):
+        pass
+''', encoding="utf-8")
+        with self.assertRaises(VerificationError) as ctx:
+            self.verifier.freeze("tests/test_all.py", 1, case_meta=[
+                {"fp_id": "", "category": "functional", "op": "add", "name": ""},
+                {"fp_id": "FP-01", "category": "smoke", "op": "div", "name": ""},
+            ])
+        self.assertIn("empty_fp:test_functional_add", str(ctx.exception))
+        self.assertIn("bad_category:test_smoke_div", str(ctx.exception))
 
     def test_modified_test_is_restored(self):
         self.verifier.freeze("tests/test_all.py", 1)
@@ -380,6 +417,31 @@ class ReviewerBlockingRecomputeTests(unittest.TestCase):
         result = self._mapping("pkg/core.py::missing")
         self.assertEqual(result["blocking"], 1)
         self.assertEqual(result["blocking_items"][0]["rule"], "fp_mapping_symbol_missing")
+
+    def test_module_level_all_assignment_is_valid_symbol(self):
+        """模块级赋值（__all__）是合法映射符号：误报 critical 会让开发者无路可修（回退死锁）。"""
+        frozen = self.run_dir / "frozen_tests" / "tests" / "test_all_export.py"
+        frozen.write_text(
+            '"""冻结测试：核验公共导出面。"""\nimport unittest\nimport pkg\n\n\n'
+            "class TestAll(unittest.TestCase):\n"
+            "    def test_all(self):\n"
+            '        self.assertEqual(pkg.__all__, ["add"])\n',
+            encoding="utf-8",
+        )
+        result = self._mapping("pkg/__init__.py::__all__")
+        self.assertEqual(result["blocking"], 0)
+        self.assertEqual(result["mapping_audit"]["valid"], 1)
+        self.assertEqual(result["verdict"], "pass")
+
+    def test_reexported_import_is_valid_symbol(self):
+        """``pkg/__init__.py`` 的再导出（from .core import add）也是模块级名字。
+
+        开发者被 ``__all__`` 误报逼退后会把 FP 改映射到再导出名（实测 v3），
+        不识别同样构成不可修复阻塞。
+        """
+        result = self._mapping("pkg/__init__.py::add")
+        self.assertEqual(result["blocking"], 0)
+        self.assertEqual(result["mapping_audit"]["valid"], 1)
 
     def test_symbol_not_covered_by_passing_test_is_blocking(self):
         result = self._mapping("pkg/core.py::unused")

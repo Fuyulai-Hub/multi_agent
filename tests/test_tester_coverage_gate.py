@@ -35,6 +35,17 @@ def _cases(*pairs):
     ]
 
 
+def _method_of(case):
+    return "test_" + "_".join(
+        part for part in (case.get("category"), case.get("op"), case.get("name")) if part)
+
+
+def _suite_file(cases):
+    """按 cases 元数据合成方法名一致的测试文件（口径同 verifier._bind_case_meta）。"""
+    body = "".join(f"    def {_method_of(case)}(self):\n        pass\n\n" for case in cases)
+    return "import unittest\n\n\nclass TestAll(unittest.TestCase):\n" + (body or "    pass\n")
+
+
 def _spec():
     return {"function_points": [
         {"id": "FP-01", "title": "加法", "category": "功能",
@@ -90,7 +101,8 @@ class CoverageGateTests(unittest.TestCase):
         self.config.runtime["test_coverage_max_attempts"] = max_attempts
         self.ctx.llm = _StubLLM(payloads)
         result = AgentResult()
-        data = {"files": [{"path": "tests/test_all.py", "content": "pass"}],
+        data = {"files": [{"path": "tests/test_all.py",
+                           "content": _suite_file(data_cases)}],
                 "cases": data_cases}
         return self.agent._ensure_full_coverage(
             self.task, Generation(data=data, provider="stub"), data, _spec()["function_points"],
@@ -103,7 +115,8 @@ class CoverageGateTests(unittest.TestCase):
         self.assertEqual(self.agent._coverage_gaps(data["cases"], _spec()["function_points"]), [])
 
     def test_gap_triggers_repair_with_missing_pairs(self):
-        good = {"files": [{"path": "tests/test_all.py", "content": "pass"}],
+        good = {"files": [{"path": "tests/test_all.py",
+                           "content": _suite_file(_FULL_CASES)}],
                 "cases": _FULL_CASES}
         (data, _gen), result = self._run([good], _GAP_CASES)
 
@@ -123,7 +136,8 @@ class CoverageGateTests(unittest.TestCase):
         self.assertEqual(len(data["cases"]), 6)
 
     def test_exhausted_attempts_fails_without_freeze(self):
-        still_gap = {"files": [{"path": "tests/test_all.py", "content": "pass"}],
+        still_gap = {"files": [{"path": "tests/test_all.py",
+                                "content": _suite_file(_GAP_CASES)}],
                      "cases": _GAP_CASES}
         (_data, _gen), result = self._run([still_gap], _GAP_CASES)
 
@@ -152,6 +166,88 @@ class CoverageGateTests(unittest.TestCase):
     def test_gap_report_ignores_malformed_cases(self):
         cases = _FULL_CASES + [None, "junk", {"fp_id": "", "category": "functional"}]
         self.assertEqual(self.agent._coverage_gaps(cases, _spec()["function_points"]), [])
+
+    def test_unbound_method_triggers_repair(self):
+        """文件方法与 cases 元数据不一致（20261025-035830-af5d 两轮复现）必须走修复闭环。
+
+        90 个方法只绑定 83 个 → 冻结清单带 fp_id="" → 凭证 case_missing_fp_id →
+        套件解冻回退；冻结前修复掉就不再消耗回退预算。
+        """
+        mismatched = dict(cases=_FULL_CASES, files=[{
+            "path": "tests/test_all.py",
+            "content": _suite_file(_FULL_CASES)
+            + "    def test_functional_orphan(self):\n        pass\n",
+        }])
+        good = {"files": [{"path": "tests/test_all.py",
+                           "content": _suite_file(_FULL_CASES)}],
+                "cases": _FULL_CASES}
+        self.config.runtime["test_coverage_max_attempts"] = 2
+        self.ctx.llm = _StubLLM([good])
+        result = AgentResult()
+        data, _gen = self.agent._ensure_full_coverage(
+            self.task, Generation(data=mismatched, provider="stub"), mismatched,
+            _spec()["function_points"], result)
+        self.assertNotEqual(result.status, "fail", result.error)
+        self.assertEqual(len(self.ctx.llm.calls), 1)
+        kind, prompt = self.ctx.llm.calls[0]
+        self.assertEqual(kind, "test_suite_repair")
+        self.assertIn("unbound_method:test_functional_orphan", prompt)
+        self.assertEqual(len(data["cases"]), len(_FULL_CASES))
+
+    def test_binding_gaps_exhausted_fails_without_freeze(self):
+        mismatched = dict(cases=_FULL_CASES, files=[{
+            "path": "tests/test_all.py",
+            "content": _suite_file(_FULL_CASES)
+            + "    def test_functional_orphan(self):\n        pass\n",
+        }])
+        self.config.runtime["test_coverage_max_attempts"] = 2
+        self.ctx.llm = _StubLLM([mismatched])     # 修复后依旧不一致
+        result = AgentResult()
+        self.agent._ensure_full_coverage(
+            self.task, Generation(data=mismatched, provider="stub"), mismatched,
+            _spec()["function_points"], result)
+        self.assertEqual(result.status, "fail")
+        self.assertIn("unbound_method:test_functional_orphan", result.error)
+        self.assertFalse((self.run_dir / "test_manifest.json").exists())
+
+    def test_binding_gaps_flag_missing_fp_and_dangling_case(self):
+        files = [{"path": "tests/test_all.py", "content": _suite_file(_FULL_CASES)}]
+        cases = list(_FULL_CASES)
+        cases[0] = dict(cases[0], fp_id="")                       # fp 为空
+        cases[1] = dict(cases[1], fp_id="FP-99")                  # 未知 fp
+        cases.append({"fp_id": "FP-01", "category": "smoke",      # 非法 category + 无方法
+                      "op": "ghost", "name": "one"})
+        gaps = self.agent._binding_gaps(files, cases, ["FP-01", "FP-02"])
+        self.assertIn("case_missing_fp:test_functional_add_case0", gaps)
+        self.assertIn("case_unknown_fp:test_exception_add_case1:FP-99", gaps)
+        self.assertIn("case_bad_category:test_smoke_ghost_one:smoke", gaps)
+        self.assertIn("case_without_method:test_smoke_ghost_one", gaps)
+
+    def test_clear_foreign_tests_before_first_freeze(self):
+        """研发自测文件（can_write_tests=true）不得被首个冻结扫进清单。
+
+        20261025-053247-7c17 实测：tests/ 残留研发辅助方法（test_lengths 等，
+        无 category 前缀、无 cases 元数据）→ 冻结清单混入不可绑定用例 →
+        凭证必带 case_missing_fp_id。首次冻结前清掉非本套件声明的外来 .py；
+        __init__.py 保留。
+        """
+        sandbox_root = self.ctx.sandbox.root
+        (sandbox_root / "tests").mkdir(parents=True, exist_ok=True)
+        (sandbox_root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (sandbox_root / "tests" / "dev_selftest.py").write_text(
+            "import unittest\n\n\nclass T(unittest.TestCase):\n"
+            "    def test_lengths(self):\n        pass\n", encoding="utf-8")
+        (sandbox_root / "tests" / "test_all.py").write_text("pass\n", encoding="utf-8")
+        cleared = self.agent._clear_foreign_tests(
+            self.task, ["tests/test_all.py"])
+        self.assertEqual(cleared, ["tests/dev_selftest.py"])
+        self.assertFalse((sandbox_root / "tests" / "dev_selftest.py").exists())
+        self.assertTrue((sandbox_root / "tests" / "__init__.py").exists())
+        self.assertTrue((sandbox_root / "tests" / "test_all.py").exists())
+        events = [e for e in self.events.events
+                  if e.type == "test_foreign_files_cleared"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["files"], ["tests/dev_selftest.py"])
 
 
 if __name__ == "__main__":

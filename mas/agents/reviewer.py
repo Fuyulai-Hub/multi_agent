@@ -55,7 +55,13 @@ def _module_name(file: str) -> str:
 
 
 def _defined_symbols(tree: ast.AST) -> Set[str]:
-    """模块级函数/类，以及类的方法（Class.method）。"""
+    """模块级名字：函数/类/赋值（含 ``__all__``、常量）/import 绑定，及类方法（Class.method）。
+
+    只收模块级：函数/类体内的局部名字不是可映射的公开符号。缺了赋值与 import
+    绑定会把 ``pkg/__init__.py::__all__``、``pkg/__init__.py::parse_amount``（再导出）
+    这类正确映射误判为 ``fp_mapping_symbol_missing``（critical 阻塞）——开发者无法
+    把模块级名字改成函数定义，属不可修复阻塞项，实测连续三轮触发回退死锁。
+    """
     names: Set[str] = set()
 
     def visit(body: List[ast.stmt], prefix: str) -> None:
@@ -65,6 +71,22 @@ def _defined_symbols(tree: ast.AST) -> Set[str]:
                 names.add(name)
                 if isinstance(node, ast.ClassDef):
                     visit(node.body, f"{name}.")
+            elif not prefix:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+                        elif isinstance(target, ast.Tuple):
+                            names.update(
+                                elt.id for elt in target.elts if isinstance(elt, ast.Name)
+                            )
+                elif isinstance(node, ast.Import):
+                    names.update(
+                        (alias.asname or alias.name).split(".")[0] for alias in node.names
+                    )
+                elif isinstance(node, ast.ImportFrom):
+                    names.update(alias.asname or alias.name for alias in node.names)
 
     visit(tree.body, "")
     return names

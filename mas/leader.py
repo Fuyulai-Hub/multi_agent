@@ -1146,7 +1146,37 @@ class Leader:
     def _run_gate(self, ctx: AgentContext, task: NodeTask, agents: Dict[str, Any]) -> Dict[str, Any]:
         node = self.config.flow.node(task.node_id)
         snapshot = ctx.blackboard.snapshot()
-        criteria_results: List[Dict[str, Any]] = []
+        # 隐藏用例：只依据冻结契约生成、存放在 run 工作区之外，门禁现场只读执行。
+        # 可见 + 隐藏都通过才算验收通过（用户需求：hidden 与 visible 双门禁）。
+        # ——必须先于 criteria 求值执行（20261025-084134-v6 实测）：回灌会更新
+        # bug_reports（失败立单 / 通过闭环），下面的「无未关闭缺陷」等表达式要按
+        # 回灌后的最新值判定；放在求值之后会让「隐藏已通过、缺陷已闭环」的轮次
+        # 仍按旧快照 open=1 误判失败，白耗一轮回退预算直到强制失败。
+        hidden = self._verify_hidden_suite(ctx, snapshot, iteration=task.iteration)
+        if isinstance(hidden.get("report"), dict):
+            ctx.blackboard.publish(
+                "hidden_test_report", hidden["report"], producer="leader", node=node.id,
+                iteration=task.iteration,
+                summary=str(hidden["report"].get("summary_text") or "隐藏用例执行报告"),
+            )
+        # 隐藏用例失败回灌缺陷池（20261025-063338-26c1 实测）：失败细节只落在
+        # hidden_test_report 里，而 optimize 节点的缺陷视图是 bug_reports——不回灌
+        # 则研发「处理 0 个缺陷」空转一轮，acceptance→optimize 预算白耗。回灌的
+        # source=hidden 缺陷只由本门禁在隐藏套件复跑通过时闭环。
+        self._merge_hidden_bugs(ctx, node, task.iteration, hidden, snapshot)
+        criteria_results: List[Dict[str, Any]] = [{
+            "id": "隐藏用例通过（契约冻结后独立生成）",
+            "expr": "execute_hidden(frozen_outside_workspace) + attest + verify_evidence + failed=0",
+            "passed": bool(hidden.get("passed")),
+            "value": {
+                "reasons": list(hidden.get("reasons") or []),
+                "summary": dict(hidden.get("summary") or {}),
+                "coverage": dict(hidden.get("coverage") or {}),
+                "manifest_digest": str(hidden.get("manifest_digest") or ""),
+            },
+            "reason": "" if hidden.get("passed") else
+                      "；".join(str(item) for item in (hidden.get("reasons") or []))[:500],
+        }]
         for criterion in node.criteria:
             outcome = evaluate(criterion.expr, snapshot)
             criteria_results.append({
@@ -1184,26 +1214,7 @@ class Leader:
         })
         # 隐藏用例：只依据冻结契约生成、存放在 run 工作区之外，门禁现场只读执行。
         # 可见 + 隐藏都通过才算验收通过（用户需求：hidden 与 visible 双门禁）。
-        hidden = self._verify_hidden_suite(ctx, snapshot, iteration=task.iteration)
-        criteria_results.append({
-            "id": "隐藏用例通过（契约冻结后独立生成）",
-            "expr": "execute_hidden(frozen_outside_workspace) + attest + verify_evidence + failed=0",
-            "passed": bool(hidden.get("passed")),
-            "value": {
-                "reasons": list(hidden.get("reasons") or []),
-                "summary": dict(hidden.get("summary") or {}),
-                "coverage": dict(hidden.get("coverage") or {}),
-                "manifest_digest": str(hidden.get("manifest_digest") or ""),
-            },
-            "reason": "" if hidden.get("passed") else
-                      "；".join(str(item) for item in (hidden.get("reasons") or []))[:500],
-        })
-        if isinstance(hidden.get("report"), dict):
-            ctx.blackboard.publish(
-                "hidden_test_report", hidden["report"], producer="leader", node=node.id,
-                iteration=task.iteration,
-                summary=str(hidden["report"].get("summary_text") or "隐藏用例执行报告"),
-            )
+        # （校验与缺陷回灌已前移到 criteria 求值之前——见 _run_gate 开头注释。）
         # 审查绑定（docs/39 门径优化）：review 在 test 之后执行，必须给**当前**代码签字。
         # 只认 review_report 自带的 code_hash 与门禁现场重算的最终代码 hash 相等；
         # optimize 改完代码若没重跑 review，旧审查会在这里失败关闭。lean profile
@@ -1470,6 +1481,83 @@ class Leader:
                          "contract_hash": result["contract_hash"]},
             )
         return result
+
+    @staticmethod
+    def _merge_hidden_bugs(
+        ctx: AgentContext, node: Any, iteration: int,
+        hidden: Dict[str, Any], snapshot: Dict[str, Any],
+    ) -> None:
+        """把隐藏用例失败并入 bug_reports（源标记 hidden，由隐藏门禁闭环）。
+
+        tester 的可见套件回归不自动闭环 source=hidden 的缺陷（tester._bugs 已豁免）：
+        隐藏用例只在 acceptance 现场执行，闭环证据同样只能来自这里的复跑结果。
+        """
+        failures = [item for item in ((hidden.get("report") or {}).get("failures") or [])
+                    if isinstance(item, dict)]
+        bugs = snapshot.get("bug_reports") if isinstance(snapshot.get("bug_reports"), dict) else {}
+        items = [dict(item) for item in (bugs.get("items") or []) if isinstance(item, dict)]
+        by_test = {str(item.get("test") or ""): item for item in items}
+        changed = False
+        for failure in failures:
+            test_ref = str(failure.get("test") or "")
+            if not test_ref:
+                continue
+            symptom = str(failure.get("message") or "")[:200]
+            prior = by_test.get(test_ref)
+            if prior is None:
+                bug = {
+                    "id": "BUG-" + hashlib.sha1(test_ref.encode("utf-8")).hexdigest()[:8],
+                    "test": test_ref,
+                    "fp_id": str(failure.get("fp_id") or ""),
+                    "category": str(failure.get("category") or "functional"),
+                    "severity": "major",
+                    "symptom": symptom,
+                    "status": "open",
+                    "source": "hidden",
+                    "detected_iteration": iteration,
+                    "fixed_iteration": None,
+                    "evidence": {"report": "artifacts/hidden_test_report",
+                                 "log": "evidence/hidden"},
+                }
+                items.append(bug)
+                by_test[test_ref] = bug
+                changed = True
+            elif prior.get("source") == "hidden" and prior.get("status") != "open":
+                prior.update({"status": "open", "symptom": symptom})
+                changed = True
+        if hidden.get("passed"):
+            for item in items:
+                if item.get("source") == "hidden" and item.get("status") == "open":
+                    item.update({"status": "fixed", "fixed_iteration": iteration,
+                                 "verified_by": "hidden_gate"})
+                    changed = True
+        if not changed:
+            return
+        open_count = sum(1 for item in items if item.get("status") == "open")
+        report = {
+            "items": items,
+            "total": len(items),
+            "open": open_count,
+            "fixed": sum(1 for item in items if item.get("status") == "fixed"),
+            "closed": sum(1 for item in items if item.get("status") == "closed"),
+            "new": 0,
+        }
+        # 本轮 criteria 还没求值：就地把最新缺陷池写回门禁快照，否则
+        # 「无未关闭缺陷」会按回灌前的旧值误判（20261025-084134-v6 实测）。
+        snapshot["bug_reports"] = report
+        ctx.blackboard.publish(
+            "bug_reports", report, producer="leader", node=node.id, iteration=iteration,
+            summary=f"隐藏用例缺陷回灌：失败 {len(failures)}，open {open_count}"
+                    "（source=hidden，由隐藏门禁复跑闭环）",
+        )
+        events = getattr(ctx, "events", None)
+        if events is not None:
+            events.emit(
+                "hidden_bugs_merged", agent="leader", node=node.id, iteration=iteration,
+                severity="warning" if failures else "info",
+                payload={"failures": len(failures), "open": open_count,
+                         "note": "隐藏用例失败已并入缺陷池；tester 回归不自动闭环 source=hidden"},
+            )
 
     def _verify_hidden_suite(self, ctx: AgentContext, snapshot: Dict[str, Any], *,
                              iteration: int) -> Dict[str, Any]:

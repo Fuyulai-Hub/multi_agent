@@ -568,6 +568,66 @@ class GateIntegrationTests(_EvidenceFixture):
             event["kind"] == "gate_hidden_checked" and event.get("severity") == "error"
             for event in self.events.events))
 
+    def test_hidden_failures_merge_into_bug_reports(self):
+        """隐藏用例失败必须回灌 bug_reports（20261025-063338-26c1 实测）。
+
+        不回灌则 optimize 的缺陷视图为空：「处理 0 个缺陷」空转一轮，隐藏失败
+        原样复发，acceptance→optimize 预算白耗到强制失败。source=hidden 的缺陷
+        只在隐藏门禁复跑通过时闭环；复跑失败不重复立单。
+        """
+        self._publish_ready(
+            self._freeze_and_attest(), hidden_suite=HIDDEN_SUITE_FAILING)
+        self._gate()
+        bugs = self.blackboard.get("bug_reports")
+        hidden_items = [i for i in bugs.get("items", []) if i.get("source") == "hidden"]
+        self.assertEqual(len(hidden_items), 1, bugs)
+        self.assertEqual(hidden_items[0]["status"], "open")
+        self.assertEqual(hidden_items[0]["fp_id"], "FP-01")
+        self.assertTrue(hidden_items[0]["symptom"])
+        self.assertGreater(bugs["open"], 0)
+        # 第二次门禁（隐藏仍失败）不得重复立单
+        self._gate()
+        bugs2 = self.blackboard.get("bug_reports")
+        self.assertEqual(
+            len([i for i in bugs2.get("items", []) if i.get("source") == "hidden"]), 1)
+        # 隐藏复跑通过 → source=hidden 缺陷统一闭环
+        self.leader._merge_hidden_bugs(
+            self.ctx, self.config.flow.node("acceptance"), 2,
+            {"passed": True, "report": {"failures": []}},
+            {"bug_reports": self.blackboard.get("bug_reports")})
+        bugs3 = self.blackboard.get("bug_reports")
+        hidden3 = [i for i in bugs3.get("items", []) if i.get("source") == "hidden"]
+        self.assertEqual(hidden3[0]["status"], "fixed")
+        self.assertEqual(hidden3[0].get("verified_by"), "hidden_gate")
+        self.assertEqual(bugs3["open"], 0)
+
+    def test_hidden_recovery_gate_passes_in_same_round(self):
+        """隐藏复跑通过的同轮，「无未关闭缺陷」必须按回灌后的 open=0 判定。
+
+        20261025-084134-v6 实测：回灌放在 criteria 求值之后，隐藏已通过、缺陷
+        已闭环的轮次仍按旧快照 open=1 误判失败，白耗一轮回退预算直到强制失败。
+        隐藏套件冻结后不可重生成（幂等），第二轮用替身返回「通过」——本测试
+        只回归门禁内部的求值顺序，隐藏执行链路由其他用例覆盖。
+        """
+        from unittest import mock
+
+        self._publish_ready(
+            self._freeze_and_attest(), hidden_suite=HIDDEN_SUITE_FAILING)
+        self.assertFalse(self._gate()["passed"])
+        self.assertGreater(self.blackboard.get("bug_reports")["open"], 0)
+        passing = {"passed": True, "reasons": [], "summary": {"total": 1, "passed": 1,
+                                                              "failed": 0},
+                   "coverage": {}, "manifest_digest": "digest-fixed",
+                   "report": {"failures": [], "summary_text": "隐藏用例全部通过"}}
+        with mock.patch.object(self.leader, "_verify_hidden_suite",
+                               return_value=passing):
+            gate2 = self._gate(iteration=2)
+        self.assertTrue(gate2["passed"], gate2.get("failed_criteria"))
+        bugs = self.blackboard.get("bug_reports")
+        self.assertEqual(bugs["open"], 0, bugs)
+        hidden_items = [i for i in bugs.get("items", []) if i.get("source") == "hidden"]
+        self.assertEqual(hidden_items[0]["status"], "fixed")
+
     def test_gate_fails_when_hidden_frozen_copy_is_tampered(self):
         self._publish_ready(self._freeze_and_attest())
         root = hidden_suite_dir(self.config.workspace_dir, "run-fixed")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -234,6 +235,10 @@ class TesterAgent(BaseAgent):
                           test_ids=len(frozen.get("test_ids") or []))
         else:
             # 首次（或冻结已失效）时写入测试文件（真实可执行）
+            self._clear_foreign_tests(task, [
+                str(item["path"]) for item in (data.get("files") or [])
+                if isinstance(item, dict) and str(item.get("path", "")).startswith("tests/")
+            ])
             for file_item in data.get("files", []):
                 if not isinstance(file_item, dict) or not file_item.get("path"):
                     continue          # 契约外防御：跳过结构非法的文件项，不让整个节点崩溃
@@ -869,6 +874,99 @@ class TesterAgent(BaseAgent):
                     gaps.append(f"{fp_id}:{category}")
         return gaps
 
+    def _binding_gaps(
+        self, files: Any, cases: Any, fp_ids: Any
+    ) -> List[str]:
+        """文件 test_* 方法 ↔ cases 元数据的 1:1 绑定缺口（20261025-035830-af5d 实测）。
+
+        绑定口径与 ``verifier._bind_case_meta`` 一致：按 ``test_{category}_{op}_{name}``
+        方法名配对。文件方法无元数据（unbound_method）或元数据 fp_id 为空/未知
+        （case_missing_fp / case_unknown_fp）、category 非法（case_bad_category）、
+        元数据无对应方法（case_without_method）——前几类会让冻结清单带着 fp_id="" 的
+        用例签名，执行后凭证必带 case_missing_fp_id → 套件解冻 → 测试节点失败回退，
+        连续复现即撞回退上限（实测两轮 90 方法仅绑定 83）。
+        """
+        defined: set = set()
+        for item in files or []:
+            if not isinstance(item, dict):
+                continue
+            path, content = str(item.get("path") or ""), str(item.get("content") or "")
+            if not path.startswith("tests/") or not path.endswith(".py") or not content:
+                continue
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                continue          # 冻结阶段的 AST 解析会给出精确到文件的报错
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef) \
+                        or not TestVerifier._is_test_case(node):
+                    continue
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                            and child.name.startswith("test"):
+                        defined.add(child.name)
+        fp_set = {str(fp) for fp in (fp_ids or ()) if str(fp)}
+        gaps: List[str] = []
+        declared: set = set()
+        for case in cases or []:
+            if not isinstance(case, dict):
+                continue
+            category = str(case.get("category") or "")
+            method = "test_" + "_".join(
+                part for part in (category, str(case.get("op") or ""),
+                                  str(case.get("name") or "")) if part)
+            if method == "test_":
+                continue
+            declared.add(method)
+            if method not in defined:
+                gaps.append(f"case_without_method:{method}")
+            if category not in ("functional", "exception", "boundary"):
+                gaps.append(f"case_bad_category:{method}:{category or 'empty'}")
+            fp_id = str(case.get("fp_id") or "")
+            if not fp_id:
+                gaps.append(f"case_missing_fp:{method}")
+            elif fp_set and fp_id not in fp_set:
+                gaps.append(f"case_unknown_fp:{method}:{fp_id}")
+        gaps.extend(f"unbound_method:{method}" for method in sorted(defined - declared))
+        return gaps
+
+    def _clear_foreign_tests(self, task: NodeTask, declared: Any) -> List[str]:
+        """首次冻结前清除 tests/ 下非本套件声明的外来 .py（研发自测等）。
+
+        developer.can_write_tests=true，研发自测文件会留在 tests/；它们不遵循
+        test_{category}_{op}_{name} 命名、没有 cases 元数据，冻结会把整个 tests/
+        扫进清单，绑定缺口使执行凭证必带 case_missing_fp_id
+        （20261025-053247-7c17 实测：unbound:test_lengths 等研发辅助方法被兜底拦截）。
+        冻结后 restore_if_changed 本就会删除后加进 tests/ 的文件——首次冻结前先
+        对齐「tests/ = 冻结套件」这一不变量。__init__.py 无测试方法、不参与
+        绑定，保留以免破坏测试包导入。
+        """
+        declared_set = {str(path).replace("\\", "/") for path in (declared or ())}
+        tests_dir = self.ctx.sandbox.root / "tests"
+        if not tests_dir.is_dir():
+            return []
+        cleared: List[str] = []
+        for path in sorted(tests_dir.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            relative = path.relative_to(self.ctx.sandbox.root).as_posix()
+            if relative in declared_set or path.name == "__init__.py":
+                continue
+            try:
+                path.unlink()
+                cleared.append(relative)
+            except OSError:
+                pass
+        if cleared:
+            self.ctx.events.emit(
+                "test_foreign_files_cleared", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"files": cleared,
+                         "note": "首次冻结前清除 tests/ 下非本套件声明的外来文件"
+                                 "（研发自测等）；冻结清单只收可绑定元数据的用例"},
+            )
+        return cleared
+
     def _ensure_full_coverage(
         self,
         task: NodeTask,
@@ -877,11 +975,13 @@ class TesterAgent(BaseAgent):
         fps: List[Dict[str, Any]],
         result: AgentResult,
     ) -> Tuple[Dict[str, Any], Generation]:
-        """冻结前校验覆盖并给一次带缺口清单的重生成（镜像隐藏套件的修复闭环）。
+        """冻结前校验覆盖与元数据绑定并给一次带缺口清单的重生成（镜像隐藏套件的修复闭环）。
 
         返回 (data, generation)；修复失败时置 result.status=fail（不冻结任何套件）。
         """
-        gaps = self._coverage_gaps(data.get("cases"), fps)
+        fp_ids = [str(fp.get("id") or "") for fp in fps if fp.get("id")]
+        gaps = self._coverage_gaps(data.get("cases"), fps) \
+            + self._binding_gaps(data.get("files"), data.get("cases"), fp_ids)
         if not gaps:
             return data, generation
         if self.ctx.llm is None:
@@ -919,7 +1019,9 @@ class TesterAgent(BaseAgent):
                 + json.dumps(data.get("cases") or [], ensure_ascii=False, indent=1)
                 + "\n\n## 上一轮已生成的测试文件（作为补齐基础全量重写）\n"
                 + json.dumps(data.get("files") or [], ensure_ascii=False, indent=1)
-                + "\n\n## 覆盖缺口（每个 FP:类别 至少补一条用例）\n"
+                + "\n\n## 缺口清单（两类：FP:类别 = 覆盖缺口，每个至少补一条用例；"
+                "unbound_method:/case_without_method:/case_missing_fp:/case_unknown_fp:/case_bad_category: = 绑定缺口，"
+                "文件里的 test_* 方法与 cases 元数据必须一一对应——多余方法删除、缺元数据的补元数据、fp_id/category 修正）\n"
                 + "\n".join(f"- {item}" for item in gaps)
                 + "\n\n## 输出契约（必须只输出一个 JSON 对象）\n"
                 + json.dumps({
@@ -958,10 +1060,11 @@ class TesterAgent(BaseAgent):
                 return data, generation
             data = generation.data
             attempt += 1
-            gaps = self._coverage_gaps(data.get("cases"), fps)
+            gaps = self._coverage_gaps(data.get("cases"), fps) \
+                + self._binding_gaps(data.get("files"), data.get("cases"), fp_ids)
         if gaps:
             result.status = "fail"
-            result.error = ("测试套件覆盖不全（冻结前校验，套件一旦冻结缺口将无法弥补）: "
+            result.error = ("测试套件覆盖/绑定不全（冻结前校验，套件一旦冻结缺口将无法弥补）: "
                             + ", ".join(gaps[:20]))
             result.summary = result.error
             self.ctx.events.emit(
@@ -1065,6 +1168,12 @@ class TesterAgent(BaseAgent):
         if executed:
             for prior in previous.values():
                 if prior.get("status") == "open" and not any(item.get("id") == prior.get("id") for item in items):
+                    if prior.get("source") == "hidden":
+                        # 隐藏用例缺陷只在 acceptance 现场执行（20261025-063338-26c1）：
+                        # 可见套件跑不到它 ≠ 已修复，闭环证据只能来自隐藏门禁复跑
+                        # （Leader._merge_hidden_bugs 在隐藏套件通过时统一改 fixed）。
+                        items.append(prior)
+                        continue
                     prior.update({"status": "fixed", "fixed_iteration": task.iteration, "verified_by": "tester"})
                     items.append(prior)
         else:
