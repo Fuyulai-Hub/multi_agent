@@ -7,9 +7,10 @@ import json
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .config import SystemConfig, resolve_credentials
 from .context import ContextManager
@@ -153,6 +154,45 @@ class LLMClient:
         self.should_stop: Optional[Callable[[], bool]] = None
         self.cancel_poll_interval = float(config.llm.get("cancel_poll_interval", 0.5) or 0)
         self._last_cancel_check = 0.0
+        # 调用级墙钟预算（call_budget）：None=不限制（既有行为）。只约束"一次 generate
+        # 及其内部重试/降级链"的总时长，不改变单次请求的 llm.timeout 语义。
+        self._call_deadline: Optional[float] = None
+        # 调用级重试上限覆盖（call_budget(retry_attempts=...)）：None=沿用 llm.retry 配置。
+        self._call_retry_attempts: Optional[int] = None
+
+    @contextmanager
+    def call_budget(
+        self, seconds: Optional[float], *, retry_attempts: Optional[int] = None,
+    ) -> Iterator[None]:
+        """为当前调用链设置墙钟预算（含重试与降级），退出时恢复上一层预算。
+
+        用途：隐藏用例生成这类"单节点最多 3 次尝试 × 内部 3 次重试 × 1800s 流式
+        上限"的调用，实际可挂 2~3 小时（task11 实测首轮 69.9 分钟）。预算到期后
+        ``_attempt`` 直接返回 timed_out 结果，重试/降级链不再发起新请求。
+        嵌套调用取更严格的截止时间；``None`` 表示本层不额外限制。
+        ``retry_attempts`` 覆盖本次调用内部的网络重试次数（None=沿用 llm.retry）。
+        """
+        previous = self._call_deadline
+        previous_attempts = self._call_retry_attempts
+        deadline: Optional[float] = None
+        if seconds is not None and float(seconds) > 0:
+            deadline = time.monotonic() + float(seconds)
+        if previous is not None:
+            deadline = previous if deadline is None else min(previous, deadline)
+        self._call_deadline = deadline
+        if retry_attempts is not None:
+            self._call_retry_attempts = max(1, int(retry_attempts))
+        try:
+            yield
+        finally:
+            self._call_deadline = previous
+            self._call_retry_attempts = previous_attempts
+
+    def _budget_remaining(self) -> Optional[float]:
+        """剩余调用预算（秒）；未设置预算时返回 None。"""
+        if self._call_deadline is None:
+            return None
+        return self._call_deadline - time.monotonic()
 
     @staticmethod
     def _parse_ladder(raw: Any) -> List[str]:
@@ -256,6 +296,11 @@ class LLMClient:
         while step < len(ladder) and self._unusable(
             generation, expect_json=expect_json, downgraded=bool(generation.degraded)
         ):
+            remaining = self._budget_remaining()
+            if remaining is not None and remaining <= 0:
+                generation.error = (generation.error or "结果不可用") + \
+                    "；调用预算已耗尽，跳过降级重发"
+                break
             retry_payload = dict(payload)
             retry_payload["reasoning_effort"] = ladder[step]
             step += 1
@@ -306,6 +351,13 @@ class LLMClient:
         """
         if self._canceled(force=True):
             raise RunCanceledError("用户手动终止：取消尚未发起的 LLM 请求")
+        remaining = self._budget_remaining()
+        if remaining is not None and remaining <= 0:
+            # 调用预算已耗尽：不再发起新请求（含重试/降级），返回可诊断的失败结果。
+            generation = Generation(provider="openai_compatible", model=self.model)
+            generation.timed_out = True
+            generation.error = "本次生成超出调用预算（call_budget）：未发起新请求"
+            return generation
         try:
             return self._request_generation(payload, api_key, base_url)
         except _RetryableLLMError as exc:
@@ -442,7 +494,7 @@ class LLMClient:
         stream_payload = dict(payload)
         stream_payload["stream"] = True
         request = self._build_request(stream_payload, api_key, base_url)
-        attempts = self.retry_max_attempts
+        attempts = max(1, int(self._call_retry_attempts or self.retry_max_attempts))
         last_error = ""
         text_parts: List[str] = []
         reasoning_parts: List[str] = []
@@ -452,9 +504,16 @@ class LLMClient:
         for attempt in range(1, attempts + 1):
             if self._canceled(force=True):
                 raise RunCanceledError("用户手动终止：取消重试中的 LLM 请求")
+            remaining = self._budget_remaining()
+            if remaining is not None and remaining <= 0:
+                raise _RetryableLLMError("本次生成超出调用预算（call_budget）：放弃重试")
             text_parts, reasoning_parts, tool_calls_by_index = [], [], {}
             finish_reason, usage = "", {}
-            deadline = time.monotonic() + self.stream_total_timeout
+            stream_limit = self.stream_total_timeout
+            remaining = self._budget_remaining()
+            if remaining is not None:
+                stream_limit = max(1.0, min(float(stream_limit), remaining))
+            deadline = time.monotonic() + stream_limit
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     content_type = str(response.headers.get("Content-Type") or "")
@@ -464,7 +523,8 @@ class LLMClient:
                     for raw_line in response:
                         if time.monotonic() > deadline:
                             raise TimeoutError(
-                                f"流式响应总时长超过 {self.stream_total_timeout}s，主动断开重试"
+                                f"流式响应总时长超过 {stream_limit:.0f}s（流式上限 "
+                                f"{self.stream_total_timeout}s / 调用预算），主动断开重试"
                             )
                         # 立即终止（docs/41）：抛在 with 内部 → 连接随退出关闭，服务端
                         # 流被真实中断；节流探测使 Redis 后端的取消轮询至多 2 次/秒。
@@ -579,13 +639,17 @@ class LLMClient:
 
     def _post_with_retry(self, request: urllib.request.Request) -> Dict[str, Any]:
         """带重试的 POST：网络错误与 429/5xx 按 llm.retry 配置重试，4xx 立即失败。"""
-        attempts = self.retry_max_attempts
+        attempts = max(1, int(self._call_retry_attempts or self.retry_max_attempts))
         last_error = ""
         for attempt in range(1, attempts + 1):
             if self._canceled(force=True):
                 raise RunCanceledError("用户手动终止：取消尚未发起的 LLM 请求")
+            remaining = self._budget_remaining()
+            if remaining is not None and remaining <= 0:
+                raise _RetryableLLMError("本次生成超出调用预算（call_budget）：放弃重试")
+            timeout = self.timeout if remaining is None else max(1.0, min(float(self.timeout), remaining))
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:400]

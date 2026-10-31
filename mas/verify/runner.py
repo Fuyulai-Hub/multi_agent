@@ -3,8 +3,9 @@
 门禁加固要点：
 
 1. **只执行冻结清单**：从 ``test_manifest.json`` 的 ``test_ids`` 取用例，
-   用标准库 ``unittest.TestLoader`` 加载、用 ``unittest.TestResult`` 逐条
-   执行。测试文件里额外定义/动态生成的用例不会被执行，并作为
+   用标准库 ``unittest.TestLoader`` 加载，再作为一个 ``unittest.TestSuite``
+   统一执行（``setUpClass`` / ``tearDownClass`` / ``setUpModule`` 只在这里
+   生效）。测试文件里额外定义/动态生成的用例不会被执行，并作为
    ``unexpected_test_ids`` 上报；清单内缺失的用例记为 ``error``。
 2. **结果由 runner 自己汇总**：逐用例记录（``test_id / status / duration /
    failure``）直接写入 ``--out`` 指定的文件。该路径由框架分配，位于模型
@@ -41,64 +42,74 @@ _FAILURE_LIMIT = 800
 _STATUS_RANK = {"passed": 0, "failed": 1, "error": 2}
 
 
-class _CaseResult(unittest.TestResult):
-    """逐条执行时收集状态/耗时/失败摘要。"""
+class _SuiteResult(unittest.TestResult):
+    """执行 ``TestSuite`` 时逐用例收集状态/耗时/失败摘要。
+
+    不能逐条调用 ``TestCase.run``（旧实现）：那会绕过 ``setUpClass`` /
+    ``tearDownClass``，使用类级夹具的生成套件会整体 AttributeError
+    （task11-slink-fullstack-01 实测 14/49 假失败）。这里交给 unittest
+    的 ``TestSuite`` 管理类级夹具，只负责把每条用例的结果落到独立记录。
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.status = "passed"
-        self.failure = ""
-        self.started = 0.0
-        self.duration = 0.0
+        self.records: Dict[str, Dict[str, Any]] = {}
+        self._started = 0.0
+
+    def _entry(self, test: unittest.TestCase) -> Dict[str, Any]:
+        return self.records.setdefault(str(test.id()), {
+            "status": "passed", "failure": "", "duration": 0.0})
+
+    @staticmethod
+    def _exc_text(err: Any) -> str:
+        try:
+            return "".join(traceback.format_exception_only(err[0], err[1])).strip()
+        except Exception:  # noqa: BLE001 - 失败摘要绝不能反向拖垮 runner
+            return repr(err)
+
+    def _mark(self, test: unittest.TestCase, status: str, failure: str = "") -> None:
+        entry = self._entry(test)
+        if _STATUS_RANK.get(status, 0) > _STATUS_RANK.get(entry["status"], 0):
+            entry["status"] = status
+        text = str(failure or "").strip()
+        if text:
+            entry["failure"] = text[-_FAILURE_LIMIT:]
 
     def startTest(self, test: unittest.TestCase) -> None:
         super().startTest(test)
-        self.started = time.perf_counter()
+        self._entry(test)
+        self._started = time.perf_counter()
 
     def stopTest(self, test: unittest.TestCase) -> None:
-        self.duration = time.perf_counter() - self.started
+        self._entry(test)["duration"] = time.perf_counter() - self._started
         super().stopTest(test)
-
-    def _mark(self, status: str, err: Any = None, message: str = "") -> None:
-        if _STATUS_RANK.get(status, 0) > _STATUS_RANK.get(self.status, 0):
-            self.status = status
-        if err is not None:
-            try:
-                text = "".join(traceback.format_exception_only(err[0], err[1]))
-            except Exception:  # noqa: BLE001 - 失败摘要绝不能反向拖垮 runner
-                text = repr(err)
-        else:
-            text = message
-        text = str(text).strip()
-        if text:
-            self.failure = text[-_FAILURE_LIMIT:]
 
     def addError(self, test: unittest.TestCase, err: Any) -> None:
         super().addError(test, err)
-        self._mark("error", err)
+        self._mark(test, "error", self._exc_text(err))
 
     def addFailure(self, test: unittest.TestCase, err: Any) -> None:
         super().addFailure(test, err)
-        self._mark("failed", err)
+        self._mark(test, "failed", self._exc_text(err))
 
     def addSkip(self, test: unittest.TestCase, reason: str) -> None:
         super().addSkip(test, reason)
-        self._mark("failed", message=f"skipped: {reason}")
+        self._mark(test, "failed", f"skipped: {reason}")
 
     def addExpectedFailure(self, test: unittest.TestCase, err: Any) -> None:
         super().addExpectedFailure(test, err)
-        self._mark("failed", err, "expected failure（xfail 不作为通过证据）")
+        self._mark(test, "failed", self._exc_text(err) or "expected failure（xfail 不作为通过证据）")
 
     def addUnexpectedSuccess(self, test: unittest.TestCase) -> None:
         super().addUnexpectedSuccess(test)
-        self._mark("failed", message="unexpected success")
+        self._mark(test, "failed", "unexpected success")
 
     def addSubTest(self, test: unittest.TestCase, subtest: Any, err: Any) -> None:
         super().addSubTest(test, subtest, err)
         if err is not None:
             status = ("failed" if isinstance(err[1], getattr(test, "failureException", AssertionError))
                       else "error")
-            self._mark(status, err)
+            self._mark(test, status, self._exc_text(err))
 
 
 def _flatten(suite: unittest.TestSuite) -> Iterable[unittest.TestCase]:
@@ -285,6 +296,8 @@ def run_manifest(
             if test_id not in manifest_set:
                 result["unexpected_test_ids"].append(test_id)
 
+    suite = unittest.TestSuite()
+    planned: List[Tuple[str, unittest.TestCase, str]] = []
     for test_id in selected:
         name = _module_for(test_id, module_paths)
         if name in module_errors:
@@ -298,22 +311,78 @@ def run_manifest(
                 test_id, "error", 0.0,
                 "test_id_not_found（冻结清单声明了该用例，但 TestLoader 未枚举到）", manifest))
             continue
-        case_result = _CaseResult()
-        wall_start = time.perf_counter()
+        planned.append((test_id, test, name))
+        suite.addTest(test)
+
+    # 统一交给 TestSuite.run：setUpClass/tearDownClass、setUpModule/tearDownModule
+    # 只在 TestSuite 里生效；逐条 test.run() 会静默跳过类级夹具（假失败）。
+    suite_result = _SuiteResult()
+    interrupted = ""
+    if planned:
         try:
-            test.run(case_result)
+            suite.run(suite_result)
         except BaseException as exc:  # noqa: BLE001 - SystemExit/KeyboardInterrupt 也不能终止整轮取证
-            case_result._mark("error", (type(exc), exc, exc.__traceback__))
-        duration = time.perf_counter() - wall_start
-        if case_result.duration:
-            duration = case_result.duration
-        failure = case_result.failure
-        if case_result.status != "passed" and not failure:
+            interrupted = _format_exc(exc)
+
+    planned_ids = {test_id for test_id, _, _ in planned}
+    fixture_errors = {
+        holder: str(record.get("failure") or "")
+        for holder, record in suite_result.records.items()
+        if holder not in planned_ids and record.get("status") != "passed"
+    }
+    attributed: set = set()
+    built: List[Tuple[str, str, str, Dict[str, Any]]] = []
+    for test_id, _test, name in planned:
+        parts = test_id.rsplit(".", 2)
+        class_name = parts[-2] if len(parts) >= 3 else ""
+        record = suite_result.records.get(test_id)
+        if record is None:
+            # 类/模块级夹具失败时 TestSuite 会整组跳过（不调用 startTest）；
+            # 用夹具报错原文回填，避免只剩一句「未执行」。
+            owners = {name, f"{name}.{class_name}" if class_name else name}
+            hint = ""
+            for holder in sorted(fixture_errors):
+                if _fixture_parent(holder) in owners:
+                    attributed.add(holder)
+                    hint = hint or f"{holder}: {fixture_errors[holder]}"
+            failure = hint or interrupted or "test was not executed（执行器在到达该用例前中断）"
+            case = _record(test_id, "error", 0.0, failure, manifest,
+                           fp_by_class=fp_by_module.get(name))
+            result["cases"].append(case)
+            built.append((test_id, name, class_name, case))
+            continue
+        status = str(record.get("status") or "passed")
+        failure = str(record.get("failure") or "")
+        duration = float(record.get("duration") or 0.0)
+        if status != "passed" and not failure:
             failure = "test failed without message"
-        result["cases"].append(_record(
-            test_id, case_result.status, duration, failure, manifest,
-            fp_by_class=fp_by_module.get(name)))
+        case = _record(test_id, status, duration, failure, manifest,
+                       fp_by_class=fp_by_module.get(name))
+        result["cases"].append(case)
+        built.append((test_id, name, class_name, case))
+
+    # 用例执行完之后才暴露的夹具错误（典型是 tearDownClass/tearDownModule）：
+    # 归到该组最后一条用例上，不能让「全集 passed」掩盖未清理的失败。
+    for holder in sorted(set(fixture_errors) - attributed):
+        parent = _fixture_parent(holder)
+        targets = [item for item in built
+                   if parent in (item[1], f"{item[1]}.{item[2]}")]
+        if not targets:
+            continue
+        _, _, _, case = targets[-1]
+        text = f"{holder}: {fixture_errors[holder]}"[:_FAILURE_LIMIT]
+        case["status"] = "error"
+        case["failure"] = text
+        case["message"] = text
     return _finalize(result, started)
+
+
+def _fixture_parent(holder: str) -> str:
+    """``setUpClass (tests.test_all.Case)`` -> ``tests.test_all.Case``。"""
+    text = str(holder or "").strip()
+    if text.endswith(")") and " (" in text:
+        return text[text.rindex(" (") + 2:-1]
+    return ""
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:

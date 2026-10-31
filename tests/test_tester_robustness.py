@@ -453,11 +453,19 @@ class ZeroEvidenceIntegrityTests(unittest.TestCase):
             bugs = agent._track_bugs([], [], task, self._perception(copy.deepcopy(prior)))
             self.assertEqual(bugs["open"], 1, bugs)
             self.assertEqual(bugs["fixed"], 0)
-            # 有执行记录时，未复现的旧缺陷仍按原语义闭环（不影响既有行为）
+            # 有执行记录但没执行到该用例：仍然没有「已修复」证据，保持 open
+            # （原实现按「未复现」自动闭环，等于把没复测记成修好了）。
             executed = [{"class": "T", "test": "test_functional_other", "status": "passed",
                          "category": "functional", "fp_id": "FP-01"}]
             bugs2 = agent._track_bugs(executed, [], task, self._perception(copy.deepcopy(prior)))
-            self.assertEqual(bugs2["fixed"], 1, bugs2)
+            self.assertEqual(bugs2["fixed"], 0, bugs2)
+            self.assertEqual(bugs2["open"], 1, bugs2)
+            # 真正执行到该用例且通过时，才允许闭环
+            executed_same = [{"class": "T", "test": "test_functional_x", "status": "passed",
+                              "category": "functional", "fp_id": "FP-01"}]
+            bugs3 = agent._track_bugs(executed_same, [], task, self._perception(copy.deepcopy(prior)))
+            self.assertEqual(bugs3["fixed"], 1, bugs3)
+            self.assertEqual(bugs3["open"], 0, bugs3)
         finally:
             tmp.cleanup()
 
@@ -485,8 +493,314 @@ class ZeroEvidenceIntegrityTests(unittest.TestCase):
             bugs = agent._track_bugs(executed, [], task, self._perception(copy.deepcopy(prior)))
             by_id = {item["id"]: item for item in bugs["items"]}
             self.assertEqual(by_id["BUG-bbbb2222"]["status"], "open", bugs)
-            self.assertEqual(by_id["BUG-aaaa1111"]["status"], "fixed", bugs)
-            self.assertEqual(bugs["open"], 1)
+            # 可见缺陷的本轮用例没被执行到 → 无复测证据，保持 open（不再自动闭环）
+            self.assertEqual(by_id["BUG-aaaa1111"]["status"], "open", bugs)
+            self.assertEqual(bugs["open"], 2)
+            # 套件重生成且不再包含该用例时标记 stale：不计 open 也不算已修复
+            bugs2 = agent._track_bugs(
+                executed, [], task, self._perception(copy.deepcopy(prior)),
+                suite_digest="new-digest",
+                suite_test_ids=["tests.test_all.T.test_boundary_other"],
+            )
+            by_id2 = {item["id"]: item for item in bugs2["items"]}
+            self.assertEqual(by_id2["BUG-aaaa1111"]["status"], "stale", bugs2)
+            self.assertEqual(bugs2["open"], 1)
+            self.assertEqual(bugs2["fixed"], 0)
+            self.assertEqual(bugs2["stale"], 1)
+        finally:
+            tmp.cleanup()
+
+
+class FrozenSuiteSkipTests(unittest.TestCase):
+    """冻结套件有效时跳过测试生成（2026-10-31 task11 iter05 实测：白烧 12.4 分钟）。"""
+
+    def _agent_with(self, manifest):
+        agent, ctx, tmp = _agent()
+        agent._verifier = lambda: SimpleNamespace(
+            load_manifest=lambda: manifest,
+            restore_if_changed=lambda: [],
+        )
+        return agent, ctx, tmp
+
+    def _task(self):
+        return NodeTask(node_id="test", title="业务测试", role="tester", kind="task",
+                        iteration=2)
+
+    def _perception(self, spec=None, negotiation=None):
+        from mas.agents.base import Perception
+
+        found = {"requirement_spec": spec or {"delivery_shape": "backend_only"}}
+        if negotiation is not None:
+            found["test_report"] = {"negotiation": negotiation}
+        return Perception(found=found)
+
+    def test_skip_when_frozen_and_negotiation_closed(self):
+        manifest = {"digest": "d" * 64, "test_ids": ["tests.test_all.T.test_functional_x"]}
+        agent, _ctx, tmp = self._agent_with(manifest)
+        try:
+            generation = agent.precomputed_generation(
+                self._task(), self._perception(negotiation={"status": "closed"}))
+            self.assertIsNotNone(generation)
+            self.assertEqual(generation.model, "frozen-suite")
+            self.assertEqual(generation.data.get("derived_from"), "frozen-suite")
+        finally:
+            tmp.cleanup()
+
+    def test_previous_report_read_from_blackboard_not_perception(self):
+        """回归：tester 感知清单不含 test_report，跳过依据必须从黑板读取。
+
+        2026-10-31 实测：第一版跳过逻辑读 perception.found['test_report'] 永远为空，
+        真实运行里从未生效（单测只因手工塞了 test_report 而通过）。
+        """
+        from mas.agents.base import Perception
+
+        manifest = {"digest": "d" * 64, "test_ids": ["tests.test_all.T.test_functional_x"]}
+        agent, ctx, tmp = self._agent_with(manifest)
+        try:
+            closed = {"negotiation": {"status": "closed", "open": 0},
+                      "verification_attestation": {"test_hash": "d" * 64}}
+            ctx.blackboard = SimpleNamespace(get=lambda name: closed if name == "test_report" else None)
+            generation = agent.precomputed_generation(
+                self._task(), Perception(found={"requirement_spec": {"delivery_shape": "backend_only"}}))
+            self.assertIsNotNone(generation)
+            self.assertEqual(generation.model, "frozen-suite")
+            # 黑板没有历史报告时不得凭空跳过
+            ctx.blackboard = SimpleNamespace(get=lambda name: None)
+            self.assertIsNone(agent.precomputed_generation(
+                self._task(), Perception(found={"requirement_spec": {"delivery_shape": "backend_only"}})))
+        finally:
+            tmp.cleanup()
+
+    def test_no_skip_when_prior_report_belongs_to_other_suite(self):
+        """上一轮报告基于旧套件（test_hash 不同）→ 重生成并重新提问。"""
+        manifest = {"digest": "d" * 64, "test_ids": ["tests.test_all.T.test_functional_x"]}
+        agent, _ctx, tmp = self._agent_with(manifest)
+        try:
+            perception = self._perception(negotiation={"status": "closed"})
+            perception.found["test_report"]["verification_attestation"] = {"test_hash": "e" * 64}
+            self.assertIsNone(agent.precomputed_generation(self._task(), perception))
+            perception.found["test_report"]["verification_attestation"] = {"test_hash": "d" * 64}
+            self.assertIsNotNone(agent.precomputed_generation(self._task(), perception))
+        finally:
+            tmp.cleanup()
+
+    def test_no_skip_when_negotiation_open_or_manifest_missing(self):
+        manifest = {"digest": "d" * 64, "test_ids": ["tests.test_all.T.test_functional_x"]}
+        agent, _ctx, tmp = self._agent_with(manifest)
+        try:
+            self.assertIsNone(agent.precomputed_generation(
+                self._task(), self._perception(negotiation={"status": "open"})))
+            # 冻结后进程被杀（有清单、无上一轮报告）：保守重生成一次，避免丢提问
+            from mas.agents.base import Perception
+
+            self.assertIsNone(agent.precomputed_generation(
+                self._task(), Perception(found={"requirement_spec": {"delivery_shape": "backend_only"}})))
+        finally:
+            tmp.cleanup()
+        agent2, _ctx2, tmp2 = self._agent_with(None)
+        try:
+            self.assertIsNone(agent2.precomputed_generation(
+                self._task(), self._perception(negotiation={"status": "closed"})))
+        finally:
+            tmp2.cleanup()
+
+    def test_no_skip_for_spa_shape(self):
+        """SPA 的浏览器证据依赖生成产物（ui_checks），不能跳过生成。"""
+        manifest = {"digest": "d" * 64, "test_ids": ["tests.test_all.T.test_functional_x"]}
+        agent, _ctx, tmp = self._agent_with(manifest)
+        try:
+            self.assertIsNone(agent.precomputed_generation(
+                self._task(),
+                self._perception(spec={"delivery_shape": "full_stack_spa"},
+                                 negotiation={"status": "closed"})))
+        finally:
+            tmp.cleanup()
+
+    def test_case_count_derived_from_executed_cases(self):
+        agent, _ctx, tmp = _agent()
+        try:
+            cases = [
+                {"class": "T", "test": "t1", "status": "passed", "category": "functional"},
+                {"class": "T", "test": "t2", "status": "passed", "category": "boundary"},
+                {"class": "T", "test": "t3", "status": "failed", "category": "exception"},
+            ]
+            counts = agent._case_count(cases, {})
+            self.assertEqual(counts, {"total": 3, "functional": 1, "exception": 1, "boundary": 1})
+            # 生成方自报合法时保持原值
+            self.assertEqual(agent._case_count(cases, {"total": 9}), {"total": 9})
+        finally:
+            tmp.cleanup()
+
+
+class EnvProbeWiringTests(unittest.TestCase):
+    """环境事实必须进入测试角色，否则「通道可用」会被误报成「未就绪」。
+
+    2026-10-31 task12-foodlink-spa-03 实测：env_probe.browser_ui_ready=true、
+    ui_server.available=true，但 tester 的感知清单没有 env_probe，test_report
+    写着「浏览器 MCP 未就绪：」，验收报告据此把验证缺口归因为浏览器通道。
+    """
+
+    def test_tester_perception_includes_env_probe(self):
+        agent, ctx, tmp = _agent()
+        try:
+            names = ctx.config.collaboration.perception_of("tester")
+            self.assertIn("env_probe", names)
+        finally:
+            tmp.cleanup()
+
+    def test_env_probe_falls_back_to_blackboard(self):
+        """感知丢失 env_probe 时从黑板 latest 兜底（续跑/单测构造 Perception 场景）。"""
+        from mas.agents.base import Perception
+
+        agent, ctx, tmp = _agent()
+        try:
+            probe = {"browser_ui_ready": True, "javascript_ready": True}
+            ctx.blackboard = SimpleNamespace(get=lambda name: probe if name == "env_probe" else None)
+            self.assertEqual(agent._env_probe(Perception(found={})), probe)
+            # 感知里有时优先用感知值
+            self.assertEqual(agent._env_probe(Perception(found={"env_probe": {"browser_ui_ready": False}})),
+                             {"browser_ui_ready": False})
+            # 黑板也没有时返回空（不臆造环境事实）
+            ctx.blackboard = SimpleNamespace(get=lambda name: None)
+            self.assertEqual(agent._env_probe(Perception(found={})), {})
+        finally:
+            tmp.cleanup()
+
+    def test_spa_gap_follows_real_browser_channel(self):
+        agent, _ctx, tmp = _agent()
+        try:
+            spec = {"delivery_shape": "full_stack_spa"}
+            design = {"tech_choice": {"language": "TypeScript"}}
+            ready = agent._verification_gap(design, {"browser_ui_ready": True}, spec,
+                                            shape="full_stack_spa")
+            self.assertEqual(ready["gap"], 0, ready)
+            not_ready = agent._verification_gap(
+                design, {"browser_ui_ready": False, "ui_server": {"reason": "launch failed"}},
+                spec, shape="full_stack_spa")
+            self.assertEqual(not_ready["gap"], 1)
+            self.assertIn("浏览器级证据通道", not_ready["note"])
+        finally:
+            tmp.cleanup()
+
+    def test_ui_evidence_reason_when_probe_missing(self):
+        """env_probe 缺失时不能写「浏览器 MCP 未就绪」——那是未经探测的结论。"""
+        agent, _ctx, tmp = _agent()
+        try:
+            ui = agent._collect_ui_evidence({}, {"failed": 1}, {}, {"gap": 1},
+                                            "full_stack_spa")
+            self.assertEqual(ui["failed_asserts"], 1)
+            self.assertIn("env_probe 缺失", ui["error"])
+            # 探测说未就绪时才引用真实原因
+            ui2 = agent._collect_ui_evidence(
+                {}, {"failed": 1},
+                {"browser_ui_ready": False, "ui_server": {"reason": "launch failed"}},
+                {"gap": 1}, "full_stack_spa")
+            self.assertIn("launch failed", ui2["error"])
+            # 通道就绪但契约没有 ui_checks：如实报契约缺口
+            ui3 = agent._collect_ui_evidence({}, {"failed": 1},
+                                             {"browser_ui_ready": True}, {"gap": 0},
+                                             "full_stack_spa")
+            self.assertIn("ui_checks", ui3["error"])
+        finally:
+            tmp.cleanup()
+
+
+class RootCauseAttributionTests(unittest.TestCase):
+    """「外部程序不存在」的报错要区分：本机真缺工具链 vs 程序存在但通道不可用。"""
+
+    CASES = [{"class": "T", "test": "t1", "status": "failed",
+              "message": "FileNotFoundError: [WinError 2] 系统找不到指定的文件。"}]
+    BYPASS = [{"rule": "sandbox_command_bypass",
+               "message": "subprocess.Popen() 直接调用未在沙箱白名单内的程序 `npm`"
+                          "（沙箱命令白名单只校验框架发起的命令）"}]
+
+    def test_bypass_program_missing_is_environment(self):
+        from unittest import mock
+
+        agent, _ctx, tmp = _agent()
+        try:
+            with mock.patch("mas.agents.tester.shutil.which", return_value=None):
+                cause = agent._root_cause(self.BYPASS, self.CASES)
+            self.assertEqual(cause["category"], "environment_or_build")
+            self.assertIn("【环境/构建问题】", agent._root_cause_note(self.BYPASS, cause))
+        finally:
+            tmp.cleanup()
+
+    def test_bypass_program_present_is_unverifiable(self):
+        """npm.cmd 在本机存在（task12 实测）：失败不是缺工具链，而是通道不可用。"""
+        from unittest import mock
+
+        agent, _ctx, tmp = _agent()
+        try:
+            with mock.patch("mas.agents.tester.shutil.which", return_value="C:/npm.cmd"):
+                cause = agent._root_cause(self.BYPASS, self.CASES)
+            self.assertEqual(cause["category"], "delivery_unverifiable", cause)
+            self.assertEqual(cause["bypass_programs"], ["npm"])
+            note = agent._root_cause_note(self.BYPASS, cause)
+            self.assertIn("【交付物无法验证】", note)
+            self.assertIn("npm 在本机存在", note)
+        finally:
+            tmp.cleanup()
+
+    def test_leader_treats_new_signals_as_unfixable(self):
+        from mas.leader import Leader
+
+        for event in ("test_delivery_unverifiable", "test_suite_defect"):
+            self.assertIn(event, Leader._UNFIXABLE_FAILURE_EVENTS)
+
+
+class BlockedBugsTests(unittest.TestCase):
+    """环境阻断不得被展开成交付物缺陷（task12: 一次 setUp 失败 → 33 个缺陷）。"""
+
+    def _perception(self, items=None):
+        from mas.agents.base import Perception
+
+        return Perception(found={"bug_reports": {"items": items or []}})
+
+    def _task(self):
+        return NodeTask(node_id="test", title="业务测试", role="tester", kind="task",
+                        iteration=2)
+
+    def test_environment_failure_creates_blocked_not_bug(self):
+        agent, _ctx, tmp = _agent()
+        try:
+            executed = [
+                {"class": "T", "test": "test_functional_x", "status": "failed",
+                 "message": "AssertionError: backend service unavailable: spawn failed: "
+                            "FileNotFoundError(2, ...)", "category": "functional", "fp_id": "FP-01"},
+                {"class": "T", "test": "test_functional_y", "status": "failed",
+                 "message": "AssertionError: 3 != 4", "category": "functional", "fp_id": "FP-01"},
+            ]
+            bugs = agent._track_bugs(executed, [], self._task(), self._perception(),
+                                     blocked_reason="【环境/构建问题】外部程序不存在")
+            self.assertEqual(bugs["blocked"], 1, bugs)
+            self.assertEqual(bugs["total"], 1, bugs)       # 只有真实断言失败立单
+            self.assertEqual(len(bugs["new"]), 1)
+            self.assertEqual(bugs["new"], [bugs["items"][0]["id"]])
+            self.assertEqual(bugs["items"][0]["symptom"], "AssertionError: 3 != 4")
+            # 没有环境归因时，环境症状仍按普通失败立单（保持原行为）
+            plain = agent._track_bugs(executed, [], self._task(), self._perception())
+            self.assertEqual(plain["total"], 2, plain)
+            self.assertEqual(plain["blocked"], 0)
+        finally:
+            tmp.cleanup()
+
+    def test_prior_open_bug_reclassified_as_blocked(self):
+        agent, _ctx, tmp = _agent()
+        try:
+            prior = [{"id": "BUG-aaaa1111", "test": "T.test_functional_x", "status": "open",
+                      "fp_id": "FP-01", "category": "functional", "source": "visible"}]
+            executed = [{"class": "T", "test": "test_functional_x", "status": "failed",
+                         "message": "AssertionError: backend service unavailable: "
+                                    "spawn failed: FileNotFoundError(2, ...)",
+                         "category": "functional", "fp_id": "FP-01"}]
+            bugs = agent._track_bugs(executed, [], self._task(), self._perception(prior),
+                                     blocked_reason="【交付物无法验证】测试通道不可用")
+            self.assertEqual(bugs["open"], 0, bugs)
+            self.assertEqual(bugs["blocked"], 1, bugs)
+            self.assertEqual(bugs["total"], 0, bugs)
+            self.assertEqual(bugs["items"][0]["status"], "blocked")
+            self.assertIn("未获得复测证据", bugs["items"][0]["closure_note"])
         finally:
             tmp.cleanup()
 

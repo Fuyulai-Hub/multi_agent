@@ -154,7 +154,7 @@ runtime:
     # 与上面的文本注入相互独立：文本注入约束「怎么做」（方法本体全文），工具调用提供
     # 「可执行动作」（scripts/*.py）；方法本体无法变成调用，只能走文本路径。
     # 开启后需配合 llm.tools_nodes 决定哪些节点下发工具（tools 与 response_format 互斥）。
-    tools_enabled: true
+    tools_enabled: false
     tools_timeout_s: 60           # 单次技能脚本执行超时（秒），独立于 sandbox_timeout
     max_items: 3                  # 单节点最多注入几个技能（按匹配度降序）
     min_score: 1                  # 匹配度阈值：1=作用域命中即注入
@@ -186,6 +186,12 @@ runtime:
   # 实测漏写 FP-14 一条用例就让整轮 1690s 作废，-04 实测两轮修不对（第一轮修好结构
   # 第二轮引入重名）也整轮作废。3 = 首次 + 两次修复；1 = 关闭修复（回到一次性生成）。
   hidden_suite_max_attempts: 3
+  # 隐藏用例生成的调用预算（2026-10-31 task11 实测）：该调用不在节点 LLM 预算内，
+  # 单次请求上限 stream_total_timeout=1800s，叠加内部重试 3 次 × 3 轮尝试后，
+  # 首轮实测挂了 69.9 分钟（≈2×1800s 超时 + 1 次成功）。下面两级预算 + 收紧重试：
+  hidden_suite_stream_timeout_s: 1800  # 单次尝试墙钟上限（秒，0=沿用 stream_total_timeout；900 实测本轮 0 token 被掐断）
+  hidden_suite_total_budget_s: 3600    # 整个隐藏生成的总预算（秒，0=不限制）
+  hidden_suite_retry_attempts: 2       # 单次尝试内部的网络重试次数（覆盖 llm.retry.max_attempts）
   # 可见测试套件冻结前的覆盖率校验重试次数（含首次）。套件一旦冻结，FP×类别覆盖率
   # 就被冻结清单永久固定（复测忽略新生成），而验收门禁要求三类覆盖率 >= 1.0；
   # 20261024-233917-897d 实测首轮 10/9/7 of 12 被照单冻结后门禁永远失败。

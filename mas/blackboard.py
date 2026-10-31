@@ -203,11 +203,41 @@ class Blackboard:
             refs = self._refs.get(name, [])
             version = refs[-1].version if refs else 1
             payload = json.dumps(value, ensure_ascii=False, default=str)
+            original_len = len(payload)
+            if original_len > max_chars_per_item:
+                compact = self._compact_spec(value, max_chars_per_item)
+                if compact is not value:
+                    value = compact
+                    payload = json.dumps(value, ensure_ascii=False, default=str)
             if len(payload) > max_chars_per_item:
-                payload = payload[:max_chars_per_item] + f"...(截断, 共 {len(payload)} 字符)"
+                payload = payload[:max_chars_per_item] + f"...(截断, 共 {original_len} 字符)"
             producer = refs[-1].producer if refs else "-"
             chunks.append(f"### 产物 {name} (v{version}, 由 {producer} 产出)\n{payload}")
         return "\n\n".join(chunks) if chunks else "(暂无上游产物)"
+
+    @staticmethod
+    def _compact_spec(value: Any, max_chars: int) -> Any:
+        """超预算的需求规格先做语义压缩，避免 JSON 被硬切丢尾部功能点。
+
+        task12-foodlink-spa-03 实测：38194 字符的规格按 30000 硬截断，FP-12/FP-13
+        整段消失，solution 只看到 FP-01~FP-11；覆盖率校验却按完整 13 个 FP 要求，
+        方案节点必然 fail。这里复用 compress 的保留字段策略（先丢 samples/parameters/
+        source_spans，再丢 description/inputs/outputs），保证每个 FP 的 id/title
+        不丢；仍未达预算才退回硬截断。只改 Prompt 文本，黑板数据不动。
+        """
+        if not isinstance(value, dict) or not isinstance(value.get("function_points"), list):
+            return value
+        from .compress import _compress_spec, _compress_spec_deep
+
+        for strategy in (_compress_spec, _compress_spec_deep):
+            compact = strategy(value)
+            try:
+                size = len(json.dumps(compact, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                continue
+            if size <= max_chars:
+                return compact
+        return _compress_spec_deep(value)
 
     def missing_report(self, names: List[str]) -> str:
         missing = [name for name in names if name not in self._latest]

@@ -187,6 +187,23 @@ button.danger-btn:disabled { opacity: .55; cursor: not-allowed; border-color: va
 /* 运行详情顶部工具条（终止任务按钮） */
 .detail-actions { display: flex; justify-content: flex-end; margin-bottom: 12px; }
 
+/* 产物目录直达：打开按钮 + 真实绝对路径 + 一键复制（打不开文件夹时的兜底展示） */
+.artifact-dir {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 12px;
+}
+.artifact-dir-label { color: var(--muted); }
+.artifact-dir-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.artifact-dir-link:hover { text-decoration: underline; }
+.artifact-dir-path {
+  flex: 1 1 240px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: rgba(139, 152, 169, .12); border-radius: 6px; padding: 3px 8px;
+}
+.artifact-dir button, .artifact-dir-meta, .artifact-dir-label { white-space: nowrap; }
+.artifact-dir-meta { color: var(--muted); }
+.artifact-dir-meta.warn { color: var(--orange); }
+
 /* 运行详情 */
 .run-detail { min-width: 0; }
 .empty {

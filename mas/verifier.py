@@ -16,7 +16,8 @@
    ``fp_id`` 必须属于需求功能点；分类必须合法；测试文件里必须至少有一条断言；
    exit code 与失败数必须一致。
 4. **签名**：manifest 与 attestation 都用 HMAC-SHA256 签名（密钥取
-   ``MAS_VERIFIER_SECRET``，未配置时用进程内随机密钥），artifact 被改动可检出。
+   ``MAS_VERIFIER_SECRET``；dev 未配置时由 ``bind_run_secret()`` 在 run 目录生成
+   并持久化随机密钥，重启后可继续验签），artifact 被改动可检出。
    release 模式（``MAS_ENV=release/prod/production`` 或
    ``runtime.verifier.release_mode=true`` 或 ``MAS_VERIFIER_RELEASE=1``）必须配置
    稳定密钥（>=32 字符），缺失/过短时启动即拒绝，绝不退回进程随机密钥。
@@ -57,7 +58,7 @@ import secrets
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .errors import ConfigError
 from .verify.runner import RUNNER_NAME, RUNNER_VERSION
@@ -65,13 +66,17 @@ from .verify.runner import RUNNER_NAME, RUNNER_VERSION
 __all__ = [
     "VerificationError", "TestVerifier", "verify_attestation",
     "release_mode", "require_signing_secret", "require_release_profile",
-    "canonical_hash", "sign_payload", "verify_signed",
+    "canonical_hash", "sign_payload", "verify_signed", "bind_run_secret",
     "code_tree_hash",
 ]
 
 _CATEGORIES = ("functional", "exception", "boundary")
 _VALID_STATUS = {"passed", "failed", "error"}
 _PROCESS_SECRET = secrets.token_hex(32)
+# dev 模式的 run 级持久密钥：首进程生成到 run 目录，续跑进程读回同一密钥。
+# 只在未配置 MAS_VERIFIER_SECRET 且非 release 时使用；release 仍要求外部稳定密钥。
+_RUN_SECRET: Optional[str] = None
+RUN_SECRET_NAME = ".verifier_secret"
 MANIFEST_NAME = "test_manifest.json"
 FROZEN_DIR = "frozen_tests"
 SIGNATURE_ALG = "hmac-sha256"
@@ -96,6 +101,62 @@ class VerificationError(RuntimeError):
 
 def _configured_secret() -> str:
     return str(os.environ.get("MAS_VERIFIER_SECRET") or "").strip()
+
+
+def _read_or_create_run_secret(run_dir: Path) -> str:
+    """读取 run 目录下的 dev 签名密钥；不存在则原子创建（0600）。
+
+    创建失败（只读目录等）时返回本次生成的候选值：本进程内仍保持一致，
+    只是重启后无法续验——与旧行为相同，不因此阻断运行。
+    """
+    path = Path(run_dir) / RUN_SECRET_NAME
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if existing:
+        return existing
+    candidate = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            return path.read_text(encoding="utf-8").strip() or candidate
+        except OSError:
+            return candidate
+    except OSError:
+        return candidate
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(candidate + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        return candidate
+    return candidate
+
+
+def bind_run_secret(run_dir: Path, config: Any = None) -> bytes:
+    """把当前进程的签名密钥绑定到该 run 的持久化密钥（dev 模式，幂等）。
+
+    背景（task11-slink-fullstack-01 实测）：旧实现对 dev 直接使用进程随机密钥，
+    进程重启后既验不了已冻结清单，也验不了需求契约与隐藏套件签名，续跑被误判为
+    「文件被篡改」并消耗回退预算。Leader 在每个 run 开始时调用本函数：
+
+    - 配置了 ``MAS_VERIFIER_SECRET``：沿用外部稳定密钥（release 的唯一路径）；
+    - release 但未配置：由 ``_resolve_secret`` 抛错，绝不退回随机密钥；
+    - dev 未配置：读取/创建 ``<run_dir>/.verifier_secret``，同一 run 跨进程复用。
+    """
+    global _RUN_SECRET
+    configured = _configured_secret()
+    if configured:
+        # 环境密钥优先，且不写入 run 级状态：同一进程换 run 时无需清理。
+        return _resolve_secret(config)
+    if release_mode(config):
+        return _resolve_secret(config)      # 抛 VerificationError，交给启动检查
+    _RUN_SECRET = _read_or_create_run_secret(Path(run_dir))
+    return _RUN_SECRET.encode("utf-8")
 
 
 def release_mode(config: Any = None) -> bool:
@@ -160,7 +221,7 @@ def require_release_profile(config: Any = None) -> None:
 
 
 def _resolve_secret(config: Any = None) -> bytes:
-    """解析签名密钥：有环境密钥用之；release 缺失/过短抛错，dev 才回落进程随机。"""
+    """解析签名密钥：环境密钥 > run 级持久密钥 > 进程随机（仅 dev 兜底）。"""
     secret = _configured_secret()
     is_release = release_mode(config)
     if secret:
@@ -174,6 +235,8 @@ def _resolve_secret(config: Any = None) -> bytes:
         raise VerificationError(
             "release 模式必须设置稳定的 MAS_VERIFIER_SECRET，拒绝使用进程随机密钥"
         )
+    if _RUN_SECRET:
+        return _RUN_SECRET.encode("utf-8")
     return _PROCESS_SECRET.encode("utf-8")
 
 
@@ -777,8 +840,8 @@ class TestVerifier:
     def _collect_test_ids(self) -> List[str]:
         """用 AST 枚举冻结副本中的 unittest 用例（不执行测试代码）。
 
-        只收集直接继承 ``*TestCase`` 的类中 ``test*`` 方法：这正是
-        ``unittest.TestLoader.loadTestsFromModule`` 会加载的集合（模块级
+        收集继承 ``*TestCase`` 的类中 ``test*`` 方法（含经同模块基类间接继承）：
+        这正是 ``unittest.TestLoader.loadTestsFromModule`` 会加载的集合（模块级
         ``test_*`` 函数不会被加载）。测试文件若有同名包遮蔽问题，runner 按
         文件路径加载模块，仍能得到这些 id。
         """
@@ -792,22 +855,46 @@ class TestVerifier:
                 tree = ast.parse(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, SyntaxError) as exc:
                 raise VerificationError(f"测试文件无法解析: {relative}: {exc}") from exc
-            for node in tree.body:
-                if not isinstance(node, ast.ClassDef) or not self._is_test_case(node):
-                    continue
-                for child in node.body:
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                            and child.name.startswith("test"):
-                        ids.append(f"{module}.{node.name}.{child.name}")
+            for class_name, method_name in self.iter_test_methods(tree):
+                ids.append(f"{module}.{class_name}.{method_name}")
         return sorted(dict.fromkeys(ids))
 
     @staticmethod
-    def _is_test_case(node: ast.ClassDef) -> bool:
+    def _is_test_case(node: ast.ClassDef, known: Optional[Iterable[str]] = None) -> bool:
+        """是否 unittest 用例类：直接继承 ``*TestCase``，或继承模块内已识别的用例基类。"""
+        known_set = {str(name) for name in (known or ())}
         for base in node.bases:
             name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
-            if str(name).endswith("TestCase"):
+            name = str(name)
+            if name.endswith("TestCase") or name in known_set:
                 return True
         return False
+
+    @classmethod
+    def _test_case_class_names(cls, tree: ast.Module) -> set:
+        """模块内所有用例类名（含间接继承，按定义顺序传递）。
+
+        与 ``unittest.TestLoader`` 的 ``issubclass(cls, TestCase)`` 口径一致：
+        生成方常用 ``class _Base(unittest.TestCase)`` + ``class TestX(_Base)``
+        的共享夹具写法，只看直接基类会把这类套件误判为「没有可枚举用例」。
+        """
+        names: set = set()
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and cls._is_test_case(node, names):
+                names.add(node.name)
+        return names
+
+    @classmethod
+    def iter_test_methods(cls, tree: ast.Module) -> Iterator[Tuple[str, str]]:
+        """遍历模块内 unittest 会加载的 ``test*`` 方法（类名, 方法名）。"""
+        names = cls._test_case_class_names(tree)
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or node.name not in names:
+                continue
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and child.name.startswith("test"):
+                    yield node.name, child.name
 
     @staticmethod
     def _bind_case_meta(

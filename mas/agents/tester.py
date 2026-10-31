@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..errors import SandboxError
@@ -175,6 +176,117 @@ class TesterAgent(BaseAgent):
                 pass  # 留痕失败不影响测试生成
         return bundle
 
+    # ---------------------------------------------------------------- 冻结短路
+    def _verifier(self) -> TestVerifier:
+        return TestVerifier(
+            self.ctx.run_dir, self.ctx.sandbox.root, events=self.ctx.events,
+            config=self.ctx.config, sandbox=self.ctx.sandbox,
+            run_id=getattr(self.ctx, "run_id", ""),
+        )
+
+    def _previous_test_report(self, perception: Optional[Perception]) -> Dict[str, Any]:
+        """读取上一轮测试报告（协商记录来源）。
+
+        tester 的感知清单里没有 ``test_report``（config/collaboration.yaml），
+        所以 ``perception.found`` 永远拿不到它——2026-10-31 实测：第一版跳过逻辑
+        因此从未生效。上一轮报告属于框架状态，优先从黑板 latest 读取（掉电/续跑后
+        可从磁盘回落）；单测直接构造的 Perception 作为兜底。
+        """
+        board = getattr(self.ctx, "blackboard", None)
+        if board is not None and hasattr(board, "get"):
+            try:
+                report = board.get("test_report")
+            except Exception:  # noqa: BLE001 - 读取失败按无历史处理，不影响主流程
+                report = None
+            if isinstance(report, dict):
+                return report
+        found = getattr(perception, "found", None) or {}
+        report = found.get("test_report")
+        return report if isinstance(report, dict) else {}
+
+    def _env_probe(self, perception: Optional[Perception]) -> Dict[str, Any]:
+        """环境事实（node/浏览器通道）优先取感知，缺失时回落黑板 latest。
+
+        tester 的感知清单曾漏配 ``env_probe``（config/collaboration.yaml），
+        ``perception.found`` 恒为空 → 语言闸把「浏览器通道可用」误报为未就绪，
+        SPA 的 ui_evidence 直接判失败。2026-10-31 task12-foodlink-spa-03 实测：
+        ``env_probe.browser_ui_ready=true``，验收报告却写「浏览器 MCP 未就绪：」。
+        与 ``_previous_test_report`` 同因同治：框架状态优先从黑板读取，感知只作兜底。
+        """
+        found = getattr(perception, "found", None) or {}
+        probe = found.get("env_probe")
+        if isinstance(probe, dict) and probe:
+            return probe
+        board = getattr(self.ctx, "blackboard", None)
+        if board is not None and hasattr(board, "get"):
+            try:
+                probe = board.get("env_probe")
+            except Exception:  # noqa: BLE001 - 读取失败按未探测处理，不影响主流程
+                probe = None
+        return probe if isinstance(probe, dict) else {}
+
+    def precomputed_generation(
+        self, task: NodeTask, perception: Perception,
+    ) -> Optional[Generation]:
+        """冻结套件有效时跳过测试生成 LLM 调用，直接执行冻结副本。
+
+        依据（2026-10-31 task11-slink-fullstack-01）：test iter05 仍花 12.4 分钟
+        生成测试，apply() 随即发 ``test_generation_ignored`` 并整份丢弃——生成在这一
+        路径上没有任何产出。只有「协商已闭环」时才短路；仍有开放协商问题时保留模型
+        生成路径，避免跳过提问环节。上一轮报告与当前冻结套件对不上（test_hash 不同）
+        时同样重生成，保证换套件后重新提问。清单签名无效/不存在时返回 None。
+        """
+        if task.node_id != "test":
+            return None
+        # SPA 形态的浏览器证据依赖生成产物里的 ui_checks/ui_service_cmd，跳过生成会让
+        # _collect_ui_evidence 无从执行（按证据不足判失败）。这类形态保留生成路径。
+        # 声明形态之外再按沙箱文件探测一次：backend_only 被探测升级为 SPA 时同样不能跳过。
+        shape, _, _ = resolve_delivery_shape(perception.spec)
+        if shape == "full_stack_spa":
+            return None
+        sandbox = getattr(self.ctx, "sandbox", None)
+        if sandbox is not None:
+            try:
+                probed = probe_delivery_shape(sandbox.root, sandbox.list_files())
+            except Exception:  # noqa: BLE001 - 探测失败不影响主流程，按声明形态处理
+                probed = {}
+            if str(probed.get("shape") or "") == "full_stack_spa":
+                return None
+        try:
+            frozen = self._verifier().load_manifest()
+        except VerificationError:
+            return None
+        if not frozen or not frozen.get("test_ids"):
+            return None
+        previous = self._previous_test_report(perception)
+        negotiation = previous.get("negotiation")
+        # 必须已有「明确闭环」的协商记录才跳过：冻结后被杀进程（有清单、无报告）时
+        # 仍重新生成一次，保证歧义提问不会因为一次中断而永久丢失。
+        if not isinstance(negotiation, dict) or str(negotiation.get("status")) != "closed":
+            return None
+        prior_hash = str((previous.get("verification_attestation") or {}).get("test_hash") or "")
+        current_hash = str(frozen.get("digest") or "")
+        # 上一轮报告不是基于当前冻结套件产出的（套件失效后重生成）→ 重新生成并重新提问
+        if prior_hash and current_hash and prior_hash != current_hash:
+            self.ctx.events.emit(
+                "test_generation_reopened", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="info",
+                payload={"prior_test_hash": prior_hash, "current_test_hash": current_hash,
+                         "note": "上一轮报告对应的套件与当前冻结套件不同：重新生成并以新套件重提问"},
+            )
+            return None
+        self.ctx.events.emit(
+            "test_generation_skipped", agent=self.role_id, node=task.node_id,
+            iteration=task.iteration, severity="info",
+            payload={"test_hash": frozen.get("digest", ""),
+                     "test_ids": len(frozen.get("test_ids") or []),
+                     "note": "测试套件已冻结且协商已闭环：跳过生成调用，直接执行冻结副本"},
+        )
+        return Generation(
+            provider="framework", model="frozen-suite", text="", tokens=0,
+            data={"derived_from": "frozen-suite", "skipped_generation": True},
+        )
+
     # ---------------------------------------------------------------- 执行
     def apply(
         self,
@@ -191,11 +303,7 @@ class TesterAgent(BaseAgent):
 
         # 1) 测试冻结（docs/37 P0-2）：一旦冻结，生成方提交的 tests/ 文件不再生效，
         # 执行前从 run_dir/frozen_tests/ 恢复权威副本。首次执行前冻结当前套件。
-        verifier = TestVerifier(
-            self.ctx.run_dir, self.ctx.sandbox.root, events=self.ctx.events,
-            config=self.ctx.config, sandbox=self.ctx.sandbox,
-            run_id=getattr(self.ctx, "run_id", ""),
-        )
+        verifier = self._verifier()
         try:
             frozen = verifier.load_manifest()
         except VerificationError as exc:
@@ -223,13 +331,25 @@ class TesterAgent(BaseAgent):
         if frozen is not None:
             test_file = str(frozen.get("test_file") or "")
             changes = verifier.restore_if_changed()
-            self.ctx.events.emit(
-                "test_generation_ignored", agent=self.role_id, node=task.node_id,
-                iteration=task.iteration, severity="warning",
-                payload={"test_hash": frozen.get("digest", ""), "files": len(generated_tests),
-                         "restored_changes": changes,
-                         "note": "测试套件已冻结：本轮新生成的 tests/ 文件被忽略，执行冻结副本"},
-            )
+            if generated_tests:
+                self.ctx.events.emit(
+                    "test_generation_ignored", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="warning",
+                    payload={"test_hash": frozen.get("digest", ""), "files": len(generated_tests),
+                             "restored_changes": changes,
+                             "note": "测试套件已冻结：本轮新生成的 tests/ 文件被忽略，执行冻结副本"},
+                )
+            else:
+                # 生成被 precomputed_generation 短路（无新文件可忽略）：按 info 记录，
+                # 不再用「忽略生成」的 warning 误导排障。
+                self.ctx.events.emit(
+                    "test_frozen_suite_executed", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="info",
+                    payload={"test_hash": frozen.get("digest", ""),
+                             "test_ids": len(frozen.get("test_ids") or []),
+                             "restored_changes": changes,
+                             "note": "直接执行冻结副本（本轮跳过测试生成）"},
+                )
             self.evidence(result, "frozen_tests", test_file=test_file,
                           test_hash=frozen.get("digest", ""), restored=len(changes),
                           test_ids=len(frozen.get("test_ids") or []))
@@ -279,17 +399,22 @@ class TesterAgent(BaseAgent):
         # 说明它想绕过白名单去验证非 Python 交付物；若用了 json.* 却没 import json，
         # 则结果回传协议必然崩在 NameError。两类都必须在执行前就写明，而不是事后翻 stderr。
         # 实测 task04（C++ 需求）：19 条用例全部败于 FileNotFoundError，报告里看不出根因。
+        # 事件在拿到逐用例结果后按根因分类发出（见 4.1）：「本机缺工具链」「测试文件绕过
+        # 白名单」「测试套件自身缺陷」的处置原则不同，执行前无法区分。
         preexec_findings = self._preexec_diagnosis(test_file)
-        if preexec_findings:
-            self.ctx.events.emit(
-                "test_environment_gap", agent=self.role_id, node=task.node_id,
-                iteration=task.iteration, severity="error",
-                payload={"note": "测试文件执行前体检发现外部程序依赖或协议缺陷",
-                         "findings": preexec_findings},
-            )
 
         # 2) 需求歧义协商（Agent 间请求-应答通信）
-        negotiation = self._negotiate(data, task, result)
+        if data.get("skipped_generation"):
+            # 冻结套件复测不再重新生成歧义问题：沿用上一轮已闭环的协商记录留档，
+            # 新提问只会在重新生成套件时产生（避免每轮白付一次 developer 应答调用）。
+            previous_negotiation = self._previous_test_report(perception).get("negotiation")
+            if isinstance(previous_negotiation, dict) and int(previous_negotiation.get("open") or 0) == 0:
+                negotiation = dict(previous_negotiation)
+                negotiation["carried_over"] = True
+            else:
+                negotiation = self._negotiate(data, task, result)
+        else:
+            negotiation = self._negotiate(data, task, result)
 
         # 2.5) 验证口径与选型语言的一致性：非 Python 选型下，沙箱执行的 Python 测试文件
         # 不构成对交付物的证据（实测 probe-02 因此拿到 8 项门禁全绿）。
@@ -308,7 +433,7 @@ class TesterAgent(BaseAgent):
                          "note": "沙箱交付文件探测到更强的前端形态，覆盖模型/规格自报的交付形态"},
             )
             shape, shape_source = shape_probe["shape"], "file_probe"
-        env_probe = perception.found.get("env_probe") or {}
+        env_probe = self._env_probe(perception)
         verification = self._verification_gap(
             perception.found.get("solution_design") or {}, env_probe, spec, shape=shape)
         if verification["gap"]:
@@ -368,6 +493,22 @@ class TesterAgent(BaseAgent):
 
         # 4) 独立验证（docs/37 P0-2）：只用逐用例记录重算结果，并核对冻结 hash。
         root_cause = self._root_cause(preexec_findings, parsed.get("cases", []))
+        # 4.1) 执行前体检的归因落事件：Leader 用事件类型判定「回退也改不掉」，一律记成
+        # test_environment_gap 会把「测试文件绕过白名单」误报为缺工具链
+        # （task12-foodlink-spa-03：npm 实际存在，报告却写「外部工具链缺失」并建议加白名单）。
+        if preexec_findings:
+            event_type = {
+                "environment_or_build": "test_environment_gap",
+                "test_suite_defect": "test_suite_defect",
+                "delivery_unverifiable": "test_delivery_unverifiable",
+            }.get(str(root_cause.get("category") or ""), "test_preexec_findings")
+            self.ctx.events.emit(
+                event_type, agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"note": self._root_cause_note(preexec_findings, root_cause),
+                         "category": root_cause.get("category", ""),
+                         "findings": preexec_findings},
+            )
         spec_fps = [str(fp.get("id")) for fp in fps if fp.get("id")]
         try:
             attestation = verifier.attest(
@@ -400,8 +541,15 @@ class TesterAgent(BaseAgent):
         coverage = (attestation.get("coverage") if attestation.get("valid")
                     else self._coverage(effective_cases, fp_total, data))
 
-        # 5) 缺陷跟踪（含上一轮缺陷的闭环判定）
-        bugs = self._track_bugs(effective_cases, data.get("cases", []), task, perception)
+        # 5) 缺陷跟踪（含上一轮缺陷的闭环判定）。环境/验证通道/套件自身缺陷导致的失败
+        #    只记 blocked（未获得复测证据），不立交付物缺陷，也不把旧缺陷改回 open。
+        bugs = self._track_bugs(
+            effective_cases, data.get("cases", []), task, perception,
+            suite_digest=str(suite_manifest.get("digest") or ""),
+            suite_test_ids=[str(item) for item in (suite_manifest.get("test_ids") or [])],
+            blocked_reason=(self._root_cause_note(preexec_findings, root_cause)
+                            if root_cause.get("category") else ""),
+        )
 
         # 6) 测试报告（summary 以验证器重算值为准）
         summary = {
@@ -428,6 +576,8 @@ class TesterAgent(BaseAgent):
             "test_ids": list(suite_manifest.get("test_ids") or []),
             "summary": summary,
             "coverage": coverage,
+            "blocked_cases": int(bugs.get("blocked", 0)),
+            "blocked_reason": str(bugs.get("blocked_reason") or ""),
             "verification_attestation": attestation_report,
             "negotiation": negotiation,
             "executions": [{
@@ -445,8 +595,8 @@ class TesterAgent(BaseAgent):
                 }
                 for case in parsed.get("cases", []) if case.get("status") != "passed"
             ],
-            "case_count": data.get("case_count", {}),
-            "derived_from": data.get("derived_from", ""),
+            "case_count": self._case_count(effective_cases, data.get("case_count")),
+            "derived_from": str(data.get("derived_from") or ""),
             "protocol_note": protocol_note,
             "preexec_findings": preexec_findings,
             "verification": verification,
@@ -461,9 +611,13 @@ class TesterAgent(BaseAgent):
         self.publish(
             "test_report", test_report, task,
             summary=f"用例 {summary['total']}（通过 {summary['passed']} / 失败 {summary['failed']}），"
-                    f"缺陷开 {bugs['open']} / 闭环 {bugs['fixed']}",
+                    f"缺陷开 {bugs['open']} / 闭环 {bugs['fixed']}"
+                    + (f" / 环境阻断 {bugs['blocked']}（未立缺陷）" if bugs.get("blocked") else ""),
         )
-        self.publish("bug_reports", bugs, task, summary=f"缺陷总数 {bugs['total']}（open {bugs['open']}）")
+        self.publish("bug_reports", bugs, task,
+                     summary=(f"缺陷总数 {bugs['total']}（open {bugs['open']}）"
+                              + (f"，环境/通道阻断 {bugs['blocked']} 条（未形成交付物缺陷）"
+                                 if bugs.get("blocked") else "")))
         result.artifacts["test_report"] = test_report
         result.artifacts["bug_reports"] = bugs
 
@@ -501,8 +655,9 @@ class TesterAgent(BaseAgent):
         result.summary = (
             f"业务测试：功能 {coverage['functional']['total']} / 异常 {coverage['exception']['total']} / "
             f"边界 {coverage['boundary']['total']} 条用例，通过率 {summary['pass_rate']}，"
-            f"缺陷 {bugs['total']} 个（新增 {len(bugs.get('new', []))}，闭环 {bugs['fixed']}）；"
-            f"歧义协商 {negotiation['closed']}/{negotiation['total']} 闭环"
+            f"缺陷 {bugs['total']} 个（新增 {len(bugs.get('new', []))}，闭环 {bugs['fixed']}）"
+            + (f"，环境/通道阻断 {bugs['blocked']} 条（未立缺陷）" if bugs.get("blocked") else "")
+            + f"；歧义协商 {negotiation['closed']}/{negotiation['total']} 闭环"
             + (f"；根因：{test_report['root_cause_note']}" if preexec_findings else "")
             + (f"；验证口径缺口：{verification['note']}" if verification["gap"] else "")
             + (f"；独立验证未通过：{', '.join(attestation.get('reasons') or [])}"
@@ -535,6 +690,8 @@ class TesterAgent(BaseAgent):
                 "verification_valid": bool(attestation.get("valid")),
                 "verification_reasons": attestation.get("reasons") or [],
                 "test_hash": attestation.get("test_hash", ""),
+                "blocked_cases": int(bugs.get("blocked", 0)),
+                "root_cause_category": root_cause.get("category", ""),
                 "failures": test_report["failures"],
             },
             refs=[f"test_runs/iter{task.iteration:02d}/stdout.txt"],
@@ -569,11 +726,29 @@ class TesterAgent(BaseAgent):
                                                  "sandbox_command_unresolved")
                 or str(getattr(item, "rule", "")).endswith("_not_imported")]
 
+    @classmethod
+    def _environment_blocked(cls, message: str) -> bool:
+        """失败症状是否命中「外部程序不存在」特征（环境/验证通道阻断，而非交付物缺陷）。"""
+        text = str(message or "").lower()
+        return any(pattern in text for pattern in cls._MISSING_PROG_PATTERNS)
+
     # 外部程序在本机不存在的报错特征：命中即判定为环境/构建问题，而不是交付物缺陷
     _MISSING_PROG_PATTERNS = ("filenotfounderror", "winerror 2", "no such file or directory",
                               "not found", "not recognized")
     # 测试套件自身的静态缺陷（可修，不该算环境也不该算交付物）：`<模块>_not_imported`
     _SUITE_DEFECT_SUFFIX = "_not_imported"
+    # 测试文件内联启动外部程序的发现规则（见 Sandbox._command_bypass_findings）
+    _BYPASS_RULES = ("sandbox_command_bypass", "sandbox_command_unresolved")
+
+    @classmethod
+    def _bypass_programs(cls, findings: List[Dict[str, Any]]) -> List[str]:
+        """从 bypass 发现里取出被调用的程序名（message 中反引号包裹的字面量）。"""
+        names: List[str] = []
+        for item in findings:
+            if str(item.get("rule", "")) not in cls._BYPASS_RULES:
+                continue
+            names.extend(re.findall(r"`([^`]+)`", str(item.get("message", ""))))
+        return list(dict.fromkeys(names))
 
     def _root_cause(self, findings: List[Dict[str, Any]],
                     cases: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -583,6 +758,11 @@ class TesterAgent(BaseAgent):
         task04（C++ 需求）实测：32 条用例全败于 FileNotFoundError（本机没有编译器），
         原实现只报"32 个缺陷"并回退给研发修复，回退预算耗尽后才以失败终止——
         根因其实是环境/构建问题，研发再怎么改也改不出一个不存在的 g++。
+
+        task12（NestJS SPA）补充：报错同样是 FileNotFoundError，但程序（npm.cmd）
+        在本机其实存在，失败来自测试文件绕过白名单后的调用方式与平台/协议不兼容。
+        这类失败不是「缺工具链」，而是交付物无法被现有 Python 通道验证——归
+        ``delivery_unverifiable``，否则报告会给出「把 npm 加进白名单」这类错误建议。
         """
         if not findings:
             return {"category": "", "evidence": []}
@@ -596,10 +776,15 @@ class TesterAgent(BaseAgent):
         if any(rule.endswith(self._SUITE_DEFECT_SUFFIX) for rule in rules):
             category = "test_suite_defect"
         elif evidence:
-            category = "environment_or_build"
+            programs = self._bypass_programs(findings)
+            if programs and all(shutil.which(program) for program in programs):
+                category = "delivery_unverifiable"
+            else:
+                category = "environment_or_build"
         else:
             category = "delivery_unverifiable"
-        return {"category": category, "evidence": evidence[:5], "evidence_total": len(evidence)}
+        return {"category": category, "evidence": evidence[:5], "evidence_total": len(evidence),
+                "bypass_programs": self._bypass_programs(findings)}
 
     def _root_cause_note(self, findings: List[Dict[str, Any]], root_cause: Dict[str, Any]) -> str:
         if not findings:
@@ -616,8 +801,11 @@ class TesterAgent(BaseAgent):
                     f"{root_cause.get('evidence_total', 0)} 条用例报"
                     f"`{root_cause['evidence'][0].split(': ',1)[-1] if root_cause.get('evidence') else ''}`；"
                     "这类失败无法靠修改交付物代码消除，需补齐环境或改用可验证的语言")
+        programs = "、".join(root_cause.get("bypass_programs") or [])
+        exists = f"（{programs} 在本机存在，失败来自测试通道的调用方式/协议限制）" if programs else ""
         return (f"【交付物无法验证】{detail}。沙箱命令白名单只校验框架发起的命令，"
-                "测试文件内部再起的程序会绕过它，非 Python 交付物因此无法被真实验证")
+                "测试文件内部再起的程序会绕过它，非 Python 交付物因此无法被真实验证"
+                + exists)
 
     @staticmethod
     def _language_tokens(language: str) -> List[str]:
@@ -724,14 +912,18 @@ class TesterAgent(BaseAgent):
 
         if shape == "full_stack_spa":
             if not browser_ready:
+                if not probe_cfg.get("enabled"):
+                    why = "runtime.ui_probe 未启用"
+                elif not env_probe:
+                    why = "环境探测产物 env_probe 缺失，无法确认浏览器通道可用性"
+                else:
+                    why = f"浏览器 MCP 未就绪：{env_probe.get('ui_server', {}).get('reason', '')}"
                 return {
                     "enabled": True, "mode": "browser", "delivery_shape": shape, "channel": "",
                     "asserts": [], "checks": [], "screenshots": [], "console_errors": [],
                     "console_note": "", "probe_version": "", "http_status": 0, "http_probe": {},
                     "failed_asserts": 1,
-                    "error": ("full_stack_spa 需要浏览器级 UI 证据，当前不可得（"
-                              + ("runtime.ui_probe 未启用" if not probe_cfg.get("enabled")
-                                 else f"浏览器 MCP 未就绪：{env_probe.get('ui_server', {}).get('reason', '')}")
+                    "error": ("full_stack_spa 需要浏览器级 UI 证据，当前不可得（" + why
                               + "）：断言数为 0 时按证据不足判失败，不允许空证据通过"),
                 }
             if not checks:
@@ -897,14 +1089,8 @@ class TesterAgent(BaseAgent):
                 tree = ast.parse(content)
             except SyntaxError:
                 continue          # 冻结阶段的 AST 解析会给出精确到文件的报错
-            for node in tree.body:
-                if not isinstance(node, ast.ClassDef) \
-                        or not TestVerifier._is_test_case(node):
-                    continue
-                for child in node.body:
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                            and child.name.startswith("test"):
-                        defined.add(child.name)
+            for _class_name, method_name in TestVerifier.iter_test_methods(tree):
+                defined.add(method_name)
         fp_set = {str(fp) for fp in (fp_ids or ()) if str(fp)}
         gaps: List[str] = []
         declared: set = set()
@@ -1083,6 +1269,23 @@ class TesterAgent(BaseAgent):
             )
         return data, generation
 
+    def _case_count(self, cases: List[Dict[str, Any]], reported: Any) -> Dict[str, int]:
+        """用例计数：优先用生成方自报，缺失时从实际执行记录重算。
+
+        冻结套件复测会跳过生成（``test_generation_skipped``），此时 ``data`` 为空；
+        沿用 ``data.get("case_count", {})`` 会让报告里的计数变成 0，与实际执行不符。
+        """
+        if isinstance(reported, dict) and reported.get("total"):
+            return reported
+        counts = {"total": len(cases), "functional": 0, "exception": 0, "boundary": 0}
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            category = str(case.get("category") or "")
+            if category in counts:
+                counts[category] += 1
+        return counts
+
     def _coverage(self, cases: List[Dict[str, Any]], fp_total: int, data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         coverage: Dict[str, Dict[str, Any]] = {}
         for category in ("functional", "exception", "boundary"):
@@ -1106,7 +1309,17 @@ class TesterAgent(BaseAgent):
         generated: List[Dict[str, Any]],
         task: NodeTask,
         perception: Perception,
+        suite_digest: str = "",
+        suite_test_ids: Optional[List[str]] = None,
+        blocked_reason: str = "",
     ) -> Dict[str, Any]:
+        """按执行记录维护缺陷池。
+
+        ``blocked_reason`` 非空表示本轮失败已归因为环境/验证通道问题：症状命中
+        「外部程序不存在」特征的用例记为 ``blocked``（未获得复测证据），既不新开
+        交付物缺陷、也不把旧缺陷改成 open——task12-foodlink-spa-03 实测：一次
+        setUp 环境失败被展开成 33 个 critical/major 缺陷，报告据此声称交付物有问题。
+        """
         method_to_case = {}
         for case in generated:
             if not isinstance(case, dict):
@@ -1120,6 +1333,7 @@ class TesterAgent(BaseAgent):
         }
         items: List[Dict[str, Any]] = []
         new_ids: List[str] = []
+        blocked_skipped = 0
         for case in executed:
             if not isinstance(case, dict):
                 continue          # 契约外防御：跳过结构非法的执行记录
@@ -1130,21 +1344,37 @@ class TesterAgent(BaseAgent):
             if status == "passed":
                 if prior and prior.get("status") == "open":
                     prior.update({"status": "fixed", "fixed_iteration": task.iteration,
-                                  "verified_by": "tester"})
+                                  "verified_by": "tester",
+                                  "fixed_by_test_hash": suite_digest})
                     items.append(prior)
                 elif prior:
                     prior.update({"status": "fixed", "fixed_iteration": prior.get("fixed_iteration", task.iteration)})
                     items.append(prior)
                 continue
-            meta = method_to_case.get(method, {})
+            message = str(case.get("message", ""))
+            blocked = bool(blocked_reason) and self._environment_blocked(message)
             if prior:
+                if blocked:
+                    prior.update({
+                        "status": "blocked",
+                        "symptom": message[:200] or prior.get("symptom", ""),
+                        "detected_iteration": prior.get("detected_iteration", task.iteration),
+                        "closure_note": ("本轮仍被环境/验证通道阻断，未获得复测证据："
+                                         + blocked_reason[:160]),
+                    })
+                    items.append(prior)
+                    continue
                 prior.update({
                     "status": "open",
-                    "symptom": str(case.get("message", ""))[:200] or prior.get("symptom", ""),
+                    "symptom": message[:200] or prior.get("symptom", ""),
                     "detected_iteration": prior.get("detected_iteration", task.iteration),
                 })
                 items.append(prior)
                 continue
+            if blocked:
+                blocked_skipped += 1
+                continue          # 环境阻断不立交付物缺陷；证据保留在 test_report.failures
+            meta = method_to_case.get(method, {})
             import hashlib
 
             bug = {
@@ -1154,9 +1384,10 @@ class TesterAgent(BaseAgent):
                 "op": str(meta.get("op", "")),
                 "category": case.get("category") or meta.get("category", "functional"),
                 "severity": _SEVERITY.get(str(case.get("category", "")), "major"),
-                "symptom": str(case.get("message", ""))[:200],
+                "symptom": message[:200],
                 "status": "open",
                 "detected_iteration": task.iteration,
+                "detected_test_hash": suite_digest,
                 "fixed_iteration": None,
                 "evidence": {"log": f"test_runs/iter{task.iteration:02d}/stdout.txt"},
             }
@@ -1167,6 +1398,11 @@ class TesterAgent(BaseAgent):
         # bug_reports.open 归 0，门禁第 6 项被虚假满足）。无证据时旧缺陷原样保留为 open。
         if executed:
             for prior in previous.values():
+                if prior.get("status") == "blocked" and not any(
+                        item.get("id") == prior.get("id") for item in items):
+                    prior.update({"closure_note": "本轮未执行到该用例：环境阻断记录保留，等待复测"})
+                    items.append(prior)
+                    continue
                 if prior.get("status") == "open" and not any(item.get("id") == prior.get("id") for item in items):
                     if prior.get("source") == "hidden":
                         # 隐藏用例缺陷只在 acceptance 现场执行（20261025-063338-26c1）：
@@ -1174,19 +1410,44 @@ class TesterAgent(BaseAgent):
                         # （Leader._merge_hidden_bugs 在隐藏套件通过时统一改 fixed）。
                         items.append(prior)
                         continue
-                    prior.update({"status": "fixed", "fixed_iteration": task.iteration, "verified_by": "tester"})
+                    # 本轮没有执行到该用例（被删/改名/执行集合缺失）→ 没有「已修复」证据。
+                    # 原实现把这类缺陷一律改 fixed，等于把「没复测」记成「修好了」。
+                    # 套件已重生成且不再包含该用例时记为 stale（需人工确认）；
+                    # 用例仍在当前清单里（或清单未知）时保持 open，等待真实复测。
+                    prior_hash = str(prior.get("detected_test_hash") or "")
+                    test_ref = str(prior.get("test") or "")
+                    in_suite: Optional[bool] = (
+                        None if not suite_test_ids else
+                        any(str(tid).endswith("." + test_ref) for tid in suite_test_ids))
+                    suite_changed = bool(prior_hash and suite_digest and prior_hash != suite_digest)
+                    if in_suite is False or (in_suite is None and suite_changed):
+                        prior.update({
+                            "status": "stale",
+                            "closure_note": "该用例不在本轮冻结清单中（套件重生成或用例删除），"
+                                            "未获得复测证据；按 stale 记录，不计入已修复",
+                        })
+                    else:
+                        prior.update({
+                            "closure_note": "本轮未执行到该用例：保持 open，等待真实复测",
+                        })
                     items.append(prior)
         else:
             for prior in previous.values():
-                if prior.get("status") == "open":
+                if prior.get("status") in ("open", "blocked"):
                     items.append(prior)
         open_count = sum(1 for item in items if item.get("status") == "open")
         fixed_count = sum(1 for item in items if item.get("status") == "fixed")
+        stale_count = sum(1 for item in items if item.get("status") == "stale")
+        blocked_count = sum(1 for item in items if item.get("status") == "blocked") + blocked_skipped
         return {
             "items": items,
-            "total": len(items),
+            # 「缺陷总数」只统计确立的交付物缺陷：blocked 是「未能验证」，不是「有问题」
+            "total": open_count + fixed_count + stale_count,
             "open": open_count,
             "fixed": fixed_count,
+            "stale": stale_count,
             "closed": fixed_count,
+            "blocked": blocked_count,
+            "blocked_reason": blocked_reason,
             "new": new_ids,
         }

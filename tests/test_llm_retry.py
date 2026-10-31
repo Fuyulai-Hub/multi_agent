@@ -225,5 +225,64 @@ class RetryClassificationTests(unittest.TestCase):
         self.assertEqual(generation.data, {"ok": True})
 
 
+class CallBudgetTests(unittest.TestCase):
+    """调用级墙钟预算（2026-10-31 task11：隐藏用例生成单轮可挂 69.9 分钟）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config = load_config(PROJECT_ROOT / "config", workspace=self.root / "workspace")
+        self.config.runtime["verbose"] = False
+        self.config.llm["provider"] = "openai_compatible"
+        self.config.llm["model"] = "stub-model"
+        self.config.llm["timeout"] = 5
+        self.config.llm["empty_output_retry"] = 0
+        self.config.llm["retry"] = {"max_attempts": 3, "backoff_s": 0}
+        self.config.llm_overrides = {"api_key": "stub-key", "base_url": "http://127.0.0.1:1/v1"}
+        self.bundle = SimpleNamespace(
+            path=None, system="sys", user="请生成隐藏用例", experiences=[], skills=[], tier_counts={})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_exhausted_budget_sends_no_request(self):
+        import time
+
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            return _FakeResponse()
+
+        client = LLMClient(self.config)
+        with client.call_budget(0.001):
+            time.sleep(0.02)
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                generation = client.generate("hidden_test_suite", self.bundle, {})
+        self.assertEqual(calls["n"], 0, "预算耗尽后不得再发起请求")
+        self.assertTrue(generation.timed_out)
+        self.assertIn("调用预算", generation.error)
+        # 退出上下文后预算恢复为空，后续调用不受影响
+        self.assertIsNone(client._budget_remaining())
+
+    def test_retry_attempts_override(self):
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            raise ConnectionRefusedError(10061, "由于目标计算机积极拒绝，无法连接")
+
+        client = LLMClient(self.config)
+        with client.call_budget(60, retry_attempts=2):
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                generation = client.generate("hidden_test_suite", self.bundle, {})
+        self.assertEqual(calls["n"], 2, "调用级 retry_attempts 应覆盖 llm.retry.max_attempts")
+        self.assertIsNotNone(generation.error)
+        # 退出上下文后恢复全局重试配置
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.generate("requirement_spec", self.bundle, {})
+        self.assertEqual(calls["n"], 2 + 3)
+
+
 if __name__ == "__main__":
     unittest.main()

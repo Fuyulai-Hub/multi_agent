@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -146,6 +147,14 @@ class HiddenRepairTests(unittest.TestCase):
         self.assertEqual(len(self.ctx.llm.calls), 2)
         self.assertIn("hidden_case_missing:FP-02", self.ctx.llm.calls[1])
         self.assertIn("修正后的完整 JSON", self.ctx.llm.calls[1])
+        # 逐次留痕：两次尝试的耗时/结果都要保留（此前只保留最后一次，排障只能靠时间戳反推）
+        detail = result.metrics.get("hidden_generation_attempts_detail") or []
+        self.assertEqual(len(detail), 2, result.metrics)
+        self.assertEqual([item["attempt"] for item in detail], [1, 2])
+        traces = (self.run_dir / "llm_traces.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(traces), 2)
+        kinds = [json.loads(line)["task_kind"] for line in traces]
+        self.assertEqual(kinds, ["hidden_test_suite", "hidden_test_suite"])
         self.assertTrue(
             (self.run_dir / "prompts" / "intake_hidden_iter01_repair01.md").exists())
         repair_events = [e for e in self.events.events
@@ -220,6 +229,55 @@ class HiddenStructureValidationTests(unittest.TestCase):
                 "cases": [_CASE_ADD, _CASE_SUB]}
         out = validate_generated_suite(data, self.spec)
         self.assertEqual(out["errors"], [])
+
+    def test_suffix_only_name_mismatch_is_reconciled(self):
+        """task12 实测：内容完整、仅方法名差一个后缀时不应白扔整份套件。"""
+        from mas.hidden import validate_generated_suite
+        case = {"id": "TH-FP-01-functional-demo-run-success", "fp_id": "FP-01",
+                "op": "demo_run", "name": "success", "category": "functional",
+                "call": "run()", "expect": "ok"}
+        suite = '''"""隐藏用例（方法名少一个 _success）。"""
+import unittest
+
+
+class TestHidden(unittest.TestCase):
+    def test_functional_demo_run(self):
+        self.assertTrue(True)
+'''
+        data = {"files": [{"path": "tests/test_hidden.py", "content": suite}],
+                "cases": [case]}
+        # 单 FP 规格，隔离「仅方法名差后缀」这一个变量
+        spec = {"function_points": [_spec()["function_points"][0]]}
+        out = validate_generated_suite(data, spec)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(out["reconciled"],
+                         [{"from": "test_functional_demo_run",
+                           "to": "test_functional_demo_run_success"}])
+        self.assertIn("def test_functional_demo_run_success(",
+                      out["files"][0]["content"])
+        # 重命名只动 def 行，测试体不变
+        self.assertIn("self.assertTrue(True)", out["files"][0]["content"])
+
+    def test_unrelated_method_name_is_not_reconciled(self):
+        """非前后缀关系的错名不能靠重命名蒙混过关（保持原有拒绝口径）。"""
+        from mas.hidden import validate_generated_suite
+        case = {"id": "TH-FP-01-functional-demo-run-success", "fp_id": "FP-01",
+                "op": "demo_run", "name": "success", "category": "functional",
+                "call": "run()", "expect": "ok"}
+        suite = '''"""隐藏用例（方法名完全不相干）。"""
+import unittest
+
+
+class TestHidden(unittest.TestCase):
+    def test_functional_other_thing(self):
+        self.assertTrue(True)
+'''
+        data = {"files": [{"path": "tests/test_hidden.py", "content": suite}],
+                "cases": [case]}
+        out = validate_generated_suite(data, self.spec)
+        self.assertIn("hidden_case_method_missing:test_functional_demo_run_success",
+                      out["errors"])
+        self.assertEqual(out["reconciled"], [])
 
 
 class HiddenRepairGuidanceTests(HiddenRepairTests):

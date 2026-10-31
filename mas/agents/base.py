@@ -180,8 +180,16 @@ class BaseAgent:
             result.metrics["skills_injected"] = len(bundle.skills)
             result.consumed_experience = [item["id"] for item in bundle.experiences]
             context = self.build_context(task, perception)
-            generation = self._generate_with_tools(task, bundle, context, result)
-            self._trace_llm(task, bundle, generation, error=generation.error)
+            # 生成短路（2026-10-31 task11 实测）：冻结套件已存在时测试节点的 LLM 生成
+            # 结果会被 apply() 整体丢弃（test_generation_ignored），单次白烧 12.4 分钟。
+            # 返回非 None 表示「本节点无需模型生成」，直接进入 apply；默认 None 行为不变。
+            generation = self.precomputed_generation(task, perception)
+            if generation is None:
+                generation = self._generate_with_tools(task, bundle, context, result)
+                self._trace_llm(task, bundle, generation, error=generation.error)
+            else:
+                result.metrics["generation_skipped"] = str(
+                    generation.model or generation.provider or "precomputed")
             self._trace_context(task, result)
             result.metrics["generation"] = generation.to_dict()
             if generation.error:
@@ -480,14 +488,19 @@ class BaseAgent:
         generation: Optional[Generation],
         *,
         error: str = "",
+        task_kind: Optional[str] = None,
     ) -> None:
-        """把一次 LLM 调用（含思考链与原始输出）追加到 run_dir/llm_traces.jsonl。"""
+        """把一次 LLM 调用（含思考链与原始输出）追加到 run_dir/llm_traces.jsonl。
+
+        ``task_kind`` 用于同一节点内的旁路生成（如 intake 的隐藏用例生成）：
+        按节点映射取 kind 会把它记成 requirement_spec，事后无法从 trace 区分。
+        """
         record = {
             "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
             "agent": self.role_id,
             "node": task.node_id,
             "iteration": task.iteration,
-            "task_kind": self.task_kind_for(task),
+            "task_kind": task_kind or self.task_kind_for(task),
             "prompt_path": str(bundle.path) if bundle.path else None,
             "provider": (generation.provider if generation else "") or getattr(self.ctx.llm, "provider", ""),
             "model": (generation.model if generation else "") or getattr(self.ctx.llm, "model", ""),
@@ -546,6 +559,17 @@ class BaseAgent:
         result.metrics["context"] = fit.to_dict()
 
     # ---------------------------------------------------------------- 钩子
+    def precomputed_generation(
+        self, task: NodeTask, perception: Perception,
+    ) -> Optional[Generation]:
+        """可选短路钩子：返回非 None 时跳过本节点的大模型生成。
+
+        默认返回 None（行为与改造前逐字节一致）。调用方必须保证 apply() 能只靠
+        该 Generation 完成节点——目前仅 TesterAgent 在「冻结套件有效且协商已闭环」
+        时使用：生成结果本来就会被冻结副本覆盖，跳过可省一次长调用。
+        """
+        return None
+
     def task_kind_for(self, task: NodeTask) -> str:
         if task.node_id in self.task_kinds:
             return self.task_kinds[task.node_id]

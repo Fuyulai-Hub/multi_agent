@@ -632,6 +632,43 @@ class PermissionAndRetryTests(unittest.TestCase):
             brief_full = blackboard.brief(["big"], max_chars_per_item=10000)
             self.assertNotIn("截断", brief_full)           # 预算内完整透传
 
+    def test_perception_brief_keeps_all_function_points_when_over_budget(self):
+        """task12-foodlink-spa-03 实测：38k 规格被 30k 硬截断丢掉 FP-12/FP-13。
+
+        solution 只看到 FP-01~FP-11，覆盖率校验按 13 个 FP 要求 → 必然 fail。
+        超预算时必须先做结构化压缩，保证每个功能点的 id/title 仍在 Prompt 里。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            blackboard = Blackboard(Path(tmp) / "artifacts")
+            spec = {
+                "title": "规格",
+                "function_points": [
+                    {
+                        "id": f"FP-{index:02d}",
+                        "title": f"功能点 {index}",
+                        "description": "描述" * 200,
+                        "parameters": [{"name": "x", "type": "string"}] * 20,
+                        "samples": [{"input": "x" * 200, "expect": "y" * 200}] * 5,
+                        "source_spans": [{"clause_id": f"C-{index:03d}", "quote": "q" * 200}],
+                        "category": "功能",
+                    }
+                    for index in range(1, 14)
+                ],
+            }
+            blackboard._latest["requirement_spec"] = spec
+            blackboard._refs["requirement_spec"] = [SimpleNamespace(version=1, producer="p")]
+
+            brief = blackboard.brief(["requirement_spec"], max_chars_per_item=30000)
+
+            self.assertNotIn("截断", brief)
+            self.assertLessEqual(len(brief.split("\n", 1)[1]), 30000)
+            for index in range(1, 14):
+                self.assertIn(f'"id": "FP-{index:02d}"', brief)
+            # 压缩只作用于 Prompt 文本，黑板里的原始产物保持不变
+            self.assertEqual(len(blackboard._latest["requirement_spec"]["function_points"]), 13)
+            self.assertIn("source_spans",
+                          blackboard._latest["requirement_spec"]["function_points"][0])
+
     def test_permission_allows_helper(self):
         self.assertTrue(_permission_allows(self._agent({}), "can_block_acceptance"))
         self.assertFalse(_permission_allows(self._agent({"can_block_acceptance": False}),

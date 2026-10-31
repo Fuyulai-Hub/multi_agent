@@ -11,7 +11,11 @@ from types import SimpleNamespace
 from mas.agents.reviewer import ReviewerAgent
 from mas.config import load_config
 from mas.schemas import NodeTask
-from mas.verifier import TestVerifier, VerificationError, code_tree_hash, verify_attestation
+from mas.verifier import (
+    RUN_SECRET_NAME, TestVerifier, VerificationError, bind_run_secret,
+    code_tree_hash, verify_attestation,
+)
+import mas.verifier as verifier_module
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -98,6 +102,25 @@ class TestFreezeTests(unittest.TestCase):
         # 拒绝时不得落清单（否则半冻结状态会让下一轮误判已冻结）
         self.assertFalse((self.run_dir / "test_manifest.json").exists())
 
+    def test_freeze_collects_indirect_test_case_subclasses(self):
+        """共享夹具基类（``_Base(unittest.TestCase)`` + ``TestX(_Base)``）必须可枚举。
+
+        task11-slink-fullstack-01 实测：生成方用 ``_StoreBase(unittest.TestCase)``
+        共享 setUp，用例类继承 ``_StoreBase``；只认直接基类会把 44 个真实存在
+        的方法判成「没有可枚举用例」，与 unittest loader 的 issubclass 口径不符。
+        """
+        self.test_path.write_text(
+            '"""测试。"""\nimport unittest\n\n\n'
+            'class _Base(unittest.TestCase):\n    def setUp(self):\n        pass\n\n\n'
+            'class TestFp01(_Base):\n    def test_functional_add(self):\n'
+            '        self.assertEqual(1 + 1, 2)\n',
+            encoding="utf-8")
+        manifest = self.verifier.freeze("tests/test_all.py", 1, case_meta=[
+            {"fp_id": "FP-01", "category": "functional", "op": "add", "name": ""},
+        ])
+        self.assertEqual(manifest["test_ids"],
+                         ["tests.test_all.TestFp01.test_functional_add"])
+
     def test_freeze_rejects_empty_fp_and_bad_category_meta(self):
         self.test_path.write_text('''"""测试。"""
 import unittest
@@ -150,6 +173,51 @@ class TestFp01(unittest.TestCase):
         self.assertEqual(self.verifier.restore_if_changed(), [])
         self.verifier.freeze("tests/test_all.py", 2)
         self.assertIsNotNone(self.verifier.load_manifest())
+
+
+class RunSecretPersistenceTests(unittest.TestCase):
+    """续跑验签回归（task11-slink-fullstack-01 实测）。
+
+    旧实现 dev 模式用进程随机密钥，进程重启后已冻结清单/契约/隐藏套件全部
+    验签失败，续跑被误判为「文件被篡改」。run 级密钥必须落盘并在续跑时复用。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.run_dir = root / "run"
+        self.sandbox_root = root / "run" / "code"
+        (self.sandbox_root / "tests").mkdir(parents=True)
+        (self.sandbox_root / "tests" / "test_all.py").write_text(GOOD_TEST, encoding="utf-8")
+        self._saved_secret = verifier_module._RUN_SECRET
+        verifier_module._RUN_SECRET = None
+
+    def tearDown(self):
+        verifier_module._RUN_SECRET = self._saved_secret
+        self.tmp.cleanup()
+
+    def test_manifest_survives_simulated_restart(self):
+        bind_run_secret(self.run_dir)
+        verifier = TestVerifier(self.run_dir, self.sandbox_root)
+        verifier.freeze("tests/test_all.py", 1)
+        secret_file = self.run_dir / RUN_SECRET_NAME
+        self.assertTrue(secret_file.is_file())
+        self.assertEqual(len(secret_file.read_text(encoding="utf-8").strip()), 64)
+
+        verifier_module._RUN_SECRET = None        # 模拟进程重启：进程内状态清空
+        bind_run_secret(self.run_dir)
+        resumed = TestVerifier(self.run_dir, self.sandbox_root)
+        manifest = resumed.load_manifest()
+        self.assertIsNotNone(manifest)
+        self.assertTrue(verify_attestation(manifest))
+
+    def test_existing_run_secret_is_reused_not_rotated(self):
+        bind_run_secret(self.run_dir)
+        first = (self.run_dir / RUN_SECRET_NAME).read_text(encoding="utf-8").strip()
+        verifier_module._RUN_SECRET = None
+        bind_run_secret(self.run_dir)
+        second = (self.run_dir / RUN_SECRET_NAME).read_text(encoding="utf-8").strip()
+        self.assertEqual(first, second)
 
 
 class TestAttestationTests(unittest.TestCase):
@@ -385,6 +453,19 @@ class ReviewerBlockingRecomputeTests(unittest.TestCase):
         self.assertEqual(result["llm_verdict"], "pass")
         self.assertEqual(result["blocking_items"][0]["rule"], "eval_usage")
 
+    def test_framework_veto_prefixes_model_pass_summary(self):
+        """模型判 pass 而框架否决：摘要首行必须是否决结论（task11 实测误导时间线）。"""
+        data = {"verdict": "reject", "blocking": 38, "llm_verdict": "pass"}
+        summary = ReviewerAgent._reconciled_summary(
+            self.task, data, "reject", "结论：通过（blocking=0）")
+        self.assertTrue(summary.startswith("【框架复核否决】"), summary)
+        self.assertIn("阻塞 38 项", summary)
+        self.assertIn("模型摘要：结论：通过", summary)
+        # 模型本身判 reject：保持原文并追加框架口径
+        data2 = {"verdict": "reject", "blocking": 2, "llm_verdict": "reject"}
+        summary2 = ReviewerAgent._reconciled_summary(self.task, data2, "reject", "结论：驳回")
+        self.assertEqual(summary2, "结论：驳回（框架重算：verdict=reject，阻塞 2 项）")
+
     def test_missing_function_point_is_deterministic_blocker(self):
         self.perception.spec = {"function_points": [{"id": "FP-01"}, {"id": "FP-02"}]}
         result = self._recompute()
@@ -406,6 +487,36 @@ class ReviewerBlockingRecomputeTests(unittest.TestCase):
         self.assertEqual(result["mapping_audit"]["format"], "file::symbol")
         self.assertEqual(result["mapping_audit"]["valid"], 1)
         self.assertEqual(result["coverage"]["implemented"], 1)
+
+    def test_fp_bound_passing_case_covers_http_symbol(self):
+        """HTTP/SSR 测试经公开服务面验证时，缺少符号级 import 不应误判（task11 实测）。
+
+        冻结清单的 case_meta 把通过用例绑到 FP，是 verifier 签名的行为级证据；
+        映射符号只需在 AST 中真实定义（pkg/core.py::unused 未被测试 import）。
+        """
+        test_id = "tests.test_pkg.TestPkg.test_add"
+        (self.run_dir / "test_manifest.json").write_text(json.dumps({
+            "test_ids": [test_id],
+            "case_meta": {test_id: {"fp_id": "FP-01", "category": "functional"}},
+        }), encoding="utf-8")
+        self.perception.found["test_report"]["test_ids"] = [test_id]
+        result = self._mapping("pkg/core.py::unused")
+        self.assertEqual(result["blocking"], 0, result["blocking_items"])
+        self.assertEqual(result["mapping_audit"]["valid"], 1)
+
+    def test_fp_case_meta_mismatch_keeps_blocking(self):
+        """报告与清单用例集合不一致时不得放行（防陈旧/篡改清单）。"""
+        test_id = "tests.test_pkg.TestPkg.test_add"
+        (self.run_dir / "test_manifest.json").write_text(json.dumps({
+            "test_ids": [test_id],
+            "case_meta": {test_id: {"fp_id": "FP-01"}},
+        }), encoding="utf-8")
+        self.perception.found["test_report"]["test_ids"] = [
+            "tests.test_pkg.TestPkg.test_other"]
+        result = self._mapping("pkg/core.py::unused")
+        self.assertEqual(result["blocking"], 1)
+        self.assertEqual(result["blocking_items"][0]["rule"],
+                         "fp_mapping_not_covered_by_passing_test")
 
     def test_bare_function_name_is_invalid(self):
         """旧格式（裸函数名）不再被采信：用户实测「映射到不存在的函数也能过」。"""

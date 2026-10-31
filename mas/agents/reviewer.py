@@ -352,10 +352,9 @@ class ReviewerAgent(BaseAgent):
         # 摘要与判决对账（20261024-233917-897d 实测）：模型自报 verdict=pass/阻塞 0 时
         # summary 也写「通过，阻塞 0」，而框架重算 reject/blocking=N 才是节点真实状态——
         # node_end 里「status=fail + 摘要说通过」自相矛盾，误导时间线与前端。
-        if (task.node_id == "review" and verdict != "pass") \
-                or int(data.get("blocking", 0) or 0) > 0:
-            result.summary += (f"（框架重算：verdict={verdict}，"
-                               f"阻塞 {data.get('blocking', 0)} 项）")
+        # 2026-10-31 task11 实测：仅追加后缀时，时间线/摘要首行仍是「结论：通过」。
+        # 模型判 pass、框架否决时把否决结论放最前面，模型原文作为附注保留。
+        result.summary = self._reconciled_summary(task, data, verdict, result.summary)
         result.events = ["review_passed" if verdict == "pass" else "review_rejected"]
         result.broadcast_payload = {
             "verdict": verdict,
@@ -373,6 +372,20 @@ class ReviewerAgent(BaseAgent):
             },
             refs=[f"artifacts/{artifact_name}"],
         )
+
+    @staticmethod
+    def _reconciled_summary(
+        task: NodeTask, data: Dict[str, Any], verdict: str, summary: str,
+    ) -> str:
+        """把框架重算结论与模型摘要对齐（模型判 pass 而框架否决时否决结论置顶）。"""
+        if not ((task.node_id == "review" and verdict != "pass")
+                or int(data.get("blocking", 0) or 0) > 0):
+            return summary
+        framework_note = f"verdict={verdict}，阻塞 {data.get('blocking', 0)} 项"
+        model_verdict = str(data.get("llm_verdict") or "")
+        if task.node_id == "review" and model_verdict == "pass" and verdict != "pass":
+            return f"【框架复核否决】{framework_note}；模型摘要：{summary}"
+        return summary + f"（框架重算：{framework_note}）"
 
     # ---------------------------------------------------------------- 功能点映射审计
     def _read_code_text(self, relative: str) -> Optional[str]:
@@ -522,14 +535,41 @@ class ReviewerAgent(BaseAgent):
                 return path
         return ""
 
+    def _attested_fp_ids(self, test_report: Dict[str, Any]) -> Set[str]:
+        """冻结清单中「有通过用例绑定」的功能点 id（行为级覆盖证据）。
+
+        HTTP/SSR 交付的冻结测试经公开服务面（create_server + 真实 HTTP 请求）
+        验证行为，不必然 import 内部 handler；只看符号级 import 会把正确实现
+        误判为未覆盖（task11-slink-fullstack-01 实测 FP-03/04/05/07）。清单的
+        case_meta 是 tester 生成、verifier 签名并实际执行的 fp_id 绑定，可作为
+        行为级证据。报告 test_ids 与清单用例集合不一致时保守返回空集（维持
+        原有严格口径），避免把陈旧/篡改清单当成放行依据。
+        """
+        run_dir = getattr(self.ctx, "run_dir", None)
+        if run_dir is None:
+            return set()
+        try:
+            manifest = json.loads(
+                (Path(run_dir) / "test_manifest.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+        case_meta = manifest.get("case_meta") or {}
+        attested = {str(item) for item in (test_report.get("test_ids") or [])}
+        if not attested or set(case_meta) != attested:
+            return set()
+        return {str(meta.get("fp_id") or "") for meta in case_meta.values()
+                if isinstance(meta, dict) and meta.get("fp_id")}
+
     def _audit_fp_mapping(
         self, perception: Perception
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
         """把 fp_mapping 从「自报 key 列表」升级为可核验的符号级证据。
 
         每个功能点必须：value 严格为 ``file::symbol`` → 文件在交付清单且真实存在
-        → 符号在 AST 中被定义 → 该符号被至少一个**通过的冻结测试** import 并使用。
-        任何一步失败都生成 critical finding，由 ``_recompute_blocking`` 计为阻塞。
+        → 符号在 AST 中被定义 → 该符号被至少一个**通过的冻结测试** import 并使用，
+        或该功能点在冻结清单中有通过用例（case_meta 的 fp_id 绑定；HTTP/SSR 测试
+        经公开服务面验证，不 import 内部 handler）。任何一步失败都生成 critical
+        finding，由 ``_recompute_blocking`` 计为阻塞。
         """
         manifest = perception.found.get("code_manifest") or {}
         mapping = manifest.get("fp_mapping") or {}
@@ -547,6 +587,7 @@ class ReviewerAgent(BaseAgent):
             total, failed = 0, 1
         tests_ok = total > 0 and failed == 0 and attestation.get("valid") is True
         tests = self._frozen_test_sources() if tests_ok else {}
+        attested_fps = self._attested_fp_ids(test_report) if tests_ok else set()
 
         findings: List[Dict[str, Any]] = []
         invalid: List[Dict[str, str]] = []
@@ -605,9 +646,10 @@ class ReviewerAgent(BaseAgent):
                 continue
             if tests_ok:
                 covered = self._covered_by_tests(tests, self._export_modules(file, symbol.split(".")[0]), symbol)
-                if not covered:
+                if not covered and fp_id not in attested_fps:
                     add("fp_mapping_not_covered_by_passing_test", fp_id, file,
-                        f"功能点 {fp_id} 的符号 {symbol} 未被任何通过的冻结测试 import/使用")
+                        f"功能点 {fp_id} 的符号 {symbol} 未被任何通过的冻结测试 import/使用，"
+                        "且该功能点没有通过用例绑定")
                     continue
             valid += 1
 

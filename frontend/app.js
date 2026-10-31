@@ -222,8 +222,25 @@ function renderRunDetail(detail, openTraces = []) {
          title="终止该任务：立即中断当前模型调用并停止后续步骤（不含模型调用的执行段跑完后停止），运行标记为「已终止」，不做验收判定">${cancelPending ? "终止中…（正在中断当前步骤）" : "■ 终止任务"}</button></div>`
     : "";
 
+  // 产物目录直达（docs/42）：优先 artifacts/（各节点产物本体），未生成时回退 run 目录
+  const art = detail.artifact_dir || null;
+  const artifactBar = art
+    ? `<div class="artifact-dir">
+        <span class="artifact-dir-label">产物目录</span>
+        <a href="#" class="artifact-dir-link" id="open-artifact-dir"
+           data-run="${escapeHtml(detailRunId)}"
+           title="在系统文件管理器中定位本次运行的产物目录">打开目录</a>
+        <code class="artifact-dir-path" title="${escapeHtml(art.path)}">${escapeHtml(art.path)}</code>
+        <button class="ghost" id="copy-artifact-dir" data-path="${escapeHtml(art.path)}"
+           title="复制该绝对路径（无法直接打开文件夹时用它手动定位）">复制路径</button>
+        <span class="artifact-dir-meta${art.exists ? "" : " warn"}">${
+          art.exists ? `${art.item_count} 个条目` : "目录尚未生成"}</span>
+      </div>`
+    : "";
+
   $("#run-detail").innerHTML = `
     ${cancelBar}
+    ${artifactBar}
     <div class="cards">${cards
       .map(([label, value, cls]) => `<div class="card"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`)
       .join("")}</div>
@@ -293,6 +310,69 @@ async function cancelRun(runId) {
 $("#run-detail").addEventListener("click", (ev) => {
   const btn = ev.target.closest("#cancel-run");
   if (btn && btn.dataset.run) cancelRun(btn.dataset.run);
+});
+
+/* ---------------- 产物目录直达（docs/42）----------------
+   「打开目录」不是跳 file:// ——浏览器禁止 http(s) 页面导航到本地文件（Chrome 直接报
+   Not allowed to load local resource），因此点击后请求 POST /api/run/open：由与产物同机
+   的面板进程调用系统文件管理器定位目录。若环境不支持（远程部署/无桌面），接口返回
+   opened=false，此处提示用户复制下方真实绝对路径手动定位。 */
+async function openArtifactDir(runId) {
+  if (!runId) return;
+  try {
+    const res = await fetch(API_BASE + "/api/run/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setComposerStatus(data.error || "打开产物目录失败", "error");
+      return;
+    }
+    if (data.opened) {
+      setComposerStatus(`已在文件管理器中打开产物目录：${data.path}`, "done");
+    } else {
+      setComposerStatus(
+        `${data.reason || "无法直接打开文件夹"}，请复制下方路径手动定位：${data.path}`, "error");
+    }
+  } catch (err) {
+    setComposerStatus(`打开产物目录失败：${err.message}`, "error");
+  }
+}
+
+/* 复制产物目录绝对路径：Clipboard API 仅在安全上下文可用（https 或 localhost），
+   其余环境降级为临时 textarea + execCommand，保证「一键复制」在任何部署下都有退路。 */
+async function copyArtifactPath(path) {
+  if (!path) return;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(path);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = path;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    setComposerStatus(`已复制产物目录路径：${path}`, "done");
+  } catch (err) {
+    setComposerStatus(`复制失败：${err.message}`, "error");
+  }
+}
+
+$("#run-detail").addEventListener("click", (ev) => {
+  const link = ev.target.closest("#open-artifact-dir");
+  if (link) {
+    ev.preventDefault();          // href 只是占位（#），真实动作是下面的接口调用
+    openArtifactDir(link.dataset.run);
+    return;
+  }
+  const copyBtn = ev.target.closest("#copy-artifact-dir");
+  if (copyBtn) copyArtifactPath(copyBtn.dataset.path);
 });
 
 /* ---------------- 执行步骤（从事件流提炼） ---------------- */

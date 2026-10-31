@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 from ..contract import (
@@ -366,9 +368,34 @@ class ProductAgent(BaseAgent):
         # hidden_case_missing:FP-14 判 fail（整轮 1690s 作废）；同类错误还包括
         # 方法名非法、断言为空——这些都是「输出没对齐协议」，不是需求不可实现。
         max_attempts = max(1, int(self.ctx.config.runtime.get("hidden_suite_max_attempts", 2) or 2))
+        # 调用预算（2026-10-31 task11 实测）：隐藏用例生成的单次请求受
+        # llm.stream_total_timeout=1800s 约束，叠加内部重试(3)×max_attempts(3) 后
+        # 首轮实测挂了 69.9 分钟。这里给「单次尝试」与「整个生成」两级墙钟预算，
+        # 并收紧内部网络重试次数；超预算如实判失败，不再无限等待。
+        single_budget = float(self.ctx.config.runtime.get("hidden_suite_stream_timeout_s", 900) or 0)
+        total_budget = float(self.ctx.config.runtime.get("hidden_suite_total_budget_s", 2700) or 0)
+        call_retry_attempts = max(
+            1, int(self.ctx.config.runtime.get("hidden_suite_retry_attempts", 2) or 2))
+        generation_deadline = time.monotonic() + total_budget if total_budget > 0 else None
+        attempt_log: List[Dict[str, Any]] = []
         attempt = 1
         repaired: List[str] = []
         while True:
+            remaining_total = (None if generation_deadline is None
+                               else generation_deadline - time.monotonic())
+            if remaining_total is not None and remaining_total <= 0:
+                result.status = "fail"
+                result.error = (f"隐藏用例生成超出总预算 {total_budget:.0f}s，"
+                                f"放弃第 {attempt} 次尝试")
+                result.summary = result.error
+                self.ctx.events.emit(
+                    "hidden_suite_budget_exhausted", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="error",
+                    payload={"total_budget_s": total_budget, "attempt": attempt,
+                             "attempts": attempt_log,
+                             "note": "生成总预算耗尽：按失败落账，避免单节点无上限占用"},
+                )
+                return None
             prompt_user = user
             prompt_path = base_prompt_path
             if attempt > 1:
@@ -383,15 +410,42 @@ class ProductAgent(BaseAgent):
                 token_estimate=(len(system) + len(prompt_user)) // 3,
                 path=prompt_path,
             )
+            budget = single_budget if single_budget > 0 else None
+            if remaining_total is not None:
+                budget = remaining_total if budget is None else min(budget, remaining_total)
+            budget_ctx = (
+                self.ctx.llm.call_budget(budget, retry_attempts=call_retry_attempts)
+                if hasattr(self.ctx.llm, "call_budget") else nullcontext())
+            started = time.monotonic()
             try:
-                generation = self.ctx.llm.generate("hidden_test_suite", bundle, context)
+                with budget_ctx:
+                    generation = self.ctx.llm.generate("hidden_test_suite", bundle, context)
             except Exception as exc:  # noqa: BLE001 - 生成失败必须让节点明确失败
                 result.status = "fail"
                 result.error = f"隐藏用例生成失败: {type(exc).__name__}: {exc}"
                 result.summary = result.error
                 return None
+            # 逐次留痕：此前只保留最后一次 metrics，失败尝试的耗时/token 全部丢失
+            # （task11 首轮 69.9 分钟只能靠时间戳反推）。
+            self._trace_llm(task, bundle, generation, error=generation.error,
+                            task_kind="hidden_test_suite")
+            attempt_log.append({
+                "attempt": attempt,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "latency_ms": generation.latency_ms,
+                "tokens": generation.tokens,
+                "completion_tokens": generation.completion_tokens,
+                "reasoning_tokens": generation.reasoning_tokens,
+                "finish_reason": generation.finish_reason,
+                "timed_out": bool(generation.timed_out),
+                "error": str(generation.error or "")[:300],
+            })
             result.metrics["hidden_generation"] = generation.to_dict()
             result.metrics["hidden_generation_attempts"] = attempt
+            result.metrics["hidden_generation_attempts_detail"] = list(attempt_log)
+            result.metrics["hidden_generation_elapsed_ms"] = sum(
+                int(item.get("elapsed_ms") or 0) for item in attempt_log
+            )
             if generation.error or generation.data is None:
                 result.status = "fail"
                 result.error = generation.error or "隐藏用例生成未返回可解析的 JSON"

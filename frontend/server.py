@@ -13,7 +13,9 @@
 
 API：
     GET /api/runs                    运行列表（含摘要指标）
-    GET /api/run?id=<run_id>         运行详情（摘要 + 事件流 + 验收报告 + 时间线）
+    GET /api/run?id=<run_id>         运行详情（摘要 + 事件流 + 验收报告 + 时间线 + 产物目录 artifact_dir）
+    GET /api/run/artifacts?id=<id>    本次运行产物目录的真实绝对路径（校验存在性，不存在时 exists=false）
+    POST /api/run/open                在面板所在机器的文件管理器中打开产物目录（打开失败返回路径供复制）
     GET /api/experience              分级经验库
     GET /api/metrics                 每轮效果指标
     GET /api/learning-report         自学习效果报告（Markdown）
@@ -48,6 +50,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -265,7 +268,78 @@ def load_run_detail(workspace: Path, run_id: str) -> dict | None:
         "llm_traces": read_jsonl(run_dir / "llm_traces.jsonl"),
         "report": report_path.read_text(encoding="utf-8") if report_path.exists() else "",
         "timeline": timeline_path.read_text(encoding="utf-8") if timeline_path.exists() else "",
+        # 产物目录直达（docs/42）：随详情一并下发，前端不必再单独请求
+        "artifact_dir": resolve_artifact_dir(workspace, run_id),
     }
+
+
+# ---------------- 产物目录直达（docs/42） ----------------
+# 「产物目录」= 本次运行落盘产物的位置：默认 ``run_dir/artifacts``（Blackboard 写入各节点
+# 产物，如 requirement_contract / code_manifest / acceptance_report）；该目录尚未生成时
+# （运行刚入队、流水线未产出任何产物）回退到 ``run_dir`` 本身，由前端按 exists 展示。
+ARTIFACT_SUBDIR = "artifacts"
+
+
+def resolve_artifact_dir(workspace: Path, run_id: str) -> dict:
+    """解析一次运行的产物目录：返回真实绝对路径，并**校验该目录确实存在**。
+
+    ``path`` 是 ``Path.resolve()`` 后的绝对路径（展开 ``..`` 与符号链接），不是拼接出来的
+    应然路径；目录不存在时仍返回应然路径并把 ``exists`` 置 False，供前端退化成
+    「展示路径 + 一键复制」，不谎报目录已生成。run_id 不存在时抛 ValueError（调用方
+    ``normalize_run_id`` 已挡住路径穿越，此处只挡「压根没这次运行」）。
+    """
+    run_dir = (workspace / "runs" / run_id).resolve()
+    if not run_dir.is_dir():
+        raise ValueError(f"run 不存在: {run_id}")
+    artifacts_dir = run_dir / ARTIFACT_SUBDIR
+    target = artifacts_dir if artifacts_dir.is_dir() else run_dir
+    exists = target.is_dir()
+    try:
+        item_count = len(list(target.iterdir())) if exists else 0
+    except OSError:
+        item_count = 0
+    return {
+        "run_id": run_id,
+        "path": str(target),
+        "exists": exists,
+        "run_dir": str(run_dir),
+        "is_artifacts_dir": target == artifacts_dir,
+        "item_count": item_count,
+    }
+
+
+def reveal_in_file_manager(path: str) -> tuple[bool, str]:
+    """调用系统文件管理器定位目录：Windows=explorer，macOS=open，Linux=xdg-open。
+
+    返回 ``(是否成功调用, 失败原因)``。注意这只是在**面板进程所在机器**上发起打开动作，
+    远程部署或无桌面环境下可能静默无效或抛错——因此调用方必须把真实路径一并返回。
+    """
+    startfile = getattr(os, "startfile", None)          # 仅 Windows 存在
+    try:
+        if startfile is not None:
+            startfile(path)
+            return True, ""
+        cmd = ["open"] if sys.platform == "darwin" else ["xdg-open"]
+        subprocess.Popen(cmd + [path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True, ""
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        return False, f"环境不支持直接打开文件夹（{exc}）"
+
+
+def open_artifact_dir(workspace: Path, run_id: str) -> dict:
+    """在文件管理器中打开本次运行的产物目录（前端「产物目录」链接的实际动作）。
+
+    浏览器禁止 http(s) 页面导航到 ``file://``（Chrome 报 Not allowed to load local
+    resource），所以点击链接不是跳 file://，而是请求本接口：由与产物同机的面板进程
+    调用系统文件管理器打开。打开失败（远程部署/无桌面/无 xdg-open）时 ``opened=False``
+    且带 ``reason``，路径照常返回——前端据此退化为「展示真实绝对路径 + 一键复制」。
+    """
+    info = resolve_artifact_dir(workspace, run_id)
+    if not info["exists"]:
+        return {**info, "opened": False, "reason": "产物目录尚未生成"}
+    opened, reason = reveal_in_file_manager(info["path"])
+    return {**info, "opened": opened, "reason": reason}
 
 
 VALID_PROVIDERS = {"offline", "openai_compatible"}
@@ -1183,6 +1257,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": f"run 不存在: {run_id}"}, 404)
             else:
                 self._send_json(detail)
+        # 产物目录直达（docs/42）：返回真实绝对路径 + 存在性校验结果
+        elif route == "/api/run/artifacts":
+            try:
+                run_id = normalize_run_id((query.get("id") or [""])[0])
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            try:
+                self._send_json(resolve_artifact_dir(self.workspace, run_id))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 404)
         elif route == "/api/experience":
             self._send_json(read_jsonl(self.workspace / "knowledge" / "experience.jsonl"))
         elif route == "/api/metrics":
@@ -1221,9 +1306,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.token and not self._origin_allowed():
             self._send_json({"error": "拒绝跨站请求：Origin 不在允许列表"}, 403)
             return
-        if parsed.path not in ("/api/run", "/api/run/cancel", "/api/upload", "/api/upload/remove",
-                               "/api/upload_image", "/api/llm", "/api/llm/test", "/api/skills",
-                               "/api/tools", "/api/react", "/api/websearch"):
+        if parsed.path not in ("/api/run", "/api/run/cancel", "/api/run/open", "/api/upload",
+                               "/api/upload/remove", "/api/upload_image", "/api/llm",
+                               "/api/llm/test", "/api/skills", "/api/tools", "/api/react",
+                               "/api/websearch"):
             self._send_text("not found", 404)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -1241,6 +1327,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(cancel_run(run_id))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 404)
+            return
+        # 产物目录直达（docs/42）：在系统文件管理器中打开；打不开也返回真实路径供复制
+        if parsed.path == "/api/run/open":
+            try:
+                run_id = normalize_run_id(data.get("run_id"))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            try:
+                self._send_json(open_artifact_dir(self.workspace, run_id))
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, 404)
             return

@@ -48,8 +48,8 @@ from .sandbox import Sandbox
 from .schemas import AgentContext, AgentResult, NodeTask
 from .skills import build_tool_schema, list_skills, load_run_facts, run_skill_script
 from .verifier import (
-    TestVerifier, VerificationError, code_tree_hash, require_release_profile,
-    require_signing_secret, verify_signed,
+    TestVerifier, VerificationError, bind_run_secret, code_tree_hash,
+    require_release_profile, require_signing_secret, verify_signed,
 )
 from .verify.exec import execute_hidden_suite
 
@@ -426,6 +426,11 @@ class Leader:
         run_dir = self.config.runs_dir / run_id
         for sub in ("input", "code", "reports", "evidence"):
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
+        # 签名密钥必须先于任何节点绑定：契约/隐藏套件/测试清单/凭证都签在同一把
+        # run 级密钥上，崩溃续跑才能继续验签（dev 持久化到 run 目录，release 用
+        # MAS_VERIFIER_SECRET）。放在此处而不是 TestVerifier 构造时，避免 intake
+        # 先用进程随机密钥签契约、后续再换钥导致自相矛盾。
+        bind_run_secret(run_dir, self.config)
 
         checkpoint_path = self._checkpoint_path(run_dir)
         resume_state = self._load_checkpoint(checkpoint_path, run_id) if resume else None
@@ -1560,12 +1565,15 @@ class Leader:
         if not changed:
             return
         open_count = sum(1 for item in items if item.get("status") == "open")
+        blocked_count = sum(1 for item in items if item.get("status") == "blocked")
         report = {
             "items": items,
-            "total": len(items),
+            # 与 tester._track_bugs 同口径：blocked 是「未能验证」，不计入缺陷总数
+            "total": len(items) - blocked_count,
             "open": open_count,
             "fixed": sum(1 for item in items if item.get("status") == "fixed"),
             "closed": sum(1 for item in items if item.get("status") == "closed"),
+            "blocked": blocked_count,
             "new": 0,
         }
         # 本轮 criteria 还没求值：就地把最新缺陷池写回门禁快照，否则
@@ -2288,11 +2296,17 @@ class Leader:
         return source in self.config.collaboration.rollback
 
     #: 「回退也无法修复」的失败信号：事件类型 -> 归因描述。与 tester 的证据源一一对应：
-    #: ``test_verification_gap``（交付形态要求的验证通道未接入）/ ``test_environment_gap``
-    #: （测试依赖的外部工具链本机缺失）。两者都发生在证据源而非交付物，退回研发改代码无法消除。
+    #: ``test_verification_gap``（交付形态要求的验证通道未接入）/
+    #: ``test_environment_gap``（测试依赖的外部工具链本机确实缺失）/
+    #: ``test_delivery_unverifiable``（测试文件绕过白名单或交付语言不可执行，交付物无法被验证）/
+    #: ``test_suite_defect``（测试文件自身违反执行协议）。四类都发生在证据源而非交付物，
+    #: 退回研发改代码无法消除。事件必须按根因分类发出：task12-foodlink-spa-03 实测把
+    #: npm 绕过白名单记成「外部工具链缺失」，报告据此给出「把 npm 加入白名单」的错误建议。
     _UNFIXABLE_FAILURE_EVENTS = {
         "test_verification_gap": "验证口径/证据通道缺口",
         "test_environment_gap": "测试执行依赖的外部工具链缺失",
+        "test_delivery_unverifiable": "交付物无法被现有验证通道验证",
+        "test_suite_defect": "测试套件自身违反执行协议",
     }
 
     def _unfixable_failure_reason(self, ctx: AgentContext, node_id: str, iteration: int) -> str:

@@ -223,6 +223,16 @@ class CoverageGateTests(unittest.TestCase):
         self.assertIn("case_bad_category:test_smoke_ghost_one:smoke", gaps)
         self.assertIn("case_without_method:test_smoke_ghost_one", gaps)
 
+    def test_binding_gaps_accepts_indirect_test_case_base(self):
+        """共享基类间接继承 TestCase 时，方法仍应正确绑定（task11 实测）。"""
+        content = _suite_file(_FULL_CASES).replace(
+            "class TestAll(unittest.TestCase):",
+            "class _Base(unittest.TestCase):\n    def setUp(self):\n        pass\n\n\n"
+            "class TestAll(_Base):")
+        files = [{"path": "tests/test_all.py", "content": content}]
+        self.assertEqual(
+            self.agent._binding_gaps(files, _FULL_CASES, ["FP-01", "FP-02"]), [])
+
     def test_clear_foreign_tests_before_first_freeze(self):
         """研发自测文件（can_write_tests=true）不得被首个冻结扫进清单。
 

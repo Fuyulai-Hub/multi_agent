@@ -143,15 +143,6 @@ def _assertion_count(files: Iterable[Dict[str, str]]) -> int:
     return count
 
 
-def _is_test_case(node: ast.ClassDef) -> bool:
-    """与 verifier._is_test_case 同一口径：直接继承 ``*TestCase`` 才算。"""
-    for base in node.bases:
-        name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
-        if str(name).endswith("TestCase"):
-            return True
-    return False
-
-
 def _collect_test_methods(
     files: Iterable[Dict[str, str]],
 ) -> Tuple[set, List[str]]:
@@ -170,14 +161,55 @@ def _collect_test_methods(
         except SyntaxError as exc:
             errors.append(f"hidden_file_syntax_error:{item['path']}:{exc.msg}")
             continue
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef) or not _is_test_case(node):
-                continue
-            for child in node.body:
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                        and child.name.startswith("test"):
-                    methods.add(child.name)
+        for _class_name, method_name in TestVerifier.iter_test_methods(tree):
+            methods.add(method_name)
     return methods, errors
+
+
+def _reconcile_method_names(
+    expected: set, defined: set, files: Iterable[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """把「只差前后缀」的测试方法名对齐到 cases 声明的名字（确定性、无 LLM）。
+
+    背景（task12-foodlink-spa-01 实测）：19 个功能点的隐藏套件在第三次生成时内容已
+    完整（39 条用例、25KB 测试文件），但 3 个方法名与 cases 只差一个后缀——
+    ``..._listing`` vs ``..._listing_success``、``..._present`` vs ``..._present_present``。
+    校验器因此把整份套件判死，三次尝试共耗 52 分钟，全部是命名对齐问题而不是验证内容。
+
+    这里只处理**唯一候选且一方是另一方前缀**的情况，且只在源码里改 ``def`` 名一行，
+    不动测试体与断言；找不到唯一候选时保持原错误，交给重生成。这样既不放宽依赖
+    「方法名一一对应」的签名口径，也不允许模糊匹配掩盖真正缺失的用例。
+    """
+    missing = {name for name in expected if name not in defined}
+    extras = {name for name in defined if name not in expected}
+    if not missing or not extras:
+        return []
+    renamed: List[Dict[str, str]] = []
+    for target in sorted(missing):
+        candidates = [
+            name for name in sorted(extras)
+            if target.startswith(name) or name.startswith(target)
+        ]
+        if len(candidates) != 1:
+            continue
+        source = candidates[0]
+        pattern = re.compile(r"(?m)^(\s*def\s+)" + re.escape(source) + r"(\s*\()")
+        hits = 0
+        for item in files:
+            content = str(item.get("content") or "")
+            new_content, count = pattern.subn(r"\1" + target + r"\2", content)
+            if count:
+                item["content"] = new_content
+                hits += count
+        if hits != 1:
+            # 重命名失败（0 次=源码里没有可替换的 def 行；多次=重复定义）时不动任何状态
+            continue
+        defined.discard(source)
+        defined.add(target)
+        extras.discard(source)
+        missing.discard(target)
+        renamed.append({"from": source, "to": target})
+    return renamed
 
 
 def validate_generated_suite(
@@ -244,6 +276,7 @@ def validate_generated_suite(
             # 协议若只要求「功能类 FP 写 functional」，异常/边界 FP 只写 exception/
             # boundary 用例会在验收时才暴露缺口——此时整条流水线已跑完，代价最大。
             errors.append(f"hidden_functional_case_missing:{fp_id}")
+    reconciled: List[Dict[str, str]] = []
     if files:
         defined, syntax_errors = _collect_test_methods(files)
         errors.extend(syntax_errors)
@@ -251,6 +284,11 @@ def validate_generated_suite(
             errors.append("hidden_suite_no_test_methods")
         else:
             expected = {_method_for(case) for case in cases}
+            reconciled = _reconcile_method_names(expected, defined, files)
+            if reconciled:
+                # 源码已被改动：重新做一次 AST 枚举，防止正则替换引入语法错误
+                defined, syntax_errors = _collect_test_methods(files)
+                errors.extend(syntax_errors)
             for method in sorted(expected - defined):
                 errors.append(f"hidden_case_method_missing:{method}")
             for method in sorted(defined - expected):
@@ -258,7 +296,8 @@ def validate_generated_suite(
         if _assertion_count(files) == 0:
             errors.append("hidden_suite_has_no_assertions")
 
-    return {"errors": list(dict.fromkeys(errors)), "files": files, "cases": cases}
+    return {"errors": list(dict.fromkeys(errors)), "files": files, "cases": cases,
+            "reconciled": reconciled}
 
 
 def _artifact(
@@ -268,6 +307,7 @@ def _artifact(
     contract_hash: str,
     package: str,
     generation: Dict[str, Any],
+    reconciled: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     return {
         "root": str(root),
@@ -284,6 +324,7 @@ def _artifact(
         "package": package,
         "derived_from": "frozen-requirement-contract",
         "generation": dict(generation or {}),
+        "reconciled_methods": list(reconciled or []),
         "limitations": (
             "隐藏套件由独立上下文仅依据冻结契约生成；生成与执行证据保留，"
             "但未做行覆盖率/变异测试，覆盖口径是功能点绑定。"
@@ -326,7 +367,8 @@ def create_hidden_suite(
         if str(meta.get("contract_hash") or "") != str(contract_hash):
             raise HiddenSuiteError("隐藏套件与当前需求契约不一致（契约冻结后不得更换隐藏套件）")
         return _artifact(root=root, manifest=existing, contract_hash=contract_hash,
-                         package=package, generation=meta.get("generation") or generation or {})
+                         package=package, generation=meta.get("generation") or generation or {},
+                         reconciled=meta.get("reconciled_methods") or [])
 
     outcome = validate_generated_suite(data, spec)
     if outcome["errors"]:
@@ -373,8 +415,10 @@ def create_hidden_suite(
         "package": package,
         "frozen_at": str(manifest.get("frozen_at") or ""),
         "generation": dict(generation or {}),
+        "reconciled_methods": list(outcome.get("reconciled") or []),
     }, config=config)
     (root / "hidden_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return _artifact(root=root, manifest=manifest, contract_hash=contract_hash,
-                     package=package, generation=generation or {})
+                     package=package, generation=generation or {},
+                     reconciled=outcome.get("reconciled") or [])

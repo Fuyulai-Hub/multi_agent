@@ -127,6 +127,95 @@ class RunnerAuthorityTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
 
 
+CLASS_FIXTURE_SUITE = '''"""类级夹具：只有经过 TestSuite.run 才会执行 setUpClass。"""
+import unittest
+
+
+class TestFp01(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.resource = {"ready": True}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.resource.clear()
+
+    def test_functional_uses_fixture(self):
+        self.assertTrue(self.resource["ready"])
+
+    def test_smoke_uses_fixture(self):
+        self.assertEqual(sorted(self.resource), ["ready"])
+'''
+
+
+class RunnerClassFixtureTests(unittest.TestCase):
+    """回归：逐条 test.run() 会绕过 setUpClass（task11 实测 14/49 假失败）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "code"
+        (self.root / "tests").mkdir(parents=True)
+        self.suite_path = self.root / "tests" / "test_all.py"
+        self.manifest_path = Path(self.tmp.name) / "test_manifest.json"
+        self.out_path = Path(self.tmp.name) / "evidence" / "runner_result.json"
+        self.ids = [
+            "tests.test_all.TestFp01.test_functional_uses_fixture",
+            "tests.test_all.TestFp01.test_smoke_uses_fixture",
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, source):
+        self.suite_path.write_text(source, encoding="utf-8")
+        self.manifest_path.write_text(json.dumps({
+            "version": 2,
+            "test_file": "tests/test_all.py",
+            "files": {"tests/test_all.py": "sha"},
+            "digest": "digest-1",
+            "test_ids": self.ids,
+            "case_meta": {
+                test_id: {"fp_id": "FP-01", "category": test_id.rsplit(".", 1)[-1].split("_")[1]}
+                for test_id in self.ids
+            },
+        }), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(RUNNER), "--manifest", str(self.manifest_path),
+             "--root", str(self.root), "--out", str(self.out_path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        return proc, json.loads(self.out_path.read_text(encoding="utf-8"))
+
+    def test_class_fixtures_run_once_around_manifest_cases(self):
+        proc, data = self._run(CLASS_FIXTURE_SUITE)
+        statuses = {case["test_id"]: case["status"] for case in data["cases"]}
+        self.assertEqual(statuses, {test_id: "passed" for test_id in self.ids})
+        self.assertEqual(data["failed"], 0)
+        self.assertEqual(proc.returncode, 0)
+
+    def test_failing_setup_class_is_attributed_to_its_cases(self):
+        proc, data = self._run(CLASS_FIXTURE_SUITE.replace(
+            'cls.resource = {"ready": True}',
+            'raise RuntimeError("fixture boom")'))
+        self.assertEqual(data["total"], 2)
+        for case in data["cases"]:
+            self.assertEqual(case["status"], "error")
+            self.assertIn("setUpClass", case["failure"])
+            self.assertIn("fixture boom", case["failure"])
+        self.assertEqual(proc.returncode, 1)
+
+    def test_failing_teardown_class_is_not_silently_passed(self):
+        proc, data = self._run(CLASS_FIXTURE_SUITE.replace(
+            'cls.resource.clear()',
+            'raise RuntimeError("teardown boom")'))
+        statuses = [case["status"] for case in data["cases"]]
+        self.assertIn("error", statuses)
+        tail = data["cases"][-1]
+        self.assertEqual(tail["status"], "error")
+        self.assertIn("tearDownClass", tail["failure"])
+        self.assertEqual(proc.returncode, 1)
+
+
 INTEGRATION_SUITE = '''"""集成用例。"""
 import unittest
 
