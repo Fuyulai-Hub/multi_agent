@@ -88,9 +88,16 @@ _RELEASE_PROFILES = {"", "full", "strict"}
 _TRUTHY_VALUES = {"1", "true", "yes", "on"}
 # code_hash 的证据范围：交付代码，不含测试/框架 runner/缓存。tests 目录无论嵌套在哪层
 # 都排除（测试套件由 suite hash 单独绑定）。
+# node_modules（2026-11-03，task12-foodlink-spa-03 真实全链路复跑）：node 交付物必须
+# 先 `npm install` 才能 `npm run start:dev`（交付物 README 的启动步骤），而依赖目录是
+# 第三方产物、不是交付源码。实测一次安装就往沙箱根里落 43152 个文件，把它们计入 code_hash
+# 会让「补齐环境」本身把证据链打成 code_hash_mismatch——门禁重算必然与 attest 时不一致，
+# 于是所有 node 交付物无论测试是否通过都过不了门禁。排除项按依赖目录名匹配（任意层级）。
+# 取舍：藏在 node_modules 里的自有代码不再受 code_hash 保护，但它在依赖目录内、
+# 由 npm 生态负责，与 __pycache__/dist 同类；静态分析与测试仍可读取这些文件。
 _CODE_EXCLUDED_DIRS = {
     "tests", ".mas_verify", "__pycache__", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".git",
+    ".ruff_cache", ".git", "node_modules",
 }
 _CODE_EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 

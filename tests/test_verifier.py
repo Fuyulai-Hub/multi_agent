@@ -582,5 +582,47 @@ class ReviewerBlockingRecomputeTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "reject")
 
 
+class CodeHashScopeTests(unittest.TestCase):
+    """code_hash 的证据范围：依赖安装目录不算交付源码（2026-11-03 task12 复跑）。
+
+    node 交付物必须先 `npm install` 才能起服务；实测一次安装往沙箱根里落 43152 个文件，
+    若计入 code_hash，「补齐环境」本身就等于把证据链打成 code_hash_mismatch。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.code = Path(self.tmp.name) / "code"
+        (self.code / "backend" / "src").mkdir(parents=True)
+        (self.code / "backend" / "src" / "main.ts").write_text("export const a = 1;\n",
+                                                               encoding="utf-8")
+        (self.code / "backend" / "package.json").write_text('{"name":"b"}\n', encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_dependency_dir_is_excluded_at_any_depth(self):
+        before = code_tree_hash(self.code)
+        dep = self.code / "backend" / "node_modules" / "@nestjs" / "core"
+        dep.mkdir(parents=True)
+        (dep / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+        (self.code / "frontend" / "node_modules").mkdir(parents=True)
+        (self.code / "frontend" / "node_modules" / "vue.js").write_text("x\n", encoding="utf-8")
+        self.assertEqual(code_tree_hash(self.code), before,
+                         "npm install 的依赖文件不得进入 code_hash")
+
+    def test_authored_manifest_still_bound(self):
+        """package.json 是交付物自己写的，必须仍被 code_hash 绑定。"""
+        before = code_tree_hash(self.code)
+        (self.code / "backend" / "package.json").write_text('{"name":"b","v":2}\n',
+                                                            encoding="utf-8")
+        self.assertNotEqual(code_tree_hash(self.code), before)
+
+    def test_exclusion_covers_only_the_dependency_directory(self):
+        """排除按目录名匹配整段路径，不误伤 src 里的同名普通文件。"""
+        before = code_tree_hash(self.code)
+        (self.code / "backend" / "src" / "node_modules_doc.ts").write_text("x\n", encoding="utf-8")
+        self.assertNotEqual(code_tree_hash(self.code), before)
+
+
 if __name__ == "__main__":
     unittest.main()

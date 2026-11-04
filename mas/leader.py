@@ -2298,16 +2298,25 @@ class Leader:
     #: 「回退也无法修复」的失败信号：事件类型 -> 归因描述。与 tester 的证据源一一对应：
     #: ``test_verification_gap``（交付形态要求的验证通道未接入）/
     #: ``test_environment_gap``（测试依赖的外部工具链本机确实缺失）/
-    #: ``test_delivery_unverifiable``（测试文件绕过白名单或交付语言不可执行，交付物无法被验证）/
+    #: ``test_delivery_unverifiable``（交付语言不可执行且无任何可用工具链映射）/
     #: ``test_suite_defect``（测试文件自身违反执行协议）。四类都发生在证据源而非交付物，
     #: 退回研发改代码无法消除。事件必须按根因分类发出：task12-foodlink-spa-03 实测把
     #: npm 绕过白名单记成「外部工具链缺失」，报告据此给出「把 npm 加入白名单」的错误建议。
+    #:
+    #: 例外（2026-11-03 复盘修正）：``test_suite_defect`` 是**可修**的——修的人是 tester
+    #: 自己，不是研发。tester 在同一节点内 invalidate 冻结套件后会发
+    #: ``test_freeze_invalidated``，此时下一轮测试节点会重新生成，修复通道是开着的，
+    #: 不该按「回退也改不掉」直接 forced fail（否则 review/fix 段全空、两轮零增益）。
     _UNFIXABLE_FAILURE_EVENTS = {
         "test_verification_gap": "验证口径/证据通道缺口",
         "test_environment_gap": "测试执行依赖的外部工具链缺失",
         "test_delivery_unverifiable": "交付物无法被现有验证通道验证",
         "test_suite_defect": "测试套件自身违反执行协议",
     }
+
+    #: 该事件类型出现后，若同一节点内已解冻套件，则视为「修复通道已打开」，不算不可修
+    _REPAIRABLE_FAILURE_EVENTS = frozenset({"test_suite_defect"})
+    _SUITE_REOPENED_EVENT = "test_freeze_invalidated"
 
     def _unfixable_failure_reason(self, ctx: AgentContext, node_id: str, iteration: int) -> str:
         """本次节点失败是否属于「回退也改不掉」的环境/证据通道缺口，是则返回归因文本。
@@ -2316,14 +2325,23 @@ class Leader:
         交付物质量引起，继续回退只会空转并把回退预算耗尽，最终仍以不通过收尾——
         与 task04（缺编译器）的教训一致。
         """
-        for event in ctx.events.events:
+        events = ctx.events.events
+        for index, event in enumerate(events):
             if event.node != node_id or event.iteration != iteration:
                 continue
             label = self._UNFIXABLE_FAILURE_EVENTS.get(event.type)
-            if label:
-                note = str((event.payload or {}).get("note", "")).strip()
-                return f"{label}：{note}" if note else label
+            if not label:
+                continue
+            if (event.type in self._REPAIRABLE_FAILURE_EVENTS
+                    and self._suite_repair_opened(events, index)):
+                continue          # 套件已解冻，下一轮测试节点会重新生成：按普通失败走回退
+            note = str((event.payload or {}).get("note", "")).strip()
+            return f"{label}：{note}" if note else label
         return ""
+
+    def _suite_repair_opened(self, events: List[Any], index: int) -> bool:
+        """该事件之后是否出现了解冻记录（verifier 与 tester 共用同一个 events 流）。"""
+        return any(str(item.type) == self._SUITE_REOPENED_EVENT for item in events[index + 1:])
 
     def _publish_forced_gate(self, blackboard: Blackboard, criteria_id: str, reason: str,
                              iteration: int, run_id: str = "") -> None:

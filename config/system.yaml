@@ -82,10 +82,13 @@ runtime:
   python: "python"
   sandbox_timeout: 180            # 单次沙箱执行超时（秒）
   # 沙箱命令白名单：放行 Python 解释器（含绝对路径/版本号变体）与 node（docs/15 B1，
-  # 供 web_fullstack 需求的 JS 交付验证）；shell 解释器仍被硬拒，不受白名单影响
+  # 供 web_fullstack 需求的 JS 交付验证）；shell 解释器仍被硬拒，不受白名单影响。
+  # npm/npx（2026-11-03，task12-foodlink-spa-03 复盘）：node 交付物的构建/启动只能经
+  # 包管理器入口，白名单只有 node 时测试通道无法拉起 NestJS/Vite 服务，33/39 用例集体阻断。
+  # Windows 下按 npm.cmd 解析（Sandbox._executable_allowed 做 PATHEXT 归一）。
   sandbox_command_policy:
     enabled: true
-    allowed: ["python", "python3", "py", "node"]
+    allowed: ["python", "python3", "py", "node", "npm", "npx"]
   sandbox_strip_sensitive_env: true   # 剔除含 KEY/TOKEN/SECRET 等词的环境变量再进沙箱
   # POSIX 资源限制（Windows 无标准库等价方案，自动跳过并在事件中标注）
   sandbox_limits:

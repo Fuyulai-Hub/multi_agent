@@ -141,6 +141,9 @@ class TesterAgent(BaseAgent):
     }
 
     def build_context(self, task: NodeTask, perception: Perception) -> Dict[str, Any]:
+        # 记住本轮的 code_manifest：_target_package 要用同一个 package 去核对
+        # 「套件 import 的被测包到底存不存在」（与下发给模型的 package_hint 同源）。
+        self._package_hint_manifest = perception.found.get("code_manifest") or {}
         return {
             "spec": perception.spec,
             "solution_design": perception.found.get("solution_design") or {},
@@ -355,29 +358,17 @@ class TesterAgent(BaseAgent):
                           test_ids=len(frozen.get("test_ids") or []))
         else:
             # 首次（或冻结已失效）时写入测试文件（真实可执行）
-            self._clear_foreign_tests(task, [
-                str(item["path"]) for item in (data.get("files") or [])
-                if isinstance(item, dict) and str(item.get("path", "")).startswith("tests/")
-            ])
-            for file_item in data.get("files", []):
-                if not isinstance(file_item, dict) or not file_item.get("path"):
-                    continue          # 契约外防御：跳过结构非法的文件项，不让整个节点崩溃
-                path = str(file_item["path"])
-                try:
-                    self.sandbox_write(path, str(file_item["content"]))
-                except SandboxError as exc:
-                    # 权限守卫拒绝（如契约诱导模型输出 tests/ 之外的 serve.py）：单文件写不进去
-                    # 不该让整个测试节点崩掉——跳过后继续写其余测试文件，并在事件里如实记账。
-                    self.ctx.events.emit(
-                        "test_file_write_denied", agent=self.role_id, node=task.node_id,
-                        iteration=task.iteration, severity="error",
-                        payload={"path": path, "error": str(exc),
-                                 "note": "测试角色只能写 tests/ 下的文件；该文件被跳过，未写入沙箱"},
-                    )
-                    continue
-                if path.startswith("tests/"):
-                    test_file = path
-                    self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
+            test_file = self._write_test_files(task, data, result)
+            if test_file:
+                # 0.6) 冻结前准入体检（2026-11-03，task12-foodlink-spa-03 复盘）：静态可
+                # 判定「必然阻断」的套件一旦被冻结，restore_if_changed() 会把后续每轮重新
+                # 生成的文件整份丢弃（实测 test_generation_ignored 事件），修复通道从此关闭
+                # ——本轮 33/39 用例两轮零增益、3.35 小时白烧。冻结前给一次带精确修复指令的
+                # 重生成；仍不合格就不冻结任何套件，如实判失败。
+                test_file, data, generation = self._ensure_spawnable_suite(
+                    task, test_file, data, generation, result)
+                if result.status == "fail":
+                    return
             if test_file:
                 try:
                     suite_manifest = verifier.freeze(
@@ -569,6 +560,12 @@ class TesterAgent(BaseAgent):
                 "test_files_changed_during_execution", "verification_gap"}
             if reopen_reasons:
                 verifier.invalidate("; ".join(sorted(reopen_reasons)))
+        elif root_cause.get("category") == "test_suite_defect":
+            # 凭证有效但套件自身有可修缺陷（如 Windows 裸名启动 .cmd）：同样必须解冻。
+            # 冻结副本会被 restore_if_changed() 每轮恢复，重生成的修复永远进不来——
+            # task12-foodlink-spa-03 的 33 条用例就是这样两轮零增益的。
+            verifier.invalidate(
+                "test_suite_defect: " + str(bugs.get("blocked_reason") or "")[:300])
         test_report = {
             "title": f"《{spec.get('title', '')}》业务测试报告",
             "test_file": test_file,
@@ -711,6 +708,27 @@ class TesterAgent(BaseAgent):
                     },
                 )
 
+    def _target_package(self) -> str:
+        """契约声明的被测包名（与 `build_prompt` 下发给模型的 `package_hint` 同源）。
+
+        同一个来源是为了让两者必然同步：模型照协议写 `from foodlink import …`，
+        体检就用同一个 `foodlink` 去工作区里找这个包。task12-foodlink-spa-03 实测
+        （iter04/05/06）：包不存在时两侧口径一致才能把失败归到「套件写了无法兑现的
+        import」，而不是继续当成研发改不动的交付缺陷。
+        """
+        board = getattr(self.ctx, "blackboard", None)
+        if board is not None and hasattr(board, "get"):
+            try:
+                manifest = board.get("code_manifest")
+            except Exception:  # noqa: BLE001 - 读取失败按无包名处理，不影响主流程
+                manifest = None
+            if isinstance(manifest, dict) and str(manifest.get("package") or ""):
+                return str(manifest["package"]).strip()
+        manifest = getattr(self, "_package_hint_manifest", None)
+        if isinstance(manifest, dict) and str(manifest.get("package") or ""):
+            return str(manifest["package"]).strip()
+        return ""
+
     def _preexec_diagnosis(self, test_file: str) -> List[Dict[str, Any]]:
         """执行前对测试文件做 AST 体检，只挑"绕过/依赖沙箱命令白名单外的外部程序"这一类高危项。
 
@@ -719,11 +737,25 @@ class TesterAgent(BaseAgent):
         try:
             policies = dict(self.ctx.config.role("reviewer").policies)
             analysis = self.ctx.sandbox.analyze([test_file], policies)
+            findings = list(analysis.findings)
+            # 「import 的被测包不存在」是套件自身缺陷（见 Sandbox.suite_import_target_findings）：
+            # 2026-11-04 实测它会让归因落到空串→默认按交付缺陷退回研发，三轮预算白烧，
+            # 第三轮直接把交付物改写成 Python 包来迁就这条 import。
+            try:
+                severity_map: Dict[str, str] = dict(policies.get("severity_map") or {})
+                findings.extend(self.ctx.sandbox.suite_import_target_findings(
+                    test_file, self._target_package(),
+                    lambda rule, default="minor": severity_map.get(rule, default)))
+            except Exception:                   # noqa: BLE001 - 同一原则：诊断不拖垮节点
+                pass
         except Exception:                       # noqa: BLE001 - 体检是诊断，不能拖垮测试节点
             return []
-        return [item.to_dict() for item in analysis.findings
+        return [item.to_dict() for item in findings
                 if getattr(item, "rule", "") in ("sandbox_command_bypass",
-                                                 "sandbox_command_unresolved")
+                                                 "sandbox_command_unresolved",
+                                                 "windows_spawn_extension",
+                                                 "spawn_unread_pipe",
+                                                 "suite_import_target_missing")
                 or str(getattr(item, "rule", "")).endswith("_not_imported")]
 
     @classmethod
@@ -737,6 +769,23 @@ class TesterAgent(BaseAgent):
                               "not found", "not recognized")
     # 测试套件自身的静态缺陷（可修，不该算环境也不该算交付物）：`<模块>_not_imported`
     _SUITE_DEFECT_SUFFIX = "_not_imported"
+    # 精确名匹配的可修套件缺陷：Windows 下用裸名启动 .cmd/.bat 包装脚本必然
+    # FileNotFoundError，改写成 `npm.cmd` 即可修复。task12-foodlink-spa-03 实测：
+    # 同一现象被归为 delivery_unverifiable（不可修）→ leader 直接 forced fail，
+    # 33 条用例两轮零增益，3.35 小时白烧。
+    # `spawn_unread_pipe` 同轮实测补入：同一份后端，stdout 指文件 3.0s 监听、接 PIPE
+    # 无人读则 60s 不起、加守护线程读又 3.0s 起——失败完全来自套件写法，既不属于
+    # 环境（依赖/数据库都已就绪）也不属于交付物（代码一行没变）。
+    # `suite_import_target_missing`（2026-11-04 全链路续跑实测补入）：套件 import 的
+    # 被测包在工作区根本不存在。iter05/iter06 的 `root_cause_category` 是**空串**，
+    # 默认落到「交付缺陷」，于是连续三轮把不可能完成的任务派给研发；attempt 3 的真实
+    # 后果是 developer 放弃修 NestJS 的两处 TS2345，转而往交付里新写一个 Python 包
+    # `code/foodlink/`（code_manifest 从 57 文件的 TypeScript 变成 18 文件的 Python），
+    # 证据通道的形状把交付物的语言改了。识别为套件缺陷后走既有的可修通道：
+    # 冻结前准入拦截 → 带精确修复指令重生成 → 仍不达标就 test_spawn_unrepairable，
+    # leader 侧不再按「回退也改不掉」直接 forced fail（见 leader._REPAIRABLE_FAILURE_EVENTS）。
+    _SUITE_DEFECT_RULES = ("windows_spawn_extension", "spawn_unread_pipe",
+                           "suite_import_target_missing")
     # 测试文件内联启动外部程序的发现规则（见 Sandbox._command_bypass_findings）
     _BYPASS_RULES = ("sandbox_command_bypass", "sandbox_command_unresolved")
 
@@ -759,10 +808,14 @@ class TesterAgent(BaseAgent):
         原实现只报"32 个缺陷"并回退给研发修复，回退预算耗尽后才以失败终止——
         根因其实是环境/构建问题，研发再怎么改也改不出一个不存在的 g++。
 
-        task12（NestJS SPA）补充：报错同样是 FileNotFoundError，但程序（npm.cmd）
-        在本机其实存在，失败来自测试文件绕过白名单后的调用方式与平台/协议不兼容。
-        这类失败不是「缺工具链」，而是交付物无法被现有 Python 通道验证——归
-        ``delivery_unverifiable``，否则报告会给出「把 npm 加进白名单」这类错误建议。
+        task12（NestJS SPA）复盘修正：报错同样是 FileNotFoundError，程序（npm.cmd）
+        在本机也确实存在。第一轮把它归 ``delivery_unverifiable``（不可修）——错了：
+        真因是测试文件在 Windows 下用裸名 ``npm`` 起子进程，CreateProcess 不查 PATHEXT。
+        这是测试套件自身可修的缺陷（改写成 ``npm.cmd``），归 ``test_suite_defect``，
+        由 ``windows_spawn_extension`` 规则静态判定。归错的代价是 leader 直接 forced
+        fail、review/fix 段全空、33 条用例两轮零增益（3.35 小时白烧）。
+        ``delivery_unverifiable`` 保留给真正无法静态修复的通道缺口（白名单外且本机无
+        包装脚本可解析，例如非 Python 交付物没有任何可用工具链映射）。
         """
         if not findings:
             return {"category": "", "evidence": []}
@@ -773,7 +826,8 @@ class TesterAgent(BaseAgent):
                 evidence.append(f"{case.get('class', '')}.{case.get('test', '')}: "
                                 f"{str(case.get('message', ''))[:120]}")
         rules = {str(item.get("rule", "")) for item in findings}
-        if any(rule.endswith(self._SUITE_DEFECT_SUFFIX) for rule in rules):
+        if (any(rule.endswith(self._SUITE_DEFECT_SUFFIX) for rule in rules)
+                or bool(rules & set(self._SUITE_DEFECT_RULES))):
             category = "test_suite_defect"
         elif evidence:
             programs = self._bypass_programs(findings)
@@ -1152,6 +1206,154 @@ class TesterAgent(BaseAgent):
                                  "（研发自测等）；冻结清单只收可绑定元数据的用例"},
             )
         return cleared
+
+    def _write_test_files(
+        self, task: NodeTask, data: Dict[str, Any], result: AgentResult,
+    ) -> str:
+        """把生成方提交的 tests/ 文件写入沙箱，返回入口测试文件路径（无则空串）。
+
+        单文件被权限守卫拒绝时跳过并如实记账，不让整个测试节点崩掉（契约诱导模型输出
+        tests/ 之外的 serve.py 时实测过）。冻结前的修复重生成走同一入口，避免两套写入逻辑。
+        """
+        self._clear_foreign_tests(task, [
+            str(item["path"]) for item in (data.get("files") or [])
+            if isinstance(item, dict) and str(item.get("path", "")).startswith("tests/")
+        ])
+        test_file = ""
+        for file_item in data.get("files", []):
+            if not isinstance(file_item, dict) or not file_item.get("path"):
+                continue          # 契约外防御：跳过结构非法的文件项，不让整个节点崩溃
+            path = str(file_item["path"])
+            try:
+                self.sandbox_write(path, str(file_item["content"]))
+            except SandboxError as exc:
+                self.ctx.events.emit(
+                    "test_file_write_denied", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration, severity="error",
+                    payload={"path": path, "error": str(exc),
+                             "note": "测试角色只能写 tests/ 下的文件；该文件被跳过，未写入沙箱"},
+                )
+                continue
+            if path.startswith("tests/"):
+                test_file = path
+                self.evidence(result, "file", path=test_file, chars=len(str(file_item["content"])))
+        return test_file
+
+    def _ensure_spawnable_suite(
+        self,
+        task: NodeTask,
+        test_file: str,
+        data: Dict[str, Any],
+        generation: Generation,
+        result: AgentResult,
+    ) -> Tuple[str, Dict[str, Any], Generation]:
+        """冻结前拦截「静态可判定必然阻断」的套件，并给一次带精确修复指令的重生成。
+
+        返回 (test_file, data, generation)；修复失败时置 result.status=fail 且不冻结任何套件。
+
+        为什么必须在冻结前（2026-11-03，task12-foodlink-spa-03 复盘）：套件一旦冻结，
+        ``restore_if_changed()`` 会把后续每轮重新生成的 tests/ 整份丢弃（实测
+        ``test_generation_ignored``），而 leader 又把这类失败当「回退也改不掉」直接 forced
+        fail。结果是 33/39 用例在 iter01/iter02 两轮根因完全不变、缺陷闭环 0、review 与
+        fix 段无任何产物、3.35 小时白烧。准入体检把修复窗口开在冻结之前。
+        """
+        blocking = [item for item in self._preexec_diagnosis(test_file)
+                    if str(item.get("rule", "")) in self._SUITE_DEFECT_RULES]
+        if not blocking:
+            return test_file, data, generation
+        if self.ctx.llm is None:
+            # 直接调用 Agent 的单元测试没有 LLM 客户端（生产 Leader 必带）：
+            # 与 test_coverage_skipped / hidden_suite_skipped 同一先例，跳过并留痕。
+            self.ctx.events.emit(
+                "test_spawn_check_skipped", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="warning",
+                payload={"findings": blocking[:10],
+                         "reason": "当前上下文没有 LLM 客户端（单元测试直连），跳过冻结前准入体检"},
+            )
+            return test_file, data, generation
+        self.ctx.events.emit(
+            "test_spawn_repair_requested", agent=self.role_id, node=task.node_id,
+            iteration=task.iteration, severity="warning",
+            payload={"findings": blocking[:10], "finding_count": len(blocking),
+                     "note": "冻结前检出必然阻断的套件写法（子进程调用 / 无法兑现的 import），"
+                             "请求一次修复重生成"},
+        )
+        system = (
+            "你是业务测试工程师。上一轮测试套件里有静态即可判定必然阻断的写法"
+            "（子进程启动方式、或 import 工作区里不存在的被测包），"
+            "套件一旦冻结就无法再修改，因此必须在冻结前修好。"
+            "你只能修改这些写法本身，不得删减用例、不得放宽断言、不得改期望值。"
+        )
+        user = (
+            "## 静态体检发现（逐条必须消除）\n"
+            + "\n".join(f"- {item.get('file')}:{item.get('line')} [{item.get('rule')}] "
+                        f"{item.get('message')}" for item in blocking)
+            + "\n\n## 上一轮已生成的测试文件（在此基础上全量重写，保持全部用例与断言不变）\n"
+            + json.dumps(data.get("files") or [], ensure_ascii=False, indent=1)
+            + "\n\n## 上一轮用例元数据（原样保留，不得增删）\n"
+            + json.dumps(data.get("cases") or [], ensure_ascii=False, indent=1)
+            + "\n\n## 输出契约（必须只输出一个 JSON 对象）\n"
+            + json.dumps({
+                "files": [{"path": test_file, "content": "完整 Python 源码（全量重写）"}],
+                "cases": [], "derived_from": "spawn-repair",
+            }, ensure_ascii=False, indent=1)
+            + "\n\n修复规则：Windows 下 CreateProcess 不查 PATHEXT，启动 .cmd/.bat 包装脚本"
+            "必须写全名（如 `npm.cmd`）或用 `shutil.which(\"npm\")` 取真实路径；"
+            "接了 PIPE 就必须有人读（communicate()/read() 或守护线程持续读），"
+            "或把 stdout/stderr 重定向到工作区内日志文件；"
+            "不要 import 工作区里不存在的被测包——先确认交付里真的有这个 Python 包，"
+            "没有就改成对交付自带的公开接口发真实请求（标准库 http.client / 读文件 / 命令行），"
+            "cases 原样回填上一轮元数据，不要留空。"
+        )
+        bundle = PromptBundle(
+            role=self.role_id, node=task.node_id, task_kind="test_suite_repair",
+            iteration=task.iteration, system=system, user=user,
+            context={"task_kind": "test_suite_repair"},
+            token_estimate=(len(system) + len(user)) // 3, path=None,
+        )
+        try:
+            repaired = self.ctx.llm.generate("test_suite_repair", bundle, {})
+        except Exception as exc:  # noqa: BLE001 - 修复失败按发现如实判失败，不冻结
+            result.status = "fail"
+            result.error = f"测试套件准入修复生成失败: {type(exc).__name__}: {exc}"
+            result.summary = result.error
+            return test_file, data, generation
+        if repaired.error or not isinstance(repaired.data, dict):
+            result.status = "fail"
+            result.error = "测试套件准入修复未返回可解析的 JSON: " + str(repaired.error or "")
+            result.summary = result.error
+            return test_file, data, generation
+        # 用例元数据一律沿用修复前的：本次修复只允许改子进程写法。若采用模型回传的
+        # cases，_ensure_full_coverage 刚校验过的三类覆盖会被悄悄改写，而冻结会把它写进死档。
+        preserved_cases = ((generation.data.get("cases") if isinstance(generation.data, dict)
+                            else None) or data.get("cases") or [])
+        data = repaired.data
+        data["cases"] = preserved_cases
+        generation = repaired
+        new_file = self._write_test_files(task, data, result)
+        if result.status == "fail":
+            return test_file, data, generation
+        test_file = new_file or test_file
+        remaining = [item for item in self._preexec_diagnosis(test_file)
+                     if str(item.get("rule", "")) in self._SUITE_DEFECT_RULES]
+        if remaining:
+            result.status = "fail"
+            result.error = ("测试套件冻结前准入体检未通过（套件一旦冻结将无法修复）: "
+                            + "; ".join(str(item.get("message", ""))[:160] for item in remaining[:5]))
+            result.summary = result.error
+            self.ctx.events.emit(
+                "test_spawn_unrepairable", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"findings": remaining[:10], "finding_count": len(remaining),
+                         "note": "未冻结任何套件；下一轮测试节点将重新生成"},
+            )
+        else:
+            self.ctx.events.emit(
+                "test_spawn_repaired", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration,
+                payload={"note": "阻断性子进程调用已在冻结前修复", "test_file": test_file},
+            )
+        return test_file, data, generation
 
     def _ensure_full_coverage(
         self,

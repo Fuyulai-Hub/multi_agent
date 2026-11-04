@@ -40,6 +40,11 @@ _NETWORK_MODULES = {
 # 命令白名单默认值：本系统所有沙箱命令都是 Python 解释器调用（跑实现/跑测试），
 # 默认不放行任何 shell 解释器（cmd/sh/bash -c 可绕过一切路径级约束）。
 DEFAULT_ALLOWED_COMMANDS = ("python", "python3", "py")
+# Windows 下 npm/npx/yarn 这类工具的真实文件是 .cmd/.bat 包装脚本，而 CreateProcess
+# 不查 PATHEXT——task12-foodlink-spa-03 实测：测试文件写 subprocess.Popen(["npm", ...])，
+# 本机 npm 确实存在（F:\software\npm.CMD），却报 FileNotFoundError(WinError 2)，
+# 33/39 用例集体阻断。白名单按无扩展名登记，因此这些后缀视为同一程序。
+_WINDOWS_SCRIPT_EXTS = (".cmd", ".bat", ".com", ".ps1", ".exe")
 # 环境变量敏感词：命中即从沙箱子进程环境剔除，防止交付代码/测试窃取 LLM 凭据
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
 # POSIX 资源限制默认值（秒/字节），防止失控脚本耗尽机器资源
@@ -421,6 +426,10 @@ class Sandbox:
     def _container_executable(self, executable: str) -> str:
         raw = Path(str(executable)).name.lower()
         base = raw[:-4] if raw.endswith(".exe") else raw
+        # 宿主 Windows 的包装脚本名（npm.cmd）映射到容器内同名真实二进制（npm）
+        stem, dot, ext = base.rpartition(".")
+        if dot and stem and f".{ext}" in _WINDOWS_SCRIPT_EXTS:
+            base = stem
         if base == "py":
             return self.container["python"]
         if re.fullmatch(r"python[\d.]*", base):
@@ -480,13 +489,20 @@ class Sandbox:
             )
 
     def _executable_allowed(self, executable: str) -> bool:
-        if executable in self.allowed_commands:
+        name = str(executable).lower()
+        if name in self.allowed_commands:
             return True
         # python3.13 / python3.13.exe 这类带版本号的解释器名
-        return any(
-            re.fullmatch(re.escape(entry) + r"[\d.]*", executable)
-            for entry in self.allowed_commands
-        )
+        if any(re.fullmatch(re.escape(entry) + r"[\d.]*", name)
+               for entry in self.allowed_commands):
+            return True
+        # Windows 包装脚本：白名单登记 `npm`，本机真实文件是 `npm.cmd`（见 _WINDOWS_SCRIPT_EXTS）。
+        # 取舍：npm.cmd 是批处理包装，内部会起 cmd.exe——这与「禁止 shell 解释器」的约束
+        # 有张力。仅在 sandbox_backend=local（按 config/system.yaml 注释，local 不是安全边界）
+        # 且白名单显式登记了该程序时放行；container 后端仍走 _container_executable 的独立校验。
+        stem, dot, ext = name.rpartition(".")
+        return bool(dot and f".{ext}" in _WINDOWS_SCRIPT_EXTS
+                    and stem in self.allowed_commands)
 
     def _build_env(self, env_extra: Optional[Dict[str, str]]) -> Dict[str, str]:
         """构造子进程环境：默认剔除敏感变量（LLM 凭据等），显式 env_extra 仍可注入。"""
@@ -754,6 +770,12 @@ class Sandbox:
         # 且失败只表现为 19 条用例全败（FileNotFoundError），看不出是"框架无法验证非 Python 交付物"。
         findings.extend(self._command_bypass_findings(tree, relative, severity))
 
+        # 子进程输出管道「接了却没人读」的检测（2026-11-03，task12-foodlink-spa-03 实测）：
+        # 套件用 Popen(stdout=PIPE) 起被测服务，但全文只在线程外 poll()，从不 communicate()
+        # /read()。Windows 匿名管道缓冲只有几 KB，服务启动日志一写满，子进程就永久阻塞在
+        # write() 上，端口永远不监听——表现为「timeout waiting for backend」而不是任何报错。
+        findings.extend(self._unread_pipe_spawn_findings(tree, relative, severity))
+
         # 结果回传协议依赖 json.dumps，但 LLM 常漏写 import json（实测两次），
         # 文件跑完即 NameError、一条用例都不回传，框架只能看到"用例数为 0"。
         findings.extend(self._unbound_json_findings(tree, relative, severity))
@@ -817,6 +839,21 @@ class Sandbox:
             if method not in self._BYPASS_CALLS.get(module, set()):
                 continue
             program = self._literal_program(node.args)
+            # Windows 包装脚本必须写在白名单校验之前：`npm` 即使已在白名单内，
+            # 裸名调用仍会 FileNotFoundError（CreateProcess 不查 PATHEXT），
+            # 这是测试文件自身可修的缺陷，不是"交付物无法验证"。
+            resolved = self._windows_script_spawn(program) if program else ""
+            if resolved:
+                findings.append(Finding(
+                    rule="windows_spawn_extension",
+                    severity=severity("windows_spawn_extension", "major"),
+                    file=relative, line=getattr(node, "lineno", 0),
+                    symbol=f"{module}.{method}",
+                    message=(f"{module}.{method}() 在 Windows 下用裸名 `{program}` 启动外部程序，"
+                             f"CreateProcess 不查 PATHEXT，必然 FileNotFoundError；本机真实文件是 "
+                             f"`{resolved}`——改写成该全名（或 shutil.which(\"{program}\")）即可修复"),
+                ))
+                continue
             if program and self._executable_allowed(program):
                 continue
             if program:
@@ -838,6 +875,225 @@ class Sandbox:
                          "（若该程序在本机不存在，测试失败属于环境问题而非交付物缺陷）"),
             ))
         return findings
+
+    # 视为「有人在读这个句柄」的属性名：communicate() 内部读完，read 系列逐次读，
+    # recv 系列是 socketpair/管道句柄的读法。判定按句柄归属，不按全文（见方法文档）。
+    _PIPE_READER_ATTRS = ("communicate", "read", "readline", "readlines", "recv", "recvline")
+
+    def _unread_pipe_spawn_findings(
+        self, tree: ast.AST, relative: str, severity: Any
+    ) -> List["Finding"]:
+        """检出 ``subprocess.Popen(stdout=PIPE)`` 却没人读取该管道的套件写法。
+
+        为什么这是「测试套件自身缺陷」而不是交付物缺陷（2026-11-03，
+        task12-foodlink-spa-03 单因子对照实测）：同一份 NestJS 后端、同一个
+        ``npm run start:dev``，
+        - stdout 指向文件 → 3.0s 起来并返回 200；
+        - stdout=subprocess.PIPE 且无人读 → 60s 内永远不监听（套件只 poll()/terminate()，
+          从不 read 管道，管道写满后子进程阻塞在 write()）；
+        - 同样是 PIPE，但起一个守护线程持续读 → 3.0s 起来。
+        启动日志实测 8656 字节，超过 Windows 匿名管道的缓冲上限，所以「服务起不来」与
+        交付代码是否有错无关：task12 的 33 条用例里，这一条就足以解释全部失败。
+        套件一旦冻结，``restore_if_changed()`` 会每轮恢复这份写法，所以必须在冻结前
+        静态检出并交回生成方修（改重定向到文件，或持续读取），不得删用例。
+
+        判定按**句柄**而不是按全文：``conn.getresponse().read()`` 这类与管道无关的
+        read() 不能替 Popen 的 stdout 免责（task12 的冻结套件里就同时存在这两种写法）。
+        只认三类证据——对同一句柄调用 communicate()/read() 等、访问同一句柄的
+        ``.stdout``/``.stderr``（含 ``for line in proc.stdout``）、把句柄传给别的函数
+        （视为交给别人读取）。
+        已知漏报面：句柄先进容器再被读出（``self.procs.append(p)`` + 之后
+        ``self.procs[0].stdout.read()``）时静态看不到归属，会误报一次；该规则只用于
+        冻结前准入体检与审查提示，宁可让生成方改写成显式重定向，也不放过真死锁。
+        """
+        spawns: List[tuple] = []          # (节点, 接了 PIPE 的通道名, 句柄点分路径或 None)
+        parents: Dict[int, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[id(child)] = parent
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "Popen":
+                continue
+            if getattr(node.func.value, "id", "") != "subprocess":
+                continue
+            piped = sorted(kw.arg for kw in node.keywords
+                           if kw.arg in ("stdout", "stderr")
+                           and self._is_subprocess_const(kw.value, "PIPE"))
+            # stderr=subprocess.STDOUT 本身不是新管道：它并入 stdout。stdout 已经是
+            # PIPE 时上面已经记过；stdout 指向文件时这样写完全安全（task12 修复指令
+            # 给出的正是 stdout=日志文件 + stderr=STDOUT），不得报成缺陷。
+            if not piped:
+                continue
+            spawns.append((node, piped, self._assign_target(node, parents)))
+        if not spawns:
+            return []
+        # 收集「谁在读」的证据，按句柄前缀归属
+        drained: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in self._PIPE_READER_ATTRS:
+                drained.append(self._dotted(node.value))
+            elif isinstance(node, ast.Attribute) and node.attr in ("stdout", "stderr"):
+                drained.append(self._dotted(node))
+            elif isinstance(node, ast.Call):
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if isinstance(arg, (ast.Name, ast.Attribute)):
+                        drained.append(self._dotted(arg))
+        findings: List[Finding] = []
+        for node, piped, handle in spawns:
+            # handle 为 None：Popen 结果没被任何变量接住，没有人可能读到它
+            if handle and any(target == handle or target.startswith(f"{handle}.")
+                              or handle.startswith(f"{target}.")
+                              for target in drained if target):
+                continue
+            findings.append(Finding(
+                rule="spawn_unread_pipe",
+                severity=severity("spawn_unread_pipe", "major"),
+                file=relative, line=getattr(node, "lineno", 0), symbol="subprocess.Popen",
+                message=(f"subprocess.Popen() 把 {'/'.join(piped)} 接到 PIPE，"
+                         + (f"句柄 `{handle}` 在本文件里没有任何读取" if handle
+                            else "返回值没有被任何变量接住，更不可能被读取")
+                         + "（既无 communicate()/read()，也不遍历 .stdout）；"
+                         "被启动的服务写满管道缓冲（Windows 匿名管道数 KB，实测启动日志 "
+                         "8656 字节）后会永久阻塞在 write()，端口永远不监听。"
+                         "修法：stdout/stderr 重定向到工作区内的日志文件（被测服务退出后"
+                         "再读它做诊断），或起守护线程持续读取——不得删用例或放宽断言"),
+            ))
+        return findings
+
+    @staticmethod
+    def _dotted(node: ast.AST) -> str:
+        """``self.proc.stdout`` 这类点分路径；带下标/调用的复杂表达式返回空串。"""
+        parts: List[str] = []
+        current = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            return ".".join(reversed(parts))
+        return ""
+
+    @staticmethod
+    def _assign_target(call: ast.Call, parents: Dict[int, ast.AST]) -> str:
+        """Popen 返回值绑定的句柄名：``proc = Popen(...)`` → ``proc``；
+        ``self.proc = Popen(...)`` → ``self.proc``；取不到（裸表达式）→ 空串。"""
+        parent = parents.get(id(call))
+        if isinstance(parent, (ast.Starred, ast.Tuple, ast.List)):
+            parent = parents.get(id(parent))
+        if isinstance(parent, ast.Assign) and parent.targets:
+            return Sandbox._dotted(parent.targets[0])
+        if isinstance(parent, (ast.withitem, ast.comprehension)):
+            return ""
+        return ""
+
+    @staticmethod
+    def _is_subprocess_const(node: ast.AST, name: str) -> bool:
+        """``subprocess.PIPE`` 形式的常量判定（别名 ``from subprocess import PIPE`` 也认）。"""
+        if isinstance(node, ast.Attribute):
+            return node.attr == name and getattr(node.value, "id", "") == "subprocess"
+        return isinstance(node, ast.Name) and node.id == name
+
+    # ---------------------------------------------------------------- 套件 import 的被测包不存在
+    #: 扫描工作区时跳过的目录：依赖、构建产物、版本库、虚拟环境——它们里的
+    #: ``<包名>/__init__.py`` 不算交付物提供了这个 Python 包。
+    _PACKAGE_SCAN_EXCLUDED = frozenset({
+        "node_modules", "dist", "build", "out", ".git", "__pycache__", ".venv", "venv",
+        "env", ".mas_verify", ".pytest_cache", ".mypy_cache", ".ruff_cache", "site-packages",
+    })
+    _PACKAGE_SCAN_MAX_DEPTH = 4
+
+    def suite_import_target_findings(
+        self, relative: str, package: str, severity: Any
+    ) -> List["Finding"]:
+        """检出「测试套件 import 的被测包在工作区里根本不存在」。
+
+        为什么这是**套件自身**的缺陷而不是交付缺陷（2026-11-04，
+        task12-foodlink-spa-03 全链路真实续跑实测）：框架按需求规格给 tester 下发的
+        Web 执行协议只有「同进程起一个 Python 服务」一种形态
+        （``mas/agents/tester.py:30-70`` 的 ``from {package_hint} import build_handler``，
+        ``package_hint`` 取 ``code_manifest.package``）。task12 的交付是
+        NestJS + Prisma + PostgreSQL，工作区里没有任何 Python 包，于是重生成的套件
+        照样 ``import foodlink`` → 39 条全挂 ``ModuleNotFoundError``。
+
+        更糟的是归因：iter05/iter06 的 ``root_cause_category`` 是**空串**——四类根因
+        谁都不像，默认落到「交付缺陷」，于是连续三轮把「让 ``import foodlink`` 成立」
+        这个研发不可能完成的任务派给 developer。attempt 3 的实际后果（08:32:26 的真实
+        产物）：developer 放弃修那两处 TS2345，转而往交付里新写了一个 Python 包
+        ``code/foodlink/``，``code_manifest`` 从 57 文件的 NestJS 变成 18 文件的 Python，
+        与已批准的选型技术栈不一致，新实现自己又报 ``NameError: _get_docs``，39 条仍全挂。
+        换句话说：证据通道的形状把交付物的语言改了。
+
+        判定刻意保守，只在同时满足三件事时报告：
+        1. 文件在 ``tests/`` 下（只约束测试套件，不动 reviewer 对交付代码的分析口径）；
+        2. 套件确实 import 了契约声明的 ``package`` 这个名字；
+        3. 工作区里找不到这个包（既没有 ``<pkg>/__init__.py`` 也没有 ``<pkg>.py``，
+           且它不是标准库名字）。
+        也就是说：只要研发真的交付了这个 Python 包，本规则就不发声——
+        它拦的是「无法兑现的 import」，不是「非 Python 交付」。
+        """
+        if not package or not str(relative).startswith("tests/") or not self.root.exists():
+            return []
+        if package in sys.stdlib_module_names:
+            return []
+        tree: Optional[ast.AST] = None
+        try:
+            source = self.resolve(relative).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            return []                                  # 语法错误另有 syntax_error 规则负责
+        line = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] == package:
+                        line = line or getattr(node, "lineno", 0)
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                if node.module.split(".")[0] == package:
+                    line = line or getattr(node, "lineno", 0)
+        if not line:
+            return []
+        if self._workspace_has_package(package):
+            return []
+        return [Finding(
+            rule="suite_import_target_missing",
+            severity=severity("suite_import_target_missing", "major"),
+            file=relative, line=line, symbol=package,
+            message=(f"测试套件 import 的被测包 `{package}` 在工作区里不存在"
+                     f"（没有 `{package}/__init__.py`，也没有 `{package}.py`）；"
+                     f"每条用例都会在 setUpClass 阶段挂掉 `ModuleNotFoundError`，"
+                     "失败信息与交付质量无关。修法：先在工作区里确认真有这个 Python 包"
+                     "（`ls`/读 code_manifest.files），交付不是 Python 形态时"
+                     "**不要** import 任何被测包名，改用标准库对交付自带的公开接口发真实请求；"
+                     "不得删用例、不得放宽断言、不得把断言改成恒真"),
+        )]
+
+    def _workspace_has_package(self, package: str) -> bool:
+        """工作区内是否存在名为 ``package`` 的 Python 包/模块（深度受限，跳过依赖与产物）。"""
+        stack: List[Tuple[Path, int]] = [(self.root, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > self._PACKAGE_SCAN_MAX_DEPTH:
+                continue
+            try:
+                children = sorted(current.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if child.is_file() and child.name == f"{package}.py":
+                    return True
+                if not child.is_dir():
+                    continue
+                if child.name == package:
+                    if (child / "__init__.py").exists() or any(
+                            sub.suffix == ".py" for sub in child.iterdir()):
+                        return True          # 命名空间包（无 __init__.py）同样可 import
+                    continue
+                if child.name.startswith(".") or child.name in self._PACKAGE_SCAN_EXCLUDED:
+                    continue
+                stack.append((child, depth + 1))
+        return False
 
     # ---------------------------------------------------------------- Web 服务生命周期
     @staticmethod
@@ -1188,6 +1444,25 @@ class Sandbox:
         if name.lower().endswith(".exe"):
             name = name[:-4]
         return name.lower()
+
+    @staticmethod
+    def _windows_script_spawn(program: str) -> str:
+        """Windows 下用裸名启动 .cmd/.bat 包装脚本时返回真实全名，否则空串。
+
+        只有「本机确实解析到包装脚本」才报：解析不到属于普通的白名单绕过或缺工具链
+        （归 sandbox_command_bypass / 环境问题），不能混为可修的套件缺陷。
+        ``.exe`` 不算——node.EXE 是真实 PE 映像，CreateProcess 能直接启动。
+        """
+        if os.name != "nt":
+            return ""
+        name = str(program or "").strip()
+        if not name or "." in name:               # 已带扩展名（npm.cmd）不是本缺陷
+            return ""
+        resolved = shutil.which(name)
+        if not resolved:
+            return ""
+        return (resolved if os.path.splitext(resolved)[1].lower() in (".cmd", ".bat", ".ps1")
+                else "")
 
     def python_version(self) -> str:
         try:
