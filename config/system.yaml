@@ -16,9 +16,10 @@ system:
 # openai_compatible 走标准 /chat/completions 接口处理任意需求
 llm:
   provider: "openai_compatible"
-  # 该端点实测可用模型：DeepSeek（推荐）/ Qwen / GLM。
-  # Qwen 与 GLM 在 implement/optimize 这类长 JSON 生成任务上会把预算耗在思考链里，返回空正文。
-  model: "DeepSeek"
+  # 该端点实测可用模型：DeepSeek / Qwen / GLM。默认模型为 Qwen（2026-11-04 起）。
+  # 历史实测记录：Qwen 与 GLM 在 implement/optimize 这类长 JSON 生成任务上出现过
+  # 把预算耗在思考链里、返回空正文的情况；出现空正文时由 downgrade_reasoning_effort 降级重试兜底。
+  model: "Qwen"
   base_url: "https://api.chat.csu.edu.cn/v1"
   # API Key / BASE_URL 不写在本文件里，按优先级外注（后者覆盖前者）：
   #   1) config/credentials.yaml（本地凭据文件，前端「设为默认」写入）
