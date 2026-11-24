@@ -9,8 +9,12 @@ langgraph-checkpoint-sqlite>=3.0
 # ---- 通用基础设施：运行必需（2026-11-25 重构）-------------------------------
 # filelock：跨进程文件锁（替换自研 msvcrt/fcntl 分支实现）。
 # redis：官方 Redis 客户端（替换自研 RESP2 协议解析；MQ / 运行注册表共用）。
+# httpx：联网搜索 / 飞书文档 HTTP（替换 urllib 手写请求）。
+# anyio：MCP 异步会话的同步桥（BlockingPortal）。
 filelock>=3.13
 redis>=5,<9
+httpx>=0.27,<1
+anyio>=4,<5
 
 # ---- 扩展能力：运行必需（2026-11-25 重构）-----------------------------------
 # 官方 MCP SDK：stdio/SSE 传输、会话与 JSON-RPC 帧由 SDK 维护，

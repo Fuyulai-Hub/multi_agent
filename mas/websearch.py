@@ -1,6 +1,6 @@
 """联网搜索（docs/16 的 05 文档，路径 B：模型自主发起的本地 ``web_search`` 工具）。
 
-provider 可插拔（bing_web / bing / tavily / serpapi），stdlib urllib + ElementTree 实现，零第三方依赖。
+provider 可插拔（bing_web / bing / tavily / serpapi），httpx + ElementTree 实现。
 
 ``bing_web`` 是**免 Key 默认通道**：请求必应网页搜索的 RSS 输出（``format=rss``），
 不需要任何订阅 Key，因此「面板开关一开就能用」；``bing`` / ``tavily`` / ``serpapi``
@@ -15,11 +15,11 @@ RSS 通道的稳定性依赖必应页面输出格式，属可插拔 provider 之
 from __future__ import annotations
 
 import json
-import urllib.error
 import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional
+
+import httpx
 
 __all__ = ["PROVIDERS", "KEYLESS_PROVIDERS", "search"]
 
@@ -55,25 +55,22 @@ def _emit(sink: EventSink, kind: str, payload: Dict[str, Any]) -> None:
 
 
 def _get_json(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: int = 15) -> Dict[str, Any]:
-    request = urllib.request.Request(url, headers=headers or {}, method="GET")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+    response = httpx.get(url, headers=headers or {}, timeout=timeout, follow_redirects=True)
+    response.raise_for_status()
+    return response.json()
 
 
 def _post_json(url: str, payload: Dict[str, Any], *, timeout: int = 15) -> Dict[str, Any]:
-    request = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+    response = httpx.post(url, json=payload, timeout=timeout, follow_redirects=True)
+    response.raise_for_status()
+    return response.json()
 
 
 def _get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: int = 15) -> bytes:
     """取原始响应字节（RSS/XML 通道用：编码由文档声明决定，不能按 utf-8 硬解）。"""
-    request = urllib.request.Request(url, headers=headers or {}, method="GET")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+    response = httpx.get(url, headers=headers or {}, timeout=timeout, follow_redirects=True)
+    response.raise_for_status()
+    return response.content
 
 
 def _clip(text: Any) -> str:
@@ -175,7 +172,7 @@ def search(
             url = f"{base}?engine=google&q={urllib.parse.quote(keyword)}&api_key={urllib.parse.quote(api_key)}"
             body = _get_json(url, timeout=timeout_s)
             results = _results_serpapi(body, limit)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError,
+    except (httpx.HTTPError, TimeoutError, OSError,
             json.JSONDecodeError, ET.ParseError, ValueError, KeyError, TypeError) as exc:
         _emit(event_sink, "websearch_failed",
               {"query": keyword, "provider": provider, "error": f"{type(exc).__name__}: {exc}"})

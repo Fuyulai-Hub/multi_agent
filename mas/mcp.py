@@ -22,14 +22,12 @@ servers:
 实现方式（2026-11-25 重构）：传输与 JSON-RPC 交给官方 `mcp` SDK
 （`stdio_client` / `sse_client` + `ClientSession`），本模块只保留项目语义：
 配置 CRUD、`${VAR}` 展开、同步门面、五阶段错误定位。SDK 是 asyncio 接口，
-而 MAS 调度是同步线程，因此 `_AsyncSession` 在后台线程跑一个事件循环做桥接；
-本模块不再解析任何 JSON-RPC 帧。
+而 MAS 调度是同步线程，因此 `_AsyncSession` 用 anyio 的 BlockingPortal
+承载事件循环做桥接；本模块不再解析任何 JSON-RPC 帧。
 """
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import json
 import os
 import re
@@ -37,6 +35,9 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import anyio
+from anyio.from_thread import start_blocking_portal
 
 import yaml
 from mcp import ClientSession, types as mcp_types
@@ -274,8 +275,12 @@ class _AsyncSession:
     """把官方 SDK 的异步会话桥接成同步调用。
 
     MAS 的调度、工具循环与取证都是同步代码；官方 ``mcp`` 客户端是 asyncio。
-    这里只做「后台线程 + 事件循环 + run_coroutine_threadsafe」的桥接，
-    JSON-RPC 帧、响应 id 匹配与通知处理全部由 SDK 负责。
+    这里用 anyio 的 ``BlockingPortal``（成熟的事件循环线程桥）承载长生命周期的
+    ``stdio_client`` / ``sse_client`` + ``ClientSession``；本模块不再自维护
+    事件循环与线程生命周期。
+
+    上下文必须由**同一个任务**进入和退出（anyio 的 cancel scope 有任务归属），
+    因此 ``_main`` 在 portal 里常驻，sync 侧只通过 ``portal.call`` 发子协程。
     """
 
     def __init__(self, factory: Any, timeout_s: float, *, command: str = "",
@@ -284,17 +289,25 @@ class _AsyncSession:
         self._timeout = float(timeout_s)
         self._command = command
         self._log_tail = log_tail
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run, name="mcp-session", daemon=True)
+        self._portal_cm: Any = None
+        self._portal: Any = None
+        self._task: Any = None
+        self._stop: Optional[anyio.Event] = None
         self._ready = threading.Event()
-        self._stop: Optional[asyncio.Event] = None
         self._session: Optional[ClientSession] = None
         self._error: Optional[BaseException] = None
         self._stopping = False
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
-        self._thread.start()
+        try:
+            self._portal_cm = start_blocking_portal(backend="asyncio", name="mcp-session")
+            self._portal = self._portal_cm.__enter__()
+            self._task = self._portal.start_task_soon(self._main)
+        except BaseException as exc:          # noqa: BLE001 - 统一转 ConfigError
+            self._error = exc
+            self.close()
+            raise ConfigError(self._describe(exc)) from exc
         if not self._ready.wait(self._timeout):
             self.close()
             raise ConfigError(f"MCP 服务 {self._timeout}s 内未就绪")
@@ -303,32 +316,8 @@ class _AsyncSession:
             self.close()
             raise ConfigError(message)
 
-    def close(self) -> None:
-        self._stopping = True
-        if self._stop is not None and not self._loop.is_closed():
-            try:
-                self._loop.call_soon_threadsafe(self._stop.set)
-            except RuntimeError:
-                pass
-        if self._thread.is_alive():
-            self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._main())
-        except BaseException as exc:          # noqa: BLE001 - 线程边界，转交主线程
-            if not self._stopping:
-                self._error = exc
-            self._ready.set()
-        finally:
-            try:
-                self._loop.close()
-            except Exception:                 # noqa: BLE001 - 关闭失败不应掩盖原错误
-                pass
-
     async def _main(self) -> None:
-        self._stop = asyncio.Event()
+        self._stop = anyio.Event()
         try:
             async with self._factory() as streams:
                 read, write = streams[0], streams[1]
@@ -339,25 +328,56 @@ class _AsyncSession:
                     self._session = session
                     self._ready.set()
                     await self._stop.wait()
-        except BaseException as exc:          # noqa: BLE001 - 同上
+        except BaseException as exc:          # noqa: BLE001 - 转交同步侧
             if not self._stopping:
                 self._error = exc
             self._ready.set()
+
+    def close(self) -> None:
+        self._stopping = True
+        if self._portal is not None and self._stop is not None:
+            try:
+                self._portal.call(self._set_stop)
+            except BaseException:             # noqa: BLE001 - 关闭失败不掩盖原错误
+                pass
+        if self._task is not None:
+            try:
+                self._task.result(timeout=5)
+            except BaseException:             # noqa: BLE001 - 已取消/超时都继续收尾
+                pass
+        if self._portal is not None:
+            try:
+                self._portal.call(self._portal.stop, True)
+            except BaseException:             # noqa: BLE001
+                pass
+        if self._portal_cm is not None:
+            try:
+                self._portal_cm.__exit__(None, None, None)
+            except BaseException:             # noqa: BLE001
+                pass
+        self._portal = None
+        self._portal_cm = None
+        self._task = None
+        self._session = None
+
+    async def _set_stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
 
     # ---------------------------------------------------------------- 调用
     def call(self, fn: Any) -> Any:
         if self._error is not None:
             raise ConfigError(self._describe(self._error))
-        if self._session is None:
+        if self._session is None or self._portal is None:
             raise ConfigError("MCP 会话尚未建立")
-        future = asyncio.run_coroutine_threadsafe(fn(self._session), self._loop)
         try:
-            return future.result(self._timeout)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            raise ConfigError(f"MCP 服务 {self._timeout}s 内无响应") from exc
+            return self._portal.call(self._call_with_timeout, fn, self._session)
         except BaseException as exc:          # noqa: BLE001 - 统一转 ConfigError
             raise ConfigError(self._describe(exc)) from exc
+
+    async def _call_with_timeout(self, fn: Any, session: ClientSession) -> Any:
+        with anyio.fail_after(self._timeout):
+            return await fn(session)
 
     def _describe(self, exc: BaseException) -> str:
         leaves = _leaf_errors(exc)
@@ -366,6 +386,8 @@ class _AsyncSession:
                 return f"启动命令不存在: {self._command}"
             if isinstance(leaf, PermissionError):
                 return f"启动 MCP 服务被拒绝: {self._command}（{leaf}）"
+            if isinstance(leaf, TimeoutError):
+                return f"MCP 服务 {self._timeout}s 内无响应"
         text = "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves) or str(exc)
         message = f"MCP 服务错误: {text}"
         tail = self._log_tail() if self._log_tail is not None else ""

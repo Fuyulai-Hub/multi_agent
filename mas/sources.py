@@ -4,7 +4,7 @@
 
 - 源分类 ``classify_source``：L1 确定性规则，只认域名 + 路径形状，不联网（``mas/intent.py`` 同款范本）；
 - 文档抽取 ``extract_text``：三级路由 stdlib → MCP → 明确失败（不静默、不伪造）；
-- 飞书文档 ``fetch_feishu_document``：stdlib urllib 直连飞书开放平台，token 进程内缓存；
+- 飞书文档 ``fetch_feishu_document``：httpx 直连飞书开放平台，token 进程内缓存；
 - 上传暂存 ``save_upload``：前端 ``/api/upload`` 的校验与落盘（与运行目录分离）。
 
 配置走 ``config/inputs.yaml`` 按需加载（照抄 ``config/mcp.yaml`` 的 ``load_servers`` 模式，
@@ -15,11 +15,8 @@
 from __future__ import annotations
 
 import base64
-import json
 import re
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import zipfile
 from datetime import datetime
@@ -27,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from xml.etree import ElementTree
 
+import httpx
 import yaml
 
 from .config import SystemConfig
@@ -245,22 +243,21 @@ def _http_json(
     timeout: int = 15,
 ) -> Dict[str, Any]:
     """发一次 HTTP 请求并解析 JSON；网络失败/非 JSON 一律翻译为可读的 ConfigError。"""
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Content-Type": "application/json", **(headers or {})},
-    )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:400]
-        raise ConfigError(f"HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        response = httpx.request(
+            method, url, headers={"Content-Type": "application/json", **(headers or {})},
+            json=body, timeout=timeout, follow_redirects=True,
+        )
+        response.raise_for_status()
+        raw = response.text
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:400]
+        raise ConfigError(f"HTTP {exc.response.status_code}: {detail}") from exc
+    except httpx.HTTPError as exc:
         raise ConfigError(f"网络请求失败: {exc}") from exc
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        payload = response.json()
+    except ValueError as exc:
         raise ConfigError(f"返回非 JSON 内容: {raw[:200]}") from exc
     if not isinstance(payload, dict):
         raise ConfigError(f"返回结构非法: {raw[:200]}")

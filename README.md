@@ -88,6 +88,8 @@ python frontend/server.py --port 8080
 | **filelock** | `>=3.13` | 跨进程文件锁（黑板/经验库并发写） | `mas/filelock.py` |
 | **redis** | `>=5,<9` | Redis 客户端：运行注册表、缓存、分布式锁、Streams MQ | `mas/store/redis_backend.py` |
 | **mcp** | `>=2.3,<3` | 官方 MCP SDK：stdio/SSE 传输、会话与 JSON-RPC 帧 | `mas/mcp.py` |
+| **httpx** | `>=0.27,<1` | 联网搜索 / 飞书文档 HTTP（重定向、超时、异常统一） | `mas/websearch.py`、`mas/sources.py` |
+| **anyio** | `>=4,<5` | MCP 异步会话的同步桥（`BlockingPortal`） | `mas/mcp.py` |
 | **PyMySQL**（可选） | `>=1.1` | MySQL 索引/结构层；未安装自动降级为 jsonl，不报错 | `mas/store/mysql_backend.py` |
 
 ### 标准库承担的能力
@@ -98,7 +100,7 @@ python frontend/server.py --port 8080
 | `sqlite3` | LangGraph 检查点（`SqliteSaver`） |
 | `ast` | 门禁表达式安全求值（白名单节点）+ 交付代码静态分析 |
 | `argparse` | `python -m mas` CLI（run/demo/worker/mq/store/skill/mcp…） |
-| `urllib` | OpenAI 兼容 `/chat/completions` 流式请求、联网搜索 |
+| `urllib` | OpenAI 兼容 `/chat/completions` 流式请求（SSE 逐行读取 + 取消探测） |
 | `concurrent.futures` | IO 密集任务并行（保序 `parallel_map`） |
 | `unittest` | 生成测试套件与验证执行器 |
 | `hashlib` / `hmac` | 产物摘要、门禁/契约签名 |
@@ -128,7 +130,8 @@ python frontend/server.py --port 8080
 | --- | --- | --- | --- |
 | `mas/filelock.py`：自研 `msvcrt` / `fcntl` 分支 + 轮询重试（96 行） | `filelock` 4.3.1（51 行封装，保留 `file_lock` / `FileLockTimeout` API） | Windows 打开竞争、平台差异、超时轮询交给上游维护 | `tests/test_hardening.py` 文件锁用例 + 全量回归 |
 | `mas/store/redis_backend.py`：自研 socket + RESP2 编解码（约 100 行协议代码） | `redis-py` 8.2.0（保留 `RedisClient` / `RedisBackend` API 与返回类型归一化） | 连接池、超时、重连、RESP2/RESP3 兼容由官方客户端维护 | 真实 Redis 集成 **16 passed**（含 Streams 消费组、PEL 认领、ACK、DLQ） |
-| `mas/mcp.py`：自研换行 JSON-RPC、子进程管道、SSE 帧解析（约 280 行传输层） | 官方 `mcp` 2.3.0（`stdio_client` / `sse_client` + `ClientSession`），保留 `MCPClient` 同步 API | 协议版本、通知帧、响应 id 匹配、错误类型由 SDK 维护；`_AsyncSession` 只做线程/事件循环桥接 | `tests/test_mcp.py` **12 passed**；真实 Playwright MCP `mcp check` 握手成功并返回 **25 个工具** |
+| `mas/mcp.py`：自研换行 JSON-RPC、子进程管道、SSE 帧解析（约 280 行传输层） | 官方 `mcp` 2.3.0（`stdio_client` / `sse_client` + `ClientSession`），保留 `MCPClient` 同步 API；`_AsyncSession` 用 anyio `BlockingPortal` 承载事件循环 | 协议版本、通知帧、响应 id 匹配、错误类型由 SDK 维护；事件循环线程由 anyio 管理 | `tests/test_mcp.py` **12 passed**；真实 Playwright MCP `mcp check` 握手成功并返回 **25 个工具** |
+| `mas/websearch.py`、`mas/sources.py`、`mas/leader.py` 运行通知、`mas/uiprober.py` 探活：`urllib` 手写 GET/POST | `httpx` 0.28.1 | 超时、重定向、HTTP 错误类型统一，四个调用点共用同一 HTTP 栈 | `test_websearch.py` **18 passed**、`test_sources.py` **15 passed**；受影响五组定向 **103 passed** |
 
 > Redis 替换时发现三处返回类型差异（Stream 字段由扁平数组变为 dict、`XPENDING` 摘要/详情由列表变为 dict、`XINFO GROUPS` 变为 dict），已在 `_normalize_stream_entries` / `xpending` / `xpending_detail` / `xinfo_groups` 做双形态兼容——上层 MQ 与注册表代码零改动。
 >

@@ -900,7 +900,8 @@ class Leader:
         import hashlib
         import hmac
         import time
-        import urllib.request
+
+        import httpx
 
         url = os.environ.get("FEISHU_WEBHOOK_URL") or str(cfg.get("webhook") or "")
         secret = os.environ.get("FEISHU_WEBHOOK_SECRET") or str(cfg.get("secret") or "")
@@ -918,13 +919,11 @@ class Leader:
             payload["timestamp"] = timestamp
             payload["sign"] = base64.b64encode(
                 hmac.new(key, digestmod=hashlib.sha256).digest()).decode("utf-8")
-        request = urllib.request.Request(
-            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=int(cfg.get("timeout_s", 10))) as resp:
-                result = json.loads(resp.read().decode("utf-8") or "{}")
+            response = httpx.post(url, json=payload, timeout=int(cfg.get("timeout_s", 10)),
+                                  follow_redirects=True)
+            response.raise_for_status()
+            result = response.json()
         except Exception as exc:  # noqa: BLE001 - 通知是旁路，任何失败都不影响运行结论
             events.emit("notify_failed", agent="leader", severity="warning",
                         payload={"channel": "feishu", "error": f"{type(exc).__name__}: {exc}"})

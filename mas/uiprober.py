@@ -122,20 +122,20 @@ class UiProber:
     @staticmethod
     def _http_probe(base_url: str, timeout: int = 10) -> Dict[str, Any]:
         """框架进程对被测服务发一次真实 GET，记录状态码/响应特征（probe 写，agent 不参与）。"""
-        import urllib.error
-        import urllib.request
+        import httpx
 
         started = time.time()
         try:
-            with urllib.request.urlopen(base_url, timeout=timeout) as response:  # noqa: S310
-                body = response.read(4096).decode("utf-8", errors="replace")
-                return {"url": base_url, "status": int(response.status),
-                        "content_type": str(response.headers.get("Content-Type", "")),
-                        "body_head": body[:200], "error": "",
-                        "duration_ms": int((time.time() - started) * 1000)}
-        except urllib.error.HTTPError as exc:
-            return {"url": base_url, "status": int(exc.code), "content_type": "",
-                    "body_head": "", "error": f"HTTPError: {exc.reason}",
+            response = httpx.get(base_url, timeout=timeout, follow_redirects=True)
+            response.raise_for_status()
+            body = response.text[:4096]
+            return {"url": base_url, "status": int(response.status_code),
+                    "content_type": str(response.headers.get("Content-Type", "")),
+                    "body_head": body[:200], "error": "",
+                    "duration_ms": int((time.time() - started) * 1000)}
+        except httpx.HTTPStatusError as exc:
+            return {"url": base_url, "status": int(exc.response.status_code), "content_type": "",
+                    "body_head": "", "error": f"HTTPStatusError: {exc.response.status_code}",
                     "duration_ms": int((time.time() - started) * 1000)}
         except Exception as exc:  # noqa: BLE001 - 连不上就是取不到证据，如实记录
             return {"url": base_url, "status": 0, "content_type": "", "body_head": "",
