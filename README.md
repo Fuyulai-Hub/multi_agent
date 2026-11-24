@@ -74,7 +74,7 @@ python frontend/server.py --port 8080
 
 | 项 | 版本 / 说明 |
 | --- | --- |
-| Python | 3.11+；开发机实测 3.13.12 与 3.14 |
+| Python | 3.11+（3.13.12 / 3.14 实测；3.11 未实测） |
 | 操作系统 | Windows / Linux 均可；Windows 无 `rlimit`，沙箱只保留 `sandbox_timeout` |
 | 编排层 | LangGraph `StateGraph`；`mas/leader.py` 只做装配与收尾，不再持有调度循环 |
 
