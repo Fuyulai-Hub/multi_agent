@@ -52,6 +52,7 @@ class ToolRunner:
             # 工具面，也避免每次 run 无谓启动一个浏览器子进程。
             if server.get("tools_for_llm") is False:
                 continue
+            client = None
             try:
                 client = MCPClient(server)
                 client.start()
@@ -71,7 +72,14 @@ class ToolRunner:
                         },
                     })
             except ConfigError:
-                continue  # 服务不可用：跳过（CLI 的 mcp check 负责诊断，这里不阻塞主流程）
+                # 服务不可用：跳过（CLI 的 mcp check 负责诊断，这里不阻塞主流程）。
+                # 已建立的会话要显式关闭，避免子进程/临时 stderr 文件泄漏。
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:  # noqa: BLE001 - 清理失败不掩盖原降级语义
+                        pass
+                continue
         return self.schemas
 
     def register_static(self, tools: List[Dict[str, Any]]) -> None:

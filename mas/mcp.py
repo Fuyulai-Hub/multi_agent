@@ -19,29 +19,29 @@ servers:
     headers: {Authorization: "Bearer ${TOKEN}"}
 ```
 
-实现取舍：项目唯一依赖是 PyYAML，不引入 MCP SDK，因此这里只实现健康检查所需的
-三个方法（`initialize` / `tools/list` / `tools/call`），不做完整规范兼容。
-- stdio：子进程 + 换行分隔的 JSON-RPC 2.0；
-- sse：GET 建立事件流拿 POST 端点，POST 发请求，再从事件流读回响应。
+实现方式（2026-11-25 重构）：传输与 JSON-RPC 交给官方 `mcp` SDK
+（`stdio_client` / `sse_client` + `ClientSession`），本模块只保留项目语义：
+配置 CRUD、`${VAR}` 展开、同步门面、五阶段错误定位。SDK 是 asyncio 接口，
+而 MAS 调度是同步线程，因此 `_AsyncSession` 在后台线程跑一个事件循环做桥接；
+本模块不再解析任何 JSON-RPC 帧。
 """
 
 from __future__ import annotations
 
-import http.client
+import asyncio
+import concurrent.futures
 import json
 import os
-import queue
 import re
-import subprocess
+import tempfile
 import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import yaml
+from mcp import ClientSession, types as mcp_types
+from mcp.client.sse import sse_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from . import __version__
 from .config import SystemConfig, mask_secret
@@ -64,7 +64,6 @@ __all__ = [
 
 MCP_FILE = "mcp.yaml"
 TRANSPORTS = ("stdio", "sse")
-PROTOCOL_VERSION = "2024-11-05"
 DEFAULT_TIMEOUT_S = 10
 
 _NAME = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
@@ -224,211 +223,199 @@ def describe_server(server: Dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------- 传输层
-class _StdioTransport:
-    """stdio：子进程 + 换行分隔的 JSON-RPC。"""
+class _StderrLog:
+    """把 MCP 子进程的 stderr 落到临时文件，失败时读取末尾片段。
 
-    def __init__(self, command: str, args: List[str], env: Dict[str, str], timeout: int) -> None:
-        self.command = command
-        self.args = args
-        self.env = env
-        self.timeout = timeout
-        self._proc: Optional[subprocess.Popen] = None
-        self._lines: "queue.Queue[Optional[str]]" = queue.Queue()
-        self._thread: Optional[threading.Thread] = None
+    SDK 的 ``errlog`` 会直接作为子进程 stderr 传给 anyio，必须是带真实文件描述符
+    的文件对象（``io.StringIO`` 会报 UnsupportedOperation: fileno），因此这里用
+    命名临时文件，而不是内存缓冲。
+    """
 
-    def start(self) -> None:
-        merged = dict(os.environ)
-        merged.update(self.env)
-        merged.setdefault("PYTHONIOENCODING", "utf-8")
+    def __init__(self, limit: int = 400) -> None:
+        self._limit = limit
+        handle, name = tempfile.mkstemp(prefix="mas-mcp-", suffix=".log")
+        os.close(handle)
+        self._path = Path(name)
+        self._handle = self._path.open("wb")
+
+    def stream(self) -> Any:
+        return self._handle
+
+    def tail(self) -> str:
         try:
-            self._proc = subprocess.Popen(
-                [self.command] + list(self.args),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=merged,
-                bufsize=1,
-            )
-        except FileNotFoundError as exc:
-            raise ConfigError(f"启动命令不存在: {self.command}（{exc}）") from exc
-        except OSError as exc:
-            raise ConfigError(f"启动 MCP 服务失败: {self.command}（{exc}）") from exc
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
-
-    def _reader(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        try:
-            for line in self._proc.stdout:
-                self._lines.put(line)
-        except (ValueError, OSError):
-            pass
-        self._lines.put(None)
-
-    def send(self, message: Dict[str, Any]) -> None:
-        assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-        self._proc.stdin.flush()
-
-    def receive(self) -> str:
-        line = self._lines.get(timeout=self.timeout)
-        if line is None:
-            raise ConfigError("MCP 服务进程已退出（stdout 关闭）")
-        return line
-
-    def stderr_tail(self, limit: int = 400) -> str:
-        if self._proc is None or self._proc.stderr is None:
+            self._handle.flush()
+            raw = self._path.read_bytes()
+        except (OSError, ValueError):
             return ""
-        try:
-            self._proc.wait(timeout=0.2)
-            text = self._proc.stderr.read() or ""
-        except subprocess.TimeoutExpired:
-            return ""
-        return text[-limit:]
+        return raw.decode("utf-8", errors="replace")[-self._limit:].strip()
 
     def close(self) -> None:
-        if self._proc is None:
-            return
         try:
-            if self._proc.stdin:
-                self._proc.stdin.close()
+            self._handle.close()
         except OSError:
             pass
         try:
-            self._proc.terminate()
-            self._proc.wait(timeout=3)
-        except (subprocess.TimeoutExpired, OSError):
-            try:
-                self._proc.kill()
-            except OSError:
-                pass
-        for stream in (self._proc.stdout, self._proc.stderr):
-            try:
-                if stream:
-                    stream.close()
-            except OSError:
-                pass
+            self._path.unlink()
+        except OSError:
+            pass
 
 
-class _SSETransport:
-    """sse：GET 建立事件流取 POST 端点，POST 发请求，再从事件流读回响应。"""
+def _leaf_errors(exc: BaseException) -> List[BaseException]:
+    """把 anyio / 官方 SDK 的 ExceptionGroup 摊平成叶子异常。"""
+    if isinstance(exc, BaseExceptionGroup):
+        leaves: List[BaseException] = []
+        for inner in exc.exceptions:
+            leaves.extend(_leaf_errors(inner))
+        return leaves
+    return [exc]
 
-    def __init__(self, url: str, headers: Dict[str, str], timeout: int) -> None:
-        self.url = url
-        self.headers = headers
-        self.timeout = timeout
-        self._conn: Optional[http.client.HTTPConnection] = None
-        self._resp: Optional[http.client.HTTPResponse] = None
-        self._post_url = ""
 
+class _AsyncSession:
+    """把官方 SDK 的异步会话桥接成同步调用。
+
+    MAS 的调度、工具循环与取证都是同步代码；官方 ``mcp`` 客户端是 asyncio。
+    这里只做「后台线程 + 事件循环 + run_coroutine_threadsafe」的桥接，
+    JSON-RPC 帧、响应 id 匹配与通知处理全部由 SDK 负责。
+    """
+
+    def __init__(self, factory: Any, timeout_s: float, *, command: str = "",
+                 log_tail: Any = None) -> None:
+        self._factory = factory
+        self._timeout = float(timeout_s)
+        self._command = command
+        self._log_tail = log_tail
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run, name="mcp-session", daemon=True)
+        self._ready = threading.Event()
+        self._stop: Optional[asyncio.Event] = None
+        self._session: Optional[ClientSession] = None
+        self._error: Optional[BaseException] = None
+        self._stopping = False
+
+    # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
-        parsed = urllib.parse.urlparse(self.url)
-        if not parsed.hostname:
-            raise ConfigError(f"url 缺少主机名: {self.url}")
-        factory = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-        try:
-            self._conn = factory(parsed.hostname, parsed.port or None, timeout=self.timeout)
-            path = parsed.path or "/"
-            if parsed.query:
-                path = f"{path}?{parsed.query}"
-            self._conn.request("GET", path, headers={"Accept": "text/event-stream", **self.headers})
-            self._resp = self._conn.getresponse()
-        except OSError as exc:
-            raise ConfigError(f"无法连接 MCP 服务: {self.url}（{exc}）") from exc
-        if self._resp.status >= 400:
-            raise ConfigError(f"MCP 服务返回 HTTP {self._resp.status}: {self.url}")
-
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
-            event, data = self._read_event()
-            if event == "endpoint" and data:
-                self._post_url = urllib.parse.urljoin(self.url, data)
-                return
-        raise ConfigError(f"SSE 握手超时：{self.timeout}s 内未收到 endpoint 事件")
-
-    def _read_event(self) -> Tuple[str, str]:
-        assert self._resp is not None
-        event, data_lines = "", []
-        while True:
-            raw = self._resp.readline()
-            if not raw:
-                raise ConfigError("SSE 连接已关闭（未读到完整响应）")
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-            line = line.rstrip("\r\n")
-            if not line:
-                if event or data_lines:
-                    return event, "\n".join(data_lines)
-                continue
-            if line.startswith(":"):
-                continue
-            if line.startswith("event:"):
-                event = line[len("event:"):].strip()
-            elif line.startswith("data:"):
-                data_lines.append(line[len("data:"):].strip())
-
-    def send(self, message: Dict[str, Any]) -> None:
-        body = json.dumps(message, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            self._post_url, data=body,
-            headers={"Content-Type": "application/json", **self.headers},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                response.read()
-        except urllib.error.URLError as exc:
-            raise ConfigError(f"向 MCP 服务发送请求失败: {self._post_url}（{exc}）") from exc
-
-    def receive(self) -> str:
-        _, data = self._read_event()
-        return data
-
-    def stderr_tail(self, limit: int = 400) -> str:
-        return ""
+        self._thread.start()
+        if not self._ready.wait(self._timeout):
+            self.close()
+            raise ConfigError(f"MCP 服务 {self._timeout}s 内未就绪")
+        if self._error is not None:
+            message = self._describe(self._error)
+            self.close()
+            raise ConfigError(message)
 
     def close(self) -> None:
-        if self._resp is not None:
+        self._stopping = True
+        if self._stop is not None and not self._loop.is_closed():
             try:
-                self._resp.close()
-            except OSError:
+                self._loop.call_soon_threadsafe(self._stop.set)
+            except RuntimeError:
                 pass
-        if self._conn is not None:
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._main())
+        except BaseException as exc:          # noqa: BLE001 - 线程边界，转交主线程
+            if not self._stopping:
+                self._error = exc
+            self._ready.set()
+        finally:
             try:
-                self._conn.close()
-            except OSError:
+                self._loop.close()
+            except Exception:                 # noqa: BLE001 - 关闭失败不应掩盖原错误
                 pass
+
+    async def _main(self) -> None:
+        self._stop = asyncio.Event()
+        try:
+            async with self._factory() as streams:
+                read, write = streams[0], streams[1]
+                async with ClientSession(
+                    read, write, read_timeout_seconds=self._timeout,
+                    client_info=mcp_types.Implementation(name="mas", version=__version__),
+                ) as session:
+                    self._session = session
+                    self._ready.set()
+                    await self._stop.wait()
+        except BaseException as exc:          # noqa: BLE001 - 同上
+            if not self._stopping:
+                self._error = exc
+            self._ready.set()
+
+    # ---------------------------------------------------------------- 调用
+    def call(self, fn: Any) -> Any:
+        if self._error is not None:
+            raise ConfigError(self._describe(self._error))
+        if self._session is None:
+            raise ConfigError("MCP 会话尚未建立")
+        future = asyncio.run_coroutine_threadsafe(fn(self._session), self._loop)
+        try:
+            return future.result(self._timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise ConfigError(f"MCP 服务 {self._timeout}s 内无响应") from exc
+        except BaseException as exc:          # noqa: BLE001 - 统一转 ConfigError
+            raise ConfigError(self._describe(exc)) from exc
+
+    def _describe(self, exc: BaseException) -> str:
+        leaves = _leaf_errors(exc)
+        for leaf in leaves:
+            if isinstance(leaf, FileNotFoundError):
+                return f"启动命令不存在: {self._command}"
+            if isinstance(leaf, PermissionError):
+                return f"启动 MCP 服务被拒绝: {self._command}（{leaf}）"
+        text = "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves) or str(exc)
+        message = f"MCP 服务错误: {text}"
+        tail = self._log_tail() if self._log_tail is not None else ""
+        if tail:
+            message += f"（stderr 末尾：{tail}）"
+        return message
 
 
 # --------------------------------------------------------------------------- 客户端
 class MCPClient:
-    """MCP 最小客户端（只实现健康检查所需的三个方法）。"""
+    """官方 MCP SDK 的同步门面：start / initialize / list_tools / call_tool / close。"""
 
     def __init__(self, server: Dict[str, Any]) -> None:
         self.server = server
         self.name = str(server.get("name", ""))
         self.timeout = int(server.get("timeout_s", DEFAULT_TIMEOUT_S))
         transport = str(server.get("transport", ""))
+        self._log: Optional[_StderrLog] = None
         if transport == "stdio":
             origin = f"MCP 服务 {self.name}"
-            self._transport: Any = _StdioTransport(
-                command=expand_env(server.get("command", ""), origin=f"{origin}.command"),
-                args=[expand_env(item, origin=f"{origin}.args") for item in (server.get("args") or [])],
-                env={str(k): expand_env(v, origin=f"{origin}.env.{k}")
-                     for k, v in (server.get("env") or {}).items()},
-                timeout=self.timeout,
+            command = expand_env(server.get("command", ""), origin=f"{origin}.command")
+            args = [expand_env(item, origin=f"{origin}.args") for item in (server.get("args") or [])]
+            env = dict(os.environ)
+            env.update({str(k): expand_env(v, origin=f"{origin}.env.{k}")
+                        for k, v in (server.get("env") or {}).items()})
+            # Windows 子进程默认按 locale（GBK）写 stdout；SDK 按 UTF-8 解码会直接崩。
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env.setdefault("PYTHONUTF8", "1")
+            params = StdioServerParameters(
+                command=command, args=args, env=env,
+                cwd=server.get("cwd") or None,
+                encoding="utf-8", encoding_error_handler="replace",
+            )
+            self._log = _StderrLog()
+            self._session = _AsyncSession(
+                lambda: stdio_client(params, errlog=self._log.stream()), self.timeout,
+                command=command, log_tail=self._log.tail,
             )
         elif transport == "sse":
-            self._transport = _SSETransport(
-                url=expand_env(server.get("url", ""), origin=f"MCP 服务 {self.name}.url"),
-                headers={str(k): expand_env(v, origin=f"MCP 服务 {self.name}.headers.{k}")
-                         for k, v in (server.get("headers") or {}).items()},
-                timeout=self.timeout,
+            origin = f"MCP 服务 {self.name}"
+            url = expand_env(server.get("url", ""), origin=f"{origin}.url")
+            headers = {str(k): expand_env(v, origin=f"{origin}.headers.{k}")
+                       for k, v in (server.get("headers") or {}).items()}
+            self._session = _AsyncSession(
+                lambda: sse_client(url, headers=headers, timeout=self.timeout,
+                                   sse_read_timeout=max(300.0, float(self.timeout))),
+                self.timeout,
             )
         else:
             raise ConfigError(f"不支持的传输方式: {transport}（{' | '.join(TRANSPORTS)}）")
-        self._id = 0
 
     # ---------------------------------------------------------------- 生命周期
     def __enter__(self) -> "MCPClient":
@@ -439,68 +426,36 @@ class MCPClient:
         self.close()
 
     def start(self) -> None:
-        self._transport.start()
+        try:
+            self._session.start()
+        except ConfigError:
+            if self._log is not None:
+                self._log.close()       # 启动失败也要回收临时 stderr 文件
+            raise
 
     def close(self) -> None:
-        self._transport.close()
+        self._session.close()
+        if self._log is not None:
+            self._log.close()
+
+    def stderr_tail(self, limit: int = 400) -> str:
+        return self._log.tail()[:limit] if self._log is not None else ""
 
     # ---------------------------------------------------------------- 协议
-    def request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """发一次请求并返回**按 id 匹配**的响应。
-
-        MCP 服务会在响应之间插入通知帧（实测 Playwright MCP 会在 tools/call 前发
-        ``notifications/tools/list_changed``，该帧没有 id）。只读一行就当响应会导致
-        两层故障：
-          1. 读到通知帧 → payload 里既无 result 也无 error，call_tool 返回 {}；
-          2. 响应流整体错位一格 → 本次调用拿到上一次调用的结果。
-        表现为 browser_navigate 返回 {}、browser_evaluate 返回上一次导航的文本，
-        且是否发生取决于服务端发通知的时机（随机复现）。
-        因此这里循环读帧，跳过通知（无 id）与非本请求 id 的响应，直到匹配或超时。
-        """
-        self._id += 1
-        message = {"jsonrpc": "2.0", "id": self._id, "method": method}
-        if params is not None:
-            message["params"] = params
-        self._transport.send(message)
-
-        deadline = time.time() + self.timeout
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise ConfigError(f"MCP 服务 {self.timeout}s 内无响应（method={method}）")
-            try:
-                raw = self._transport.receive()
-            except queue.Empty as exc:
-                raise ConfigError(f"MCP 服务 {self.timeout}s 内无响应（method={method}）") from exc
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ConfigError(f"MCP 服务返回了非 JSON 内容: {raw[:200]}") from exc
-            if not isinstance(payload, dict):
-                continue  # 批量/异常形态：与本次请求无关，跳过
-            if "id" not in payload:
-                continue  # 通知帧（如 notifications/tools/list_changed）
-            if payload.get("id") != self._id:
-                continue  # 非本请求的响应（错位残留）
-            if "error" in payload:
-                error = payload["error"]
-                raise ConfigError(f"MCP 返回错误 {error.get('code')}: {error.get('message')}")
-            return payload
-
     def initialize(self) -> Dict[str, Any]:
-        return self.request("initialize", {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "mas", "version": __version__},
-        })
+        result = self._session.call(lambda session: session.initialize())
+        return result.model_dump(by_alias=True, mode="json", exclude_none=True)
 
     def list_tools(self) -> List[Dict[str, Any]]:
-        payload = self.request("tools/list")
-        return list((payload.get("result") or {}).get("tools") or [])
+        result = self._session.call(lambda session: session.list_tools())
+        return [tool.model_dump(by_alias=True, mode="json", exclude_none=True)
+                for tool in result.tools]
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        payload = self.request("tools/call", {"name": name, "arguments": arguments or {}})
-        return payload.get("result") or {}
+        result = self._session.call(
+            lambda session: session.call_tool(name, arguments or {})
+        )
+        return result.model_dump(by_alias=True, mode="json", exclude_none=True)
 
 
 # --------------------------------------------------------------------------- 装载与冒烟

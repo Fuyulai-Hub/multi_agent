@@ -12,6 +12,12 @@ langgraph-checkpoint-sqlite>=3.0
 filelock>=3.13
 redis>=5,<9
 
+# ---- 扩展能力：运行必需（2026-11-25 重构）-----------------------------------
+# 官方 MCP SDK：stdio/SSE 传输、会话与 JSON-RPC 帧由 SDK 维护，
+# 替换 mas/mcp.py 里自研的协议解析（客户端/服务端共用同一发行包，
+# 会带入 starlette/uvicorn/cryptography 等传递依赖）。
+mcp>=2.3,<3
+
 # ---- 可选依赖（docs/25 存储层接入）-----------------------------------------
 # MySQL 索引/结构层：未安装时 mas.store.build_mysql_backend 返回 None，
 # 全系统自动回落到 jsonl 文件路径（软依赖降级，不报错）。

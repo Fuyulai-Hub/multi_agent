@@ -81,11 +81,17 @@ class _SSEHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         request = json.loads(raw)
         method = request.get("method")
+        if "id" not in request:       # 通知帧（notifications/initialized）不回包
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if method == "initialize":
             result = {"protocolVersion": "2024-11-05", "capabilities": {},
                       "serverInfo": {"name": "fake-sse", "version": "0.1.0"}}
         elif method == "tools/list":
-            result = {"tools": [{"name": "remote_echo"}]}
+            result = {"tools": [{"name": "remote_echo",
+                                 "inputSchema": {"type": "object"}}]}
         else:
             result = {}
         _SSE_QUEUE.put({"jsonrpc": "2.0", "id": request.get("id"), "result": result})

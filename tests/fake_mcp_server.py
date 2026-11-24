@@ -46,6 +46,10 @@ def main() -> None:
             continue
         request = json.loads(line)
         method = request.get("method")
+        if "id" not in request:
+            # JSON-RPC 通知（如 notifications/initialized）按规范不得回包；
+            # 旧的自研客户端不发通知，官方 SDK 会发，回一个 id=None 的响应会让对端报错。
+            continue
         if NOTIFY_BEFORE_CALL and method == "tools/call":
             sys.stdout.write(json.dumps(
                 {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},

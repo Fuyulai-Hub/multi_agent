@@ -87,6 +87,7 @@ python frontend/server.py --port 8080
 | **langgraph-checkpoint-sqlite** | `>=3.0` | 图检查点 `graph.sqlite`（续跑权威源） | `mas/orchestration/checkpoint.py` |
 | **filelock** | `>=3.13` | 跨进程文件锁（黑板/经验库并发写） | `mas/filelock.py` |
 | **redis** | `>=5,<9` | Redis 客户端：运行注册表、缓存、分布式锁、Streams MQ | `mas/store/redis_backend.py` |
+| **mcp** | `>=2.3,<3` | 官方 MCP SDK：stdio/SSE 传输、会话与 JSON-RPC 帧 | `mas/mcp.py` |
 | **PyMySQL**（可选） | `>=1.1` | MySQL 索引/结构层；未安装自动降级为 jsonl，不报错 | `mas/store/mysql_backend.py` |
 
 ### 标准库承担的能力
@@ -127,8 +128,11 @@ python frontend/server.py --port 8080
 | --- | --- | --- | --- |
 | `mas/filelock.py`：自研 `msvcrt` / `fcntl` 分支 + 轮询重试（96 行） | `filelock` 4.3.1（51 行封装，保留 `file_lock` / `FileLockTimeout` API） | Windows 打开竞争、平台差异、超时轮询交给上游维护 | `tests/test_hardening.py` 文件锁用例 + 全量回归 |
 | `mas/store/redis_backend.py`：自研 socket + RESP2 编解码（约 100 行协议代码） | `redis-py` 8.2.0（保留 `RedisClient` / `RedisBackend` API 与返回类型归一化） | 连接池、超时、重连、RESP2/RESP3 兼容由官方客户端维护 | 真实 Redis 集成 **16 passed**（含 Streams 消费组、PEL 认领、ACK、DLQ） |
+| `mas/mcp.py`：自研换行 JSON-RPC、子进程管道、SSE 帧解析（约 280 行传输层） | 官方 `mcp` 2.3.0（`stdio_client` / `sse_client` + `ClientSession`），保留 `MCPClient` 同步 API | 协议版本、通知帧、响应 id 匹配、错误类型由 SDK 维护；`_AsyncSession` 只做线程/事件循环桥接 | `tests/test_mcp.py` **12 passed**；真实 Playwright MCP `mcp check` 握手成功并返回 **25 个工具** |
 
 > Redis 替换时发现三处返回类型差异（Stream 字段由扁平数组变为 dict、`XPENDING` 摘要/详情由列表变为 dict、`XINFO GROUPS` 变为 dict），已在 `_normalize_stream_entries` / `xpending` / `xpending_detail` / `xinfo_groups` 做双形态兼容——上层 MQ 与注册表代码零改动。
+>
+> MCP 替换时处理了三处运行时差异：① SDK 会发送 `notifications/initialized`，测试桩必须按 JSON-RPC 规范对通知不回包；② Windows 子进程默认按 GBK 写 stdout，必须在子进程环境显式注入 `PYTHONIOENCODING=utf-8`；③ SDK 的 `errlog` 需要真实文件描述符，stderr 改用临时文件收集末尾片段。
 
 ### 评估后保留（并说明理由）
 
@@ -137,7 +141,6 @@ python frontend/server.py --port 8080
 | `mas/expr.py` | 门禁表达式的 `BoolOp` 不短路语义被现有 `flow.yaml` 依赖（`A or B` 中 B 字段缺失会判整条失败）；换成 `simpleeval` 等库会改变裁决 |
 | `mas/llm.py` | SSE 逐行读取 + `should_stop` 取消探测是 docs/41 的硬契约，换官方 SDK 需要重做取消路径 |
 | `frontend/server.py` | 面板的令牌、同源、CORS、路径约束由 `test_panel_security.py` 逐条锁定；迁移 Flask 属独立里程碑，不在本次范围 |
-| `mas/mcp.py` | 只实现健康检查所需的最小 JSON-RPC 子集（stdio/SSE），官方 SDK 的传输层不覆盖现有配置格式 |
 | `mas/concurrency.py` | 语义是「保序 + 异常原位返回」，不是通用 map；底层已用 `ThreadPoolExecutor` |
 
 ## 前端面板
@@ -374,7 +377,7 @@ mas/
 ├── prompts.py      # Prompt 组装（感知段 + 分层经验段 + 交付契约）
 ├── llm.py          # LLM 客户端（offline / openai_compatible）
 ├── skills.py       # 技能注册表：目录规范、持久化、参数校验、冒烟、流程沉淀
-├── mcp.py          # MCP 服务配置与最小客户端（stdio / sse，仅实现健康检查所需方法）
+├── mcp.py          # MCP 服务配置 + 官方 SDK 同步门面（stdio / sse）
 ├── toolrunner.py   # MCP 工具 ↔ function calling 适配器（工具调用闭环）
 ├── sandbox.py      # 沙箱执行 + AST 静态分析
 ├── compress.py     # 上下文压缩（Prompt 感知段，默认关闭恒等返回）

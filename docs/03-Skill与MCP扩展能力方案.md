@@ -312,6 +312,10 @@ config_parse  →  param_validate  →  transport_connect  →  handshake  →  
 
 ### 6.2 MCP 客户端：零依赖自研
 
+> **2026-11-25 更新**：项目已不再坚持「唯一依赖 PyYAML」，本节的零依赖自研方案已废弃；
+> `mas/mcp.py` 的传输层已迁移到官方 `mcp` SDK（`stdio_client` / `sse_client` + `ClientSession`），
+> 仅保留配置 CRUD、`${VAR}` 展开、同步门面与五阶段错误定位。详见 README「技术栈与依赖」。
+
 项目唯一依赖是 PyYAML，因此**不引入 `mcp` SDK**，自研最小客户端（约 150 行）：
 
 - **stdio**：`subprocess.Popen(cmd, args, env=..., stdin=PIPE, stdout=PIPE, stderr=PIPE)`，按 newline-delimited JSON 收发 JSON-RPC 2.0。
