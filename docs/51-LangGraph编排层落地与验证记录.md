@@ -3,6 +3,8 @@
 > 对象：`G:/mycv/cragent/multi_agent`
 > 依据：`docs/50-LangGraph重构技术方案.md`
 > 结论：**按方案落地了编排层替换（legacy / langgraph 双轨 + 开关），默认仍是 legacy；两条路径在离线端到端 A/B 中产出逐项相同的运行结果。**
+>
+> **2026-11-25 更新**：§3 第 6 条（P4 删 legacy 循环）已执行，双轨收敛为 LangGraph 单路径，`runtime.orchestrator` 开关已删除，见 `docs/53-编排层单路径切换与legacy清理.md`。
 
 ---
 

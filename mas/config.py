@@ -764,10 +764,14 @@ def _validate(config: SystemConfig) -> None:
     if config.llm.get("provider") not in {"offline", "openai_compatible"}:
         problems.append(f"llm.provider 非法: {config.llm.get('provider')}（offline | openai_compatible）")
 
-    # 编排层开关（docs/50）：拼错不能静默退回 legacy，否则 A/B 对照会得到假结论
-    orchestrator = str(config.runtime.get("orchestrator") or "legacy")
-    if orchestrator not in {"legacy", "langgraph"}:
-        problems.append(f"runtime.orchestrator 非法: {orchestrator}（legacy | langgraph）")
+    # 编排层（docs/53）：2026-11-25 起只保留 LangGraph 单路径，legacy 循环已删除。
+    # 残留开关值必须显式报错——静默忽略会让旧配置的主人误以为自己还在跑 legacy。
+    orchestrator = config.runtime.get("orchestrator")
+    if orchestrator is not None and str(orchestrator) != "langgraph":
+        problems.append(
+            f"runtime.orchestrator 已废弃: {orchestrator!r}"
+            "（legacy 循环已删除，编排层固定为 LangGraph；请删除该键或改为 langgraph）"
+        )
 
     if problems:
         raise ConfigError("配置校验失败:\n  - " + "\n  - ".join(problems))

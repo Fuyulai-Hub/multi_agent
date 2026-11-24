@@ -4,11 +4,16 @@
 本模块补两件事，全部在 ``enabled=false`` 时恒等返回（行为与现状逐字节一致）：
 
 1. 感知段结构化压缩 ``found_artifacts``：按 artifact 名分派压缩策略（白名单制），
-   未知名保持现状硬截断不动；先按 ``per_item_chars`` 压，再按 ``total_chars`` 优先级裁剪；
+   未知名保持现状硬截断不动；**只在单产物超过 ``per_item_chars`` 时**才压缩
+   （该阈值与 ``runtime.prompt_artifact_max_chars`` 同为「brief 会硬截断」的那条线，
+   故压压缩恰好接管硬截断发生的位置），先按 L1 压，仍超预算再 L2 深压，
+   最后按 ``total_chars`` 优先级裁剪；
 2. tool 结果统一截断 ``truncate_tool_results``：头 60% + 尾 40%，中间标注省略字符数。
 
 边界原则：压缩只改「进 Prompt 的内容」，**绝不改黑板上的 artifact 数据**——
 门禁求值走 ``blackboard.snapshot()``，与压缩完全隔离（压缩出错不可能刷绿门禁）。
+调用方（``BaseAgent.perceive``）同样只在渲染 ``artifacts_brief`` 时使用压缩结果，
+``Perception.found`` 仍保留完整产物，避免下游 Agent 的逻辑判断被压缩影响。
 本模块不 import LLM（LLM 摘要列为可选第二步，默认关闭）。
 """
 
@@ -137,7 +142,10 @@ def found_artifacts(
 ) -> CompressionResult:
     """对感知到的上游产物做结构化压缩；``enabled=false`` 时恒等返回。
 
-    预算为 0 / 负数时只做「深压」不抛异常；artifact 为 null / 标量时保持原样（不压缩）。
+    阈值语义（与 ``blackboard.brief`` 的硬截断完全对齐）：**只有单个产物超过
+    ``per_item_chars`` 才压缩**——预算内的产物原样透传，压了反而丢掉本可完整保留的
+    细节（如 test_report 的逐条用例明细）。超阈值产物先 L1 压，仍超再 L2 深压。
+    预算为 0 / 负数时按深压处理不抛异常；artifact 为 null / 标量时保持原样（不压缩）。
     """
     if not isinstance(found, dict):
         return CompressionResult({}, 0, 0, [], [])
@@ -156,6 +164,12 @@ def found_artifacts(
             artifacts[name] = value
             untouched.append(name)
             continue
+        original = _size(value)
+        if original <= per_item:
+            # 未达阈值：原样透传（这是「按阈值触发」的核心——没超就不动）
+            artifacts[name] = value
+            untouched.append(name)
+            continue
         try:
             reduced = strategy(value)
         except Exception:  # noqa: BLE001 - 压缩策略异常不得影响主流程
@@ -164,7 +178,7 @@ def found_artifacts(
             continue
         if _size(reduced) > per_item:
             reduced = _DEEP[name](reduced)
-        if _size(reduced) < _size(value):
+        if _size(reduced) < original:
             compressed.append(name)
         else:
             reduced = value

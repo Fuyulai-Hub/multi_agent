@@ -1,8 +1,8 @@
 """把「执行一个节点」包装成 LangGraph 节点函数（docs/50 §5.3）。
 
-节点函数里做的事与 legacy ``while`` 循环每一轮的循环体完全相同：
-执行（``Leader._execute_node``）→ 决策（``orchestration.decision.decide``）→ 写检查点。
-router 处不产生任何副作用，副作用只发生在这里（理由见 graph.py）。
+节点函数里做的事与切换前 ``while`` 循环每一轮的循环体完全相同（迁移时逐行搬出，
+语义未改）：执行（``Leader._execute_node``）→ 决策（``orchestration.decision.decide``）
+→ 写检查点。router 处不产生任何副作用，副作用只发生在这里（理由见 graph.py）。
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def make_node(deps: GraphDeps, node_id: str, node: Any) -> Callable[[RunState], 
             max_total_rollbacks=deps.max_total_rollbacks,
         )
         # 检查点写在「节点完成 + 分支落定」之后：崩溃发生在节点内部时 next_node
-        # 仍是该节点，恢复会重跑它；已完成的节点不会重跑（与 legacy 同口径）。
+        # 仍是该节点，恢复会重跑它；已完成的节点不会重跑（与切换前同口径）。
         leader._write_checkpoint(
             deps.checkpoint_path, req_title=deps.requirement_title,
             requirement_sha256=deps.requirement_sha256, next_node=decision.target,

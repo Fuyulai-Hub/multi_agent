@@ -19,7 +19,7 @@ def merge_dict(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
 
 class RunState(TypedDict, total=False):
     max_steps: int                       # 本次运行的步数上限（recursion_limit 的语义来源）
-    steps: int                           # 已执行节点数，与 legacy 循环同口径
+    steps: int                           # 已执行节点数，与切换前循环同口径
     iteration: int                       # 最近一次执行的节点是它的第几轮
     last_status: str                     # "pass" | "fail"
     last_summary: str

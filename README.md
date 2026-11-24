@@ -18,7 +18,7 @@ Leader 统一调度的流水线架构，实现 **需求输入 → 技术方案�
 ## 快速开始
 
 ```bash
-pip install -r requirements.txt        # 仅需 PyYAML
+pip install -r requirements.txt        # 依赖清单见「技术栈与依赖」一节
 
 # 方式一：一键演示（三轮：文档输入 → 经验复用 → 文字需求输入）
 python -m mas demo
@@ -67,6 +67,78 @@ python frontend/server.py --port 8080
 > 前端服务需要在**项目根目录**下执行，且依赖 `workspace/` 已存在（先用 `python -m mas demo` 或
 > `python -m mas run` 生成一次运行数据），否则会打印提示并以退出码 2 结束。
 > 更多启动方式见下文 [前端面板](#前端面板)。
+
+## 技术栈与依赖（2026-11-25 核对）
+
+### 运行环境
+
+| 项 | 版本 / 说明 |
+| --- | --- |
+| Python | 3.11+；开发机实测 3.13.12 与 3.14 |
+| 操作系统 | Windows / Linux 均可；Windows 无 `rlimit`，沙箱只保留 `sandbox_timeout` |
+| 编排层 | LangGraph `StateGraph`；`mas/leader.py` 只做装配与收尾，不再持有调度循环 |
+
+### 第三方库（`pip install -r requirements.txt`）
+
+| 库 | 版本约束 | 用途 | 引入位置 |
+| --- | --- | --- | --- |
+| **PyYAML** | `>=6.0` | 配置、流程、技能 front-matter 解析 | `mas/config.py`、`mas/skills.py` 等 |
+| **langgraph** | `>=1.2,<2.0` | 编排层状态图（唯一驱动路径） | `mas/orchestration/` |
+| **langgraph-checkpoint-sqlite** | `>=3.0` | 图检查点 `graph.sqlite`（续跑权威源） | `mas/orchestration/checkpoint.py` |
+| **filelock** | `>=3.13` | 跨进程文件锁（黑板/经验库并发写） | `mas/filelock.py` |
+| **redis** | `>=5,<9` | Redis 客户端：运行注册表、缓存、分布式锁、Streams MQ | `mas/store/redis_backend.py` |
+| **PyMySQL**（可选） | `>=1.1` | MySQL 索引/结构层；未安装自动降级为 jsonl，不报错 | `mas/store/mysql_backend.py` |
+
+### 标准库承担的能力
+
+| 标准库 | 用途 |
+| --- | --- |
+| `http.server` + `socketserver` | 前端面板 HTTP 服务（含令牌、同源、CORS、静态托管） |
+| `sqlite3` | LangGraph 检查点（`SqliteSaver`） |
+| `ast` | 门禁表达式安全求值（白名单节点）+ 交付代码静态分析 |
+| `argparse` | `python -m mas` CLI（run/demo/worker/mq/store/skill/mcp…） |
+| `urllib` | OpenAI 兼容 `/chat/completions` 流式请求、联网搜索 |
+| `concurrent.futures` | IO 密集任务并行（保序 `parallel_map`） |
+| `unittest` | 生成测试套件与验证执行器 |
+| `hashlib` / `hmac` | 产物摘要、门禁/契约签名 |
+| `xml.etree` / `zipfile` | 文档抽取（docx 等）与 RSS 解析 |
+| `threading` / `subprocess` / `queue` | 沙箱执行、运行注册表、MQ 消费线程 |
+
+### 外部服务（可选，缺失时自动降级）
+
+| 服务 | 版本 | 作用 | 启动方式 |
+| --- | --- | --- | --- |
+| MySQL | 8.0 | 运行/事件/产物索引（SSOT 仍是 jsonl 与文件系统） | `docker compose -f deploy/docker-compose.store.yml up -d` |
+| Redis | 7 | 跨进程运行注册表、取消协调、Streams 任务队列 | 同上 |
+| LLM 端点 | OpenAI 兼容 | `/chat/completions`；无 Key 时用内置 `offline` 确定性 Provider | `config/system.yaml` 的 `llm` 段 |
+
+### 前端与测试
+
+- 前端：原生 HTML / CSS / JavaScript，无框架、无构建步骤；通过 `fetch` 轮询 `/api/*`。
+- 测试：`pytest`（`python -m pytest -q tests`）+ 标准库 `unittest`。2026-11-25 实测：无外部服务时 **788 passed / 16 skipped**；接入真实 Redis 后 **798 passed / 6 skipped**（MySQL 用例因未装 PyMySQL 跳过）。
+
+## 重构原则与本次变更（2026-11-25）
+
+原则：**通用能力复用成熟库，领域契约不为了少写代码而换实现。**
+
+### 已替换
+
+| 原实现 | 现方案 | 收益 | 验证 |
+| --- | --- | --- | --- |
+| `mas/filelock.py`：自研 `msvcrt` / `fcntl` 分支 + 轮询重试（96 行） | `filelock` 4.3.1（51 行封装，保留 `file_lock` / `FileLockTimeout` API） | Windows 打开竞争、平台差异、超时轮询交给上游维护 | `tests/test_hardening.py` 文件锁用例 + 全量回归 |
+| `mas/store/redis_backend.py`：自研 socket + RESP2 编解码（约 100 行协议代码） | `redis-py` 8.2.0（保留 `RedisClient` / `RedisBackend` API 与返回类型归一化） | 连接池、超时、重连、RESP2/RESP3 兼容由官方客户端维护 | 真实 Redis 集成 **16 passed**（含 Streams 消费组、PEL 认领、ACK、DLQ） |
+
+> Redis 替换时发现三处返回类型差异（Stream 字段由扁平数组变为 dict、`XPENDING` 摘要/详情由列表变为 dict、`XINFO GROUPS` 变为 dict），已在 `_normalize_stream_entries` / `xpending` / `xpending_detail` / `xinfo_groups` 做双形态兼容——上层 MQ 与注册表代码零改动。
+
+### 评估后保留（并说明理由）
+
+| 模块 | 保留原因 |
+| --- | --- |
+| `mas/expr.py` | 门禁表达式的 `BoolOp` 不短路语义被现有 `flow.yaml` 依赖（`A or B` 中 B 字段缺失会判整条失败）；换成 `simpleeval` 等库会改变裁决 |
+| `mas/llm.py` | SSE 逐行读取 + `should_stop` 取消探测是 docs/41 的硬契约，换官方 SDK 需要重做取消路径 |
+| `frontend/server.py` | 面板的令牌、同源、CORS、路径约束由 `test_panel_security.py` 逐条锁定；迁移 Flask 属独立里程碑，不在本次范围 |
+| `mas/mcp.py` | 只实现健康检查所需的最小 JSON-RPC 子集（stdio/SSE），官方 SDK 的传输层不覆盖现有配置格式 |
+| `mas/concurrency.py` | 语义是「保序 + 异常原位返回」，不是通用 map；底层已用 `ThreadPoolExecutor` |
 
 ## 前端面板
 
@@ -296,7 +368,7 @@ mas/
 ├── expr.py         # 门禁表达式安全求值（AST 白名单）
 ├── events.py       # 事件日志
 ├── blackboard.py   # 版本化共享黑板（跨进程文件锁）
-├── filelock.py     # 跨进程文件锁（msvcrt / flock）
+├── filelock.py     # 跨进程文件锁（封装 filelock：Windows/POSIX 差异交给上游）
 ├── bus.py          # 消息总线（direct/broadcast/request-response + 可选 MQ 投递）
 ├── experience.py   # 分级经验库：提炼/检索/注入/晋级/反馈
 ├── prompts.py      # Prompt 组装（感知段 + 分层经验段 + 交付契约）
@@ -315,7 +387,8 @@ mas/
 ├── mq.py           # 消息队列（Redis Streams：任务队列 + Agent 消息流）
 ├── runhub.py       # 运行注册表（进程内 / Redis 跨进程，取消协调）
 ├── worker.py       # 运行 worker：消费任务、心跳、ACK、重试、死信
-├── store/          # MySQL/Redis 后端（软依赖：连接失败自动降级不抛异常）
+├── store/          # MySQL/Redis 后端（PyMySQL + redis-py；连接失败自动降级不抛异常）
+├── orchestration/  # LangGraph 编排层：state / nodes / graph / decision / checkpoint / runner
 ├── leader.py       # 调度器：状态机/门禁/回退/协商/经验闭环
 ├── schemas.py      # 数据契约
 ├── errors.py       # 异常层级

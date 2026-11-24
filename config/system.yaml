@@ -81,12 +81,11 @@ llm:
 
 runtime:
   python: "python"
-  # 编排层实现（docs/50）：
-  #   legacy    = leader.py 里的手写状态机循环（默认，行为与改造前逐字节一致）
-  #   langgraph = mas/orchestration 的 StateGraph（节点执行/门禁/回退语义完全复用同一套函数，
-  #               只替换「驱动下一轮」的部分，并额外拿到 graph.sqlite 检查点）
-  # 切到 langgraph 需要安装可选依赖：pip install "langgraph>=1.2,<2.0" langgraph-checkpoint-sqlite
-  orchestrator: "legacy"
+  # 编排层固定为 mas/orchestration 的 LangGraph 图（docs/50、docs/53）：节点执行 / 门禁 /
+  # 回退复用 leader._execute_node + orchestration.decision.decide，图的边只负责推进下一轮。
+  # 2026-11-25 起 legacy 手写循环已删除，配置里不再有 runtime.orchestrator 开关
+  # （残留非 langgraph 值会直接 ConfigError）。
+  # 运行依赖：langgraph>=1.2,<2.0 + langgraph-checkpoint-sqlite（见 requirements.txt）。
   sandbox_timeout: 180            # 单次沙箱执行超时（秒）
   # 沙箱命令白名单：放行 Python 解释器（含绝对路径/版本号变体）与 node（docs/15 B1，
   # 供 web_fullstack 需求的 JS 交付验证）；shell 解释器仍被硬拒，不受白名单影响。
@@ -178,16 +177,28 @@ runtime:
   # Prompt 感知段单产物最大字符数：调高前的历史默认 900 会把 12 功能点的需求规格截到只剩
   # 3 个 FP 片段（研发/测试/审查全程信息残缺，实测根因之一）；10000 对 13 功能点、带条款
   # 引用的规格仍不够（task09-miniledger-02 实测 spec 25494 字符被硬切成半份 JSON，
-  # 模型自述"规格被截断"后无法实现）。30000 覆盖该类规格；再大仍会截断，届时改用
-  # runtime.context_compression 的结构化压缩（保留 FP 规则、丢 samples，不切坏 JSON）。
+  # 模型自述"规格被截断"后无法实现）。30000 覆盖该类规格；再大仍会硬截断。
   prompt_artifact_max_chars: 30000
-  # 上下文压缩（docs/16 的 02 文档）：默认关闭，enabled=false 时恒等返回，行为与现状逐字节一致。
-  # 开启后按白名单策略做结构化压缩（保 FP 的 id/title/rules、丢 samples/parameters 等明细），
-  # 并向上游事件流发 context_compressed（含 before/after 字符数）；压缩不改黑板 artifact 数据。
+  # 返工/修复轮的当前源码注入（2026-11-07 reconx-core-02 复盘）：修复节点原先只拿到需求、
+  # 缺陷症状与文件清单（无正文），只能凭印象整份重写（实测一轮重写 6 个文件 618 行），
+  # 把已通过的用例改坏并新增 3 个缺陷。开启后把沙箱里现存的交付文件正文并入该节点 Prompt
+  # （跳过 tests/ 与 test_*.py），让修复变成增量改动。0 = 关闭（Prompt 与改造前一致）。
+  # 预算按「一份 1500 行项目」估：单文件 24000、合计 60000 字符，约占 262144 窗口的 6%。
+  fix_source_per_file_chars: 24000
+  fix_source_total_chars: 60000
+  # 上下文压缩（docs/16 的 02 文档）：已在真实链路启用（2026-11-05）。
+  # 触发阈值（两条，缺一不压）：
+  #   ① per_item_chars：**单产物**超过该字符数才压（默认与 prompt_artifact_max_chars 同值，
+  #      即「brief 即将硬截断」的那条线）；预算内产物原样透传，不无故丢细节。
+  #   ② total_chars：压缩后感知段**总量**仍超该值时，按优先级（test_report → review_report
+  #      → bug_reports）继续深压；spec/solution_design 不参与这一步。
+  # 压缩保 FP 的 id/title/rules，丢 samples/parameters/逐条用例明细等；不改黑板 artifact 数据，
+  # 也不改 Perception.found（下游 Agent 的逻辑判断仍读完整产物），只改进 Prompt 的文本。
+  # 每次 perceive 都发 context_compressed 事件（含 before/after 字符数与被压产物名）。
   context_compression:
-    enabled: false
-    per_item_chars: 10000        # 单产物预算
-    total_chars: 32000           # 感知段总量预算；超出时按优先级裁剪低优先级明细
+    enabled: true
+    per_item_chars: 30000        # = prompt_artifact_max_chars：恰在硬截断发生处接管
+    total_chars: 60000           # 感知段总量预算；超出时按优先级裁剪低优先级产物明细
     llm_summary: false           # 可选 LLM 摘要（默认关：每次新增 LLM 调用都叠加网关超时风险）
   tool_result_max_chars: 4000    # tool 结果统一截断（头 60% + 尾 40%），0=不截断
   # 隐藏用例生成的可修复次数（含首次）。结构校验失败（漏 FP、方法名非法、无断言、

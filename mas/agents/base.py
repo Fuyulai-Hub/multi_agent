@@ -583,6 +583,14 @@ class BaseAgent:
     def build_context(self, task: NodeTask, perception: Perception) -> Dict[str, Any]:  # pragma: no cover - 抽象
         return {"spec": perception.spec}
 
+    def prompt_extra_directive(self, task: NodeTask, perception: Perception) -> str:
+        """节点级追加到 directive 的文本（默认空串 = 既有 Prompt 逐字节不变）。
+
+        与 ``build_context`` 的区别：``context`` 只进 LLM 调用参数（离线 Provider 用），
+        不进 Prompt 正文；需要真正下发给模型的内容必须走本钩子。
+        """
+        return ""
+
     def apply(
         self,
         task: NodeTask,
@@ -598,11 +606,15 @@ class BaseAgent:
         names = self.ctx.config.collaboration.perception_of(self.role_id) or list(task.inputs)
         found, missing = self.ctx.blackboard.require(names)
         # 感知段单产物字符预算：调高前的历史默认 900 会把 12 个功能点的需求规格截到只剩 3 个 FP 片段
-        # （attempt03 实测 implement/test 全程信息残缺）；代码默认与当前 system.yaml 实配均为 10000
+        # （attempt03 实测 implement/test 全程信息残缺）；代码默认与当前 system.yaml 实配均为 30000
         # （runtime.prompt_artifact_max_chars 可再调）
-        max_chars = int(self.ctx.config.runtime.get("prompt_artifact_max_chars", 10000))
+        max_chars = int(self.ctx.config.runtime.get("prompt_artifact_max_chars", 30000))
         # 上下文压缩（docs/16 的 02 文档）：enabled=false 时恒等返回，行为与现状逐字节一致。
-        # 压缩只改「进 Prompt 的内容」，黑板 artifact 数据不变（门禁求值走 snapshot，完全隔离）。
+        # 触发阈值：单产物超过 per_item_chars（默认与 prompt_artifact_max_chars 同值，
+        # 即「brief 将发生硬截断」的那条线）才压缩；预算内产物原样透传。
+        # 关键边界：压缩结果**只用于渲染 artifacts_brief（进 Prompt 的文本）**，
+        # `Perception.found` 保留完整产物——下游 Agent 会从 found 里取 test_report.test_file、
+        # bug_reports.items、env_probe 等字段做逻辑判断，若被压缩会改变行为（如空的 items）。
         compression = dict(self.ctx.config.runtime.get("context_compression") or {})
         enabled = bool(compression.get("enabled", False))
         result = compress.found_artifacts(
@@ -615,12 +627,14 @@ class BaseAgent:
             self.ctx.events.emit(
                 "context_compressed", agent=self.role_id, node=task.node_id, iteration=task.iteration,
                 payload={"before_chars": result.before_chars, "after_chars": result.after_chars,
+                         "per_item_chars": int(compression.get("per_item_chars", max_chars) or max_chars),
+                         "total_chars": int(compression.get("total_chars", 32000) or 32000),
                          "compressed": result.compressed, "untouched": result.untouched},
             )
-        brief = self.ctx.blackboard.brief(sorted(result.artifacts.keys()),
+        brief = self.ctx.blackboard.brief(sorted(found.keys()),
                                           max_chars_per_item=max_chars, data=result.artifacts)
         digest = self.ctx.bus.digest(self.role_id)
-        return Perception(found=result.artifacts, missing=missing, artifacts_brief=brief, bus_digest=digest)
+        return Perception(found=found, missing=missing, artifacts_brief=brief, bus_digest=digest)
 
     # ---------------------------------------------------------------- 经验
     def retrieve_experience(self, task: NodeTask, perception: Perception) -> RetrievalResult:
@@ -697,6 +711,13 @@ class BaseAgent:
         # tools，5 秒返回空文件清单 → 节点失败）。
         if self._react_enabled(task) and self._tool_schemas(task) is not None:
             directive = (directive + "\n\n" if directive else "") + REACT_DIRECTIVE
+        # 节点级追加指令（默认空串）：研发的返工/修复轮需要把「当前源码」带进 Prompt，
+        # 否则只能凭需求与缺陷症状整份重写（reconx-core-02 实测：修复轮重写 6 个文件
+        # 618 行，把已经通过的用例改坏，新增 3 个缺陷）。默认实现返回空串，
+        # 其他角色/节点的 Prompt 与改造前逐字节一致。
+        prompt_extra = self.prompt_extra_directive(task, perception)
+        if prompt_extra:
+            directive = (directive + "\n\n" if directive else "") + prompt_extra
         skills = self.match_skills(task, perception)
         skills_text = ""
         if skills:

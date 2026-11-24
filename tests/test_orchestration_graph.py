@@ -1,8 +1,7 @@
-"""LangGraph 编排层（docs/50）的离线回归：图结构、router 纯函数性、取消、续跑。
+"""LangGraph 编排层（docs/50、docs/53）的离线回归：图结构、router 纯函数性、取消、续跑。
 
-legacy 循环的既有行为由其余 53 个测试文件覆盖（system.yaml 默认
-``runtime.orchestrator: legacy``）；本文件只测新编排路径里**不需要双跑**的确定性部分，
-与 legacy 的逐项对照见 test_orchestration_ab.py。
+2026-11-25 起这是唯一编排路径（legacy 循环已删除），因此本文件同时承担
+「默认路径可用」的职责；两次运行的逐项对照见 test_orchestration_determinism.py。
 """
 
 from __future__ import annotations
@@ -26,11 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REQUIREMENT = PROJECT_ROOT / "examples" / "requirements" / "order_pricing_service.md"
 
 
-def _config(workspace: Path, orchestrator: str = "langgraph"):
+def _config(workspace: Path):
     config = load_config(PROJECT_ROOT / "config", workspace=str(workspace))
     config.llm["provider"] = "offline"          # 确定性：不依赖真实端点
     config.runtime["verbose"] = False
-    config.runtime["orchestrator"] = orchestrator
     return config
 
 
@@ -90,16 +88,24 @@ class GraphShapeTests(unittest.TestCase):
         self.assertEqual(route_from_state({"next_node": ""}), "halt")
 
     def test_router_stops_at_max_steps(self):
-        """与 legacy 的 ``while ... and steps < max_steps`` 同一退出点。"""
+        """与切换前手写循环的 ``while ... and steps < max_steps`` 同一退出点。"""
         self.assertEqual(route_from_state({"next_node": "test", "steps": 39, "max_steps": 40}), "test")
         self.assertEqual(route_from_state({"next_node": "test", "steps": 40, "max_steps": 40}), "halt")
 
-    def test_invalid_orchestrator_rejected(self):
+    def test_removed_orchestrator_switch_rejected(self):
+        """legacy 开关已删除：残留值必须报错，不能静默按单路径跑（docs/53）。"""
+        for stale in ("legacy", "langrfaph"):
+            config = load_config(PROJECT_ROOT / "config")
+            config.runtime["orchestrator"] = stale
+            with self.assertRaises(ConfigError) as caught:
+                _validate(config)
+            self.assertIn("runtime.orchestrator", str(caught.exception))
+
+    def test_langgraph_value_still_accepted(self):
+        """显式写 langgraph 的旧配置无需改动即可继续跑。"""
         config = load_config(PROJECT_ROOT / "config")
-        config.runtime["orchestrator"] = "langrfaph"
-        with self.assertRaises(ConfigError) as caught:
-            _validate(config)
-        self.assertIn("runtime.orchestrator", str(caught.exception))
+        config.runtime["orchestrator"] = "langgraph"
+        _validate(config)                       # 不抛异常即通过
 
 
 class GraphRunTests(unittest.TestCase):
@@ -188,7 +194,7 @@ class GraphRunTests(unittest.TestCase):
 
 
     def test_resume_from_json_only_checkpoint(self):
-        """legacy 跑挂的运行可以用 langgraph 续跑：图入口按检查点 next_node 落位。"""
+        """graph.sqlite 丢失时仍能从 checkpoint.json 落位续跑（START 条件边）。"""
         original = Leader._act_with_retry
         calls = {"n": 0}
 
@@ -200,9 +206,11 @@ class GraphRunTests(unittest.TestCase):
 
         with mock.patch.object(Leader, "_act_with_retry", crashing):
             with self.assertRaises(RuntimeError):
-                Leader(_config(self.workspace, "legacy")).run(str(REQUIREMENT))
+                Leader(self.config).run(str(REQUIREMENT))
         run_dir = next((self.workspace / "runs").iterdir())
-        self.assertFalse(graph_db_path(run_dir).exists())      # legacy 只写 json
+        self.assertTrue(graph_db_path(run_dir).exists())
+        for path in run_dir.glob("graph.sqlite*"):      # 模拟只剩 json 审计快照
+            path.unlink()
 
         summary = Leader(self.config).run(str(REQUIREMENT), run_id=run_dir.name, resume=True)
         self.assertEqual(summary.verdict, "pass", summary.error)

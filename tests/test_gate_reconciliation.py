@@ -317,6 +317,30 @@ class VerdictRecordTests(unittest.TestCase):
         self.assertNotEqual(first, gate_config_hash(lean.flow.node("acceptance"), lean))
 
 
+class SuspectHiddenCaseTests(unittest.TestCase):
+    """连续两轮失败的隐藏用例只做诊断标注，不改变裁决。
+
+    reconx-core-02 实测：3 条隐藏用例与冻结契约冲突（60 秒差断言成 3600、
+    主记录断言违反 FP-04 的 (paid_at, row_no) 升序规则、反例用例的表头缺必需列），
+    任何符合契约的实现都无法通过；报告却只写「隐藏用例失败」，把责任记到研发账上。
+    """
+
+    def test_intersects_consecutive_failures(self):
+        snapshot = {"hidden_test_report": {"failures": [{"test": "A"}, {"test": "B"}]}}
+        hidden = {"report": {"failures": [{"test": "B"}, {"test": "C"}]}}
+        self.assertEqual(Leader._suspect_hidden_cases(snapshot, hidden), ["B"])
+
+    def test_no_history_means_no_suspect(self):
+        self.assertEqual(
+            Leader._suspect_hidden_cases({}, {"report": {"failures": [{"test": "A"}]}}), [])
+        self.assertEqual(Leader._suspect_hidden_cases({"hidden_test_report": {}}, {"report": {}}), [])
+
+    def test_missing_test_field_is_ignored(self):
+        snapshot = {"hidden_test_report": {"failures": [{"test": ""}, {"test": "A"}]}}
+        hidden = {"report": {"failures": [{"test": ""}, {"test": "A"}]}}
+        self.assertEqual(Leader._suspect_hidden_cases(snapshot, hidden), ["A"])
+
+
 class EndToEndVerdictConsistencyTests(unittest.TestCase):
     """离线 Provider 跑通一次：gate / report / run_summary 口径必须一致。"""
 

@@ -132,7 +132,7 @@ def build_mysql_backend(config: Any, config_dir: Optional[Any] = None) -> Any:
 
 
 def build_redis_backend(config: Any, config_dir: Optional[Any] = None) -> Any:
-    """构建 Redis 后端（零依赖 RESP2 客户端）；未启用/连接失败/非规范工作区时返回 None。"""
+    """构建 Redis 后端（redis-py 客户端）；未启用/连接失败/非规范工作区时返回 None。"""
     settings = resolve_store_settings(config, config_dir)
     if not settings["enabled"] or not settings["redis"].get("enabled", True):
         return None

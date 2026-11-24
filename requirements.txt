@@ -1,5 +1,17 @@
 PyYAML>=6.0
 
+# ---- 编排层（docs/50、docs/53）：运行必需 -----------------------------------
+# 2026-11-25 起编排层固定为 LangGraph 单路径（legacy 手写循环已删除），
+# 缺失时 Leader.run 抛 ConfigError 并提示安装，不做静默降级。
+langgraph>=1.2,<2.0
+langgraph-checkpoint-sqlite>=3.0
+
+# ---- 通用基础设施：运行必需（2026-11-25 重构）-------------------------------
+# filelock：跨进程文件锁（替换自研 msvcrt/fcntl 分支实现）。
+# redis：官方 Redis 客户端（替换自研 RESP2 协议解析；MQ / 运行注册表共用）。
+filelock>=3.13
+redis>=5,<9
+
 # ---- 可选依赖（docs/25 存储层接入）-----------------------------------------
 # MySQL 索引/结构层：未安装时 mas.store.build_mysql_backend 返回 None，
 # 全系统自动回落到 jsonl 文件路径（软依赖降级，不报错）。
@@ -8,9 +20,3 @@ PyYAML>=6.0
 
 # Redis 协调层（运行注册表 / 缓存 / 分布式锁）为零依赖实现：
 # mas/store/redis_backend.py 用标准库 socket 直接讲 RESP2 协议，无需 redis-py。
-
-# ---- 可选依赖（docs/50 编排层，runtime.orchestrator=langgraph 时才需要）---------
-# 未安装时默认的 legacy 路径完全不受影响（mas.orchestration.runner 是惰性导入）。
-# 安装：pip install "langgraph>=1.2,<2.0" langgraph-checkpoint-sqlite
-# langgraph>=1.2,<2.0
-# langgraph-checkpoint-sqlite>=3.0

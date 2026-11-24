@@ -3,7 +3,8 @@
 本模块的逻辑是从 ``leader.py`` 手写状态机的 ``while`` 体里逐行搬出来的，语义不变：
 只做「计算 + 审计事件」，不改流程拓扑（profile 启动期定型，flow 只有 pass/fail 两条边）。
 
-legacy 循环与 LangGraph 图节点共用本函数——两条编排路径的分支行为因此不可能漂移。
+节点函数（``orchestration.nodes.make_node``）每轮调用本函数；分支语义集中在此，
+节点执行侧没有第二份实现，改回退/权限/escalation 只需改这一处。
 """
 
 from __future__ import annotations

@@ -99,7 +99,7 @@ def run_graph(
     cancel_flag = canceled or bool(final.get("canceled"))
     final_steps = int(final.get("steps") or 0)
     if cancel_flag or recursion_hit:
-        # 中断的那一步已计入 legacy 口径的 steps，下一步固定落在 halt
+        # 中断的那一步已计入切换前口径的 steps，下一步固定落在 halt
         final_steps = max(final_steps, deps.in_flight_steps)
         next_node = "halt"
     else:

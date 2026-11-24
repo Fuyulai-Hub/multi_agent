@@ -979,7 +979,12 @@ class OfflineProvider:
             md.append("")
             md.append("缺陷修复记录：")
             for fix in fixes:
-                md.append(f"- `{fix.get('bug_id', '')}`（{fix.get('op', '')}）：{fix.get('strategy', '')}｜回归自测：{'通过' if fix.get('regression_ok') else '未通过'}")
+                # 三态：通过 / 未通过 / 待门禁复跑（source=hidden 的缺陷研发侧不执行回归）
+                if fix.get("regression_ok") is None and "regression_ok" in fix:
+                    label = "待门禁复跑"
+                else:
+                    label = "通过" if fix.get("regression_ok") else "未通过"
+                md.append(f"- `{fix.get('bug_id', '')}`（{fix.get('op', '')}）：{fix.get('strategy', '')}｜回归自测：{label}")
 
         md.append("")
         md.append("## 4. 代码审查（Reviewer Agent）")

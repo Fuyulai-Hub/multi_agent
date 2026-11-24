@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -69,12 +70,98 @@ class DeveloperAgent(BaseAgent):
         return {
             "spec": spec,
             "mode": self._mode(perception, task.node_id),
-            "open_bugs": [item for item in (bugs.get("items") or []) if item.get("status") == "open"],
+            "open_bugs": [self._bug_view(item) for item in (bugs.get("items") or [])
+                          if item.get("status") == "open"],
             "review_findings": review.get("blocking_items") or review.get("findings") or [],
             "test_report": perception.found.get("test_report") or {},
             "node": task.node_id,
             "iteration": task.iteration,
         }
+
+    @staticmethod
+    def _bug_view(item: Dict[str, Any]) -> Dict[str, Any]:
+        """缺陷在研发视图里的裁剪版本。
+
+        ``source=hidden`` 的缺陷来自 run 工作区外的隐藏套件，其 test 方法是隐藏用例
+        的方法名。把方法名交给模型会诱导它按名字反推实现（reconx-core-02 实测：
+        ``..._config_error_catch_as_value_error`` 让模型把 ReconError 改成继承
+        ValueError，直接违反契约里 ``ReconError(Exception)`` 的声明）。这里只保留
+        需求侧的定位信息（功能点/类别/症状），用例引用换成不可反推的稳定短号。
+        """
+        view = {key: item.get(key) for key in
+                ("id", "fp_id", "op", "category", "severity", "symptom", "status", "source")}
+        if str(item.get("source") or "") == "hidden":
+            ref = hashlib.sha1(str(item.get("test") or "").encode("utf-8")).hexdigest()[:8]
+            view["case_ref"] = f"hidden-{ref}"
+        else:
+            view["test"] = item.get("test")
+        return view
+
+    # ---------------------------------------------------------------- 返工上下文
+    def prompt_extra_directive(self, task: NodeTask, perception: Perception) -> str:
+        """返工/修复轮把当前交付源码带进 Prompt（默认关闭时 Prompt 不变）。
+
+        只对 implement / optimize 的非首轮生效：首轮没有既有代码，不该注入。
+        """
+        if task.node_id not in ("implement", "optimize"):
+            return ""
+        if self._mode(perception, task.node_id) == "first":
+            return ""
+        manifest = perception.found.get("code_manifest") or {}
+        return self._current_source_block(manifest)
+
+    def _current_source_block(self, manifest: Dict[str, Any]) -> str:
+        runtime = dict(getattr(getattr(self.ctx, "config", None), "runtime", {}) or {})
+        per_file = int(runtime.get("fix_source_per_file_chars", 24000) or 0)
+        total_cap = int(runtime.get("fix_source_total_chars", 60000) or 0)
+        sandbox = getattr(self.ctx, "sandbox", None)
+        if not sandbox or per_file <= 0 or total_cap <= 0:
+            return ""
+        names: List[str] = []
+        for item in manifest.get("files") or []:
+            name = str(item.get("path") if isinstance(item, dict) else item or "")
+            if name and not self._is_test_file(name):
+                names.append(name)
+        if not names:
+            return ""
+        blocks: List[str] = []
+        used = 0
+        omitted: List[str] = []
+        truncated: List[str] = []
+        for name in names:
+            if used >= total_cap:
+                omitted.append(name)
+                continue
+            try:
+                content = sandbox.read_file(name)
+            except Exception:  # noqa: BLE001 - 文件缺失/越界都只跳过，不影响节点
+                omitted.append(name)
+                continue
+            if not content.strip():
+                continue
+            budget = min(per_file, total_cap - used)
+            if len(content) > budget:
+                content = content[:budget] + "\n# ...（源码在此截断，剩余内容未下发）"
+                truncated.append(name)
+            used += len(content)
+            lang = "python" if name.endswith(".py") else ""
+            blocks.append(f"### {name}\n```{lang}\n{content.rstrip()}\n```")
+        if not blocks:
+            return ""
+        head = (
+            "## 当前交付源码（修改基线）\n"
+            "以下是沙箱里**现存的**交付文件内容，请在此基础上做最小改动；"
+            "只输出需要改动的文件，未改动的文件保持原样（框架不会回滚或重写它们）。"
+            "不要为了修复一个缺陷而整份重写无关文件，已有测试通过的行为必须保留。"
+        )
+        tail = []
+        if truncated:
+            tail.append("已截断：" + ", ".join(truncated))
+        if omitted:
+            tail.append("未下发（超预算或不可读）：" + ", ".join(omitted))
+        if tail:
+            head += "\n（" + "；".join(tail) + "）"
+        return head + "\n\n" + "\n\n".join(blocks)
 
     # ---------------------------------------------------------------- 执行
     def apply(
@@ -400,6 +487,28 @@ class DeveloperAgent(BaseAgent):
                 "regression": None,
                 "regression_ok": None,
             }
+            if str(bug.get("source") or "") == "hidden":
+                # source=hidden 的缺陷来自 run 工作区外的独立清单，可见冻结清单里没有
+                # 它的 test_id：拿它去 --only 必然 no_test_id_matched（runner 返回 2），
+                # 于是「一行都没跑」被记成「定向回归失败」，节点整轮判 fail
+                # （reconx-core-02 实测：3 轮 optimize 都是 0/N，验收报告把这条
+                # 假证据当成「修复未生效」的根因）。这类缺陷按设计只由隐藏门禁
+                # 复跑闭环，研发侧不重复执行、也不计入本轮回归结论。
+                item["regression"] = {
+                    "cmd": "", "exit_code": None, "failed": None,
+                    "deferred": "hidden_gate",
+                    "reason": "隐藏用例存放于 run 工作区之外，只能由验收门禁复跑闭环；"
+                              "研发侧定向回归不适用",
+                }
+                item["regression_ok"] = None
+                fix_items.append(item)
+                self.ctx.events.emit(
+                    "bug_fix_deferred", agent=self.role_id, node=task.node_id,
+                    iteration=task.iteration,
+                    payload={"bug_id": bug.get("id"), "fp_id": bug.get("fp_id"),
+                             "source": "hidden", "verified_by": "hidden_gate"},
+                )
+                continue
             if frozen_suite is not None and bug.get("test"):
                 # 定向回归同样走框架 runner：--only 只在冻结清单内过滤，
                 # 测试文件没有 main/marker，不能再自行决定跑哪些 case。
@@ -460,6 +569,8 @@ class DeveloperAgent(BaseAgent):
             "self_check": self_check,
             "fix_targets": data.get("fix_targets", []),
         }
+        deferred = [item for item in fix_items if item["regression_ok"] is None]
+        verified = [item for item in fix_items if item["regression_ok"] is not None]
         fix_test_report = {
             "title": "缺陷修复回归自测报告（研发 Agent）",
             "scope": [bug.get("id") for bug in open_bugs],
@@ -468,13 +579,17 @@ class DeveloperAgent(BaseAgent):
                     "bug_id": item["bug_id"],
                     "test": next((bug.get("test") for bug in open_bugs if bug.get("id") == item["bug_id"]), ""),
                     "regression_ok": item["regression_ok"],
+                    "verified_by": "hidden_gate" if item["regression_ok"] is None else "developer",
                     "evidence": item["regression"],
                 }
                 for item in fix_items
             ],
             "all_pass": all_ok,
-            "conclusion": ("全部缺陷的定向回归用例通过，等待测试 Agent 复测确认。"
-                           if all_ok else "存在回归未通过的缺陷，需继续修复。"),
+            "deferred": len(deferred),
+            "conclusion": (
+                ("定向回归全部通过"
+                 + (f"；{len(deferred)} 个隐藏用例缺陷待验收门禁复跑确认。" if deferred else "，等待测试 Agent 复测确认。"))
+                if all_ok else "存在回归未通过的缺陷，需继续修复。"),
         }
         self.publish("code_manifest", manifest, task, summary=f"修复后 {len(written)} 个文件，{manifest['loc']} 行")
         self.publish("fix_summary", fix_summary, task, summary=f"修复 {len(fix_items)} 个缺陷")
@@ -485,10 +600,13 @@ class DeveloperAgent(BaseAgent):
             "fix_test_report": fix_test_report,
         })
         result.status = "pass" if all_ok else "fail"
+        # 分母只算「研发侧可执行定向回归」的缺陷：隐藏用例缺陷在门禁复跑前没有可判定的
+        # 回归结论，计入分母会把「未验证」写成「回归失败」（reconx-core-02 实测 0/5）。
         result.summary = (
-            f"缺陷修复：处理 {len(fix_items)} 个缺陷（定向回归 "
-            f"{sum(1 for item in fix_items if item['regression_ok'])}/{len(fix_items)} 通过），"
-            f"{self._self_check_label(self_check)}；已产出回归自测报告"
+            f"缺陷修复：处理 {len(fix_items)} 个缺陷（研发侧定向回归 "
+            f"{sum(1 for item in verified if item['regression_ok'])}/{len(verified)} 通过"
+            + (f"，{len(deferred)} 个隐藏缺陷待门禁复跑" if deferred else "")
+            + f"），{self._self_check_label(self_check)}；已产出回归自测报告"
         )
         result.events = ["bug_fixed"]
         result.broadcast_payload = {"summary": result.summary, "fixed": [item["bug_id"] for item in fix_items]}

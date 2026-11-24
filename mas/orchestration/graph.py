@@ -55,8 +55,8 @@ def build_graph(deps: GraphDeps) -> StateGraph:
 def route_from_state(state: RunState) -> str:
     """纯函数：只读 state，不做任何副作用。
 
-    ``steps >= max_steps`` 时回 halt，与 legacy 的 ``while ... and steps < max_steps``
-    同一个退出点（否则图会多跑一个节点，事件序列与 legacy 不一致）。
+    ``steps >= max_steps`` 时回 halt，与切换前手写循环的
+    ``while ... and steps < max_steps`` 同一个退出点（否则图会多跑一个节点）。
     """
     if int(state.get("steps") or 0) >= int(state.get("max_steps") or 0):
         return "halt"

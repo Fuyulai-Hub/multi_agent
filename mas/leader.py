@@ -42,7 +42,6 @@ from .events import EventLog
 from .experience import Experience, ExperienceLibrary
 from .expr import evaluate
 from .llm import LLMClient
-from .orchestration.decision import decide
 from .projectdocs import collect_project_docs, render_section
 from .prompts import PromptBuilder
 from .sandbox import Sandbox
@@ -680,62 +679,31 @@ class Leader:
             max_steps = min(int(flow.max_steps), int(self.config.runtime.get("max_steps", flow.max_steps)))
             max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
 
-            # 编排层分流（docs/50）：节点执行与分支决策由两条路径共用（_execute_node /
-            # orchestration.decision.decide），这里只换「谁来驱动下一轮」——手写 while
-            # 循环，还是 LangGraph 的状态图。开关默认 legacy，行为逐字节不变。
-            if str(self.config.runtime.get("orchestrator") or "legacy") == "langgraph":
+            # 编排层（docs/50、docs/53）：节点执行与分支决策由 Leader._execute_node /
+            # orchestration.decision.decide 承担，图的边负责推进下一轮。2026-11-25 起
+            # legacy 手写循环已删除，这里是唯一驱动路径。
+            try:
                 from .orchestration.runner import run_graph
-                final = run_graph(
-                    self, ctx=ctx, agents=agents, registry=registry, cancel_event=cancel_event,
-                    run_id=run_id, run_dir=run_dir, max_steps=max_steps,
-                    max_total_rollbacks=max_total_rollbacks, checkpoint_path=checkpoint_path,
-                    requirement_title=req_title, requirement_sha256=requirement_sha256,
-                    project_docs_text=prompts.project_docs_text,
-                    started_at=started.isoformat(timespec="seconds"), resume_state=resume_state,
-                )
-                node_id = final["next_node"]
-                steps = final["steps"]
-                canceled = final["canceled"]
-                forced_fail = final["forced_fail"]
-                iterations = final["iterations"]
-                rollback_counts = final["rollback_counts"]
-                pending_reason = final["pending_reason"]
-            else:
-                while node_id and node_id not in flow.terminal and steps < max_steps:
-                    # 协作式终止（面板「终止任务」）的节点边界检查点：取消在节点内已由
-                    # LLM 层立即处理（docs/41），此处兜住的是节点不含 LLM 调用的中断场景
-                    # （沙箱执行/MCP 工具调用期间置位 → 跑完当前节点后在此退出循环）。
-                    # registry 非 None 时额外查跨进程取消键：CLI/其他进程发起的运行也可被终止。
-                    if self._cancel_requested(cancel_event, registry, run_id):
-                        canceled = True
-                        break
-                    steps += 1
-                    node = flow.node(node_id)
-                    iteration = iterations.get(node_id, 0) + 1
-                    iterations[node_id] = iteration
-                    result, status = self._execute_node(
-                        ctx, agents, node, iteration=iteration, steps=steps,
-                        rollback_reason=pending_reason if iteration > 1 else "",
-                        registry=registry,
-                    )
-                    decision = decide(
-                        self, ctx, agents, node, result, status, iteration=iteration,
-                        iterations=iterations, rollback_counts=rollback_counts,
-                        forced_fail=forced_fail, max_total_rollbacks=max_total_rollbacks,
-                    )
-                    node_id = decision.target
-                    pending_reason = decision.pending_reason
-                    forced_fail = decision.forced_fail
-                    # 检查点写在「节点完成 + 分支落定」之后：崩溃发生在节点内部时，
-                    # next_node 仍是该节点，恢复会重跑它；已完成的节点不会重跑。
-                    self._write_checkpoint(
-                        checkpoint_path, req_title=req_title,
-                        requirement_sha256=requirement_sha256, next_node=node_id,
-                        iterations=iterations, rollback_counts=rollback_counts,
-                        pending_reason=pending_reason, forced_fail=forced_fail, steps=steps,
-                        run_state=ctx.run_state, project_docs_text=prompts.project_docs_text,
-                        started_at=started.isoformat(timespec="seconds"),
-                    )
+            except ImportError as exc:   # langgraph 是运行必需依赖，缺失时明确报错不降级
+                raise ConfigError(
+                    "编排层依赖缺失：请安装 langgraph 与 langgraph-checkpoint-sqlite"
+                    "（pip install -r requirements.txt）"
+                ) from exc
+            final = run_graph(
+                self, ctx=ctx, agents=agents, registry=registry, cancel_event=cancel_event,
+                run_id=run_id, run_dir=run_dir, max_steps=max_steps,
+                max_total_rollbacks=max_total_rollbacks, checkpoint_path=checkpoint_path,
+                requirement_title=req_title, requirement_sha256=requirement_sha256,
+                project_docs_text=prompts.project_docs_text,
+                started_at=started.isoformat(timespec="seconds"), resume_state=resume_state,
+            )
+            node_id = final["next_node"]
+            steps = final["steps"]
+            canceled = final["canceled"]
+            forced_fail = final["forced_fail"]
+            iterations = final["iterations"]
+            rollback_counts = final["rollback_counts"]
+            pending_reason = final["pending_reason"]
 
         except RunCanceledError:
             # 立即终止（docs/41）：LLM 层在节点内（流式读取/退避等待/请求入口）发现
@@ -1957,8 +1925,8 @@ class Leader:
     ) -> Tuple[AgentResult, str]:
         """执行一个节点：事件 + 执行 + 广播 + 即时经验提炼。
 
-        两条编排路径（legacy while / LangGraph 图节点）共用本方法——区别只在
-        「谁决定下一个节点」，本方法不碰分支，也不读 checkpoint。
+        图的节点函数（``orchestration.nodes.make_node``）在每一轮调用本方法；
+        分支由 ``orchestration.decision.decide`` 决定。本方法不碰分支，也不读 checkpoint。
         """
         node_id = node.id
         ctx.run_state["node_executions"] = steps

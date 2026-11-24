@@ -1,10 +1,10 @@
-"""Redis 后端：零依赖 RESP2 客户端 + MAS 领域操作。
+"""Redis 后端：官方 ``redis`` 客户端 + MAS 领域操作。
 
 两部分：
-1. ``RedisClient`` —— 仅用标准库 socket 实现的 Redis 协议客户端（RESP2）。
-   项目既有约定是「除 PyYAML 外零依赖」，Redis 的文本协议足够简单，
-   自实现约 150 行即可覆盖所需命令，避免为一个协调层引入第三方包；
-   环境里已装 ``redis`` 包时不冲突（本类不 import 它）。
+1. ``RedisClient`` —— 基于官方 ``redis`` 包（redis-py）的薄封装：只做 URL 解析、
+   连接探测、异常归一化与返回类型整形，不再自实现 RESP2 协议。
+   2026-11-25 重构：原约 100 行 socket/RESP2 解析代码删除，换成业界客户端
+   （连接池、超时、重连、RESP2/RESP3 兼容都由上游维护）。
 2. ``RedisBackend`` —— 面向 MAS 的领域封装：
    - 运行注册表（register / heartbeat / request_cancel / is_canceled / list_running）
    - 读缓存（cache_get / cache_set / cache_invalidate）
@@ -16,12 +16,12 @@
 from __future__ import annotations
 
 import json
-import socket
-import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
+
+import redis
 
 __all__ = ["RedisError", "RedisClient", "RedisBackend"]
 
@@ -42,7 +42,7 @@ _RENEW_LOCK_LUA = (
 
 
 class RedisClient:
-    """最小 RESP2 客户端：connect + execute(*args)，支持 AUTH/SELECT。"""
+    """redis-py 的薄封装：connect + execute(*args)，URL 解析与异常归一化。"""
 
     def __init__(self, url: str = "redis://127.0.0.1:6379/0", timeout_s: float = 5.0) -> None:
         parsed = urlparse(url)
@@ -51,36 +51,30 @@ class RedisClient:
         self.db = int((parsed.path or "/0").lstrip("/") or 0)
         self.password = unquote(parsed.password) if parsed.password else None
         self.timeout_s = timeout_s
-        self._sock: Optional[socket.socket] = None
-        self._reader = None
-        self._lock = threading.Lock()
+        self._client: Optional[redis.Redis] = None
 
     # ---------------------------------------------------------------- 连接
     def connect(self) -> None:
-        if self._sock is not None:
+        if self._client is not None:
             return
         try:
-            sock = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
-            sock.settimeout(self.timeout_s)
-            self._sock = sock
-            self._reader = sock.makefile("rb")
-            if self.password:
-                self.execute("AUTH", self.password)
-            if self.db:
-                self.execute("SELECT", self.db)
-        except OSError as exc:
-            self.close()
+            client = redis.Redis(
+                host=self.host, port=self.port, db=self.db, password=self.password or None,
+                socket_connect_timeout=self.timeout_s, socket_timeout=self.timeout_s,
+                decode_responses=True, health_check_interval=30,
+            )
+            client.ping()          # 构造本身不建连，显式探测让失败在装配期暴露
+        except (redis.exceptions.RedisError, OSError) as exc:
             raise RedisError(f"无法连接 Redis {self.host}:{self.port}: {exc}") from exc
+        self._client = client
 
     def close(self) -> None:
-        for handle in (self._reader, self._sock):
+        if self._client is not None:
             try:
-                if handle is not None:
-                    handle.close()
-            except OSError:
+                self._client.close()
+            except (redis.exceptions.RedisError, OSError):
                 pass
-        self._reader = None
-        self._sock = None
+            self._client = None
 
     def __enter__(self) -> "RedisClient":
         self.connect()
@@ -89,54 +83,28 @@ class RedisClient:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # ---------------------------------------------------------------- 协议
+    # ---------------------------------------------------------------- 命令
     def execute(self, *args: Any) -> Any:
-        """执行一条命令并返回解析后的回复（线程安全）。"""
-        with self._lock:
-            self.connect()
-            try:
-                self._send(args)
-                return self._read_reply()
-            except (OSError, RedisError) as exc:
-                self.close()
-                raise RedisError(f"Redis 命令失败 {args[:1]}: {exc}") from exc
+        """执行一条命令并返回回复（redis-py 连接池保证线程安全）。"""
+        self.connect()
+        try:
+            return self._client.execute_command(*args)
+        except (redis.exceptions.RedisError, OSError) as exc:
+            raise RedisError(f"Redis 命令失败 {args[:1]}: {exc}") from exc
 
-    def _send(self, args: tuple) -> None:
-        parts = [f"*{len(args)}\r\n".encode("utf-8")]
-        for arg in args:
-            payload = str(arg).encode("utf-8")
-            parts.append(f"${len(payload)}\r\n".encode("utf-8") + payload + b"\r\n")
-        assert self._sock is not None
-        self._sock.sendall(b"".join(parts))
-
-    def _read_reply(self) -> Any:
-        assert self._reader is not None
-        line = self._reader.readline()
-        if not line:
-            raise RedisError("连接已被对端关闭")
-        prefix, body = line[:1], line[1:-2]
-        if prefix == b"+":
-            return body.decode("utf-8", errors="replace")
-        if prefix == b"-":
-            raise RedisError(body.decode("utf-8", errors="replace"))
-        if prefix == b":":
-            return int(body)
-        if prefix == b"$":
-            length = int(body)
-            if length == -1:
-                return None
-            data = self._reader.read(length + 2)
-            return data[:-2].decode("utf-8", errors="replace")
-        if prefix == b"*":
-            count = int(body)
-            if count == -1:
-                return None
-            return [self._read_reply() for _ in range(count)]
-        raise RedisError(f"无法解析的 RESP 回复: {line!r}")
+    def _call(self, fn: Any) -> Any:
+        """调用 redis-py 的高阶方法（需要传递 options 的命令走这里）。"""
+        self.connect()
+        try:
+            return fn(self._client)
+        except (redis.exceptions.RedisError, OSError) as exc:
+            raise RedisError(f"Redis 命令失败: {exc}") from exc
 
     # ---------------------------------------------------------------- 常用命令
     def ping(self) -> bool:
-        return self.execute("PING") == "PONG"
+        # redis-py 对 +OK 类回复返回 True；保留字符串比较以兼容旧桩/其他实现
+        result = self.execute("PING")
+        return result is True or result == "PONG"
 
     def get(self, key: str) -> Optional[str]:
         return self.execute("GET", key)
@@ -210,7 +178,8 @@ class RedisClient:
         if mkstream:
             args.append("MKSTREAM")
         try:
-            return self.execute(*args) == "OK"
+            result = self.execute(*args)
+            return result is True or result == "OK"
         except RedisError as exc:
             if "BUSYGROUP" in str(exc):
                 return False
@@ -261,9 +230,25 @@ class RedisClient:
 
     def xpending(self, key: str, group: str) -> Dict[str, Any]:
         """XPENDING 摘要：总数、最小/最大 id、各消费者持有量。"""
-        reply = self.execute("XPENDING", key, group)
+        # 用高阶方法而非 execute_command：redis-py 的 XPENDING 回调依赖 options，
+        # 裸调用会把「带 start/end/count 的详情查询」误当摘要解析（实测 IndexError）。
+        reply = self._call(lambda client: client.xpending(key, group))
         if not reply:
             return {"count": 0, "min_id": None, "max_id": None, "consumers": []}
+        if isinstance(reply, dict):          # redis-py 形态 {pending,min,max,consumers}
+            consumers = []
+            for item in reply.get("consumers") or []:
+                if isinstance(item, dict):
+                    consumers.append({"consumer": str(item.get("name")),
+                                      "count": int(item.get("pending") or 0)})
+                elif item and len(item) >= 2:
+                    consumers.append({"consumer": str(item[0]), "count": int(item[1])})
+            return {
+                "count": int(reply.get("pending") or 0),
+                "min_id": reply.get("min"),
+                "max_id": reply.get("max"),
+                "consumers": consumers,
+            }
         consumers = []
         for item in reply[3] or []:
             if item and len(item) >= 2:
@@ -277,10 +262,18 @@ class RedisClient:
 
     def xpending_detail(self, key: str, group: str, entry_id: str) -> Optional[Dict[str, Any]]:
         """单条 PEL 详情（含投递次数）：用于判断是否已达最大重试次数。"""
-        reply = self.execute("XPENDING", key, group, entry_id, entry_id, 1)
+        reply = self._call(
+            lambda client: client.xpending_range(key, group, entry_id, entry_id, 1)
+        )
         if not reply:
             return None
         item = reply[0]
+        if isinstance(item, dict):          # redis-py 的 parse_xpending_range 形态
+            return {
+                "id": str(item.get("message_id")), "consumer": str(item.get("consumer")),
+                "idle_ms": int(item.get("time_since_delivered") or 0),
+                "delivery_count": int(item.get("times_delivered") or 0),
+            }
         return {
             "id": str(item[0]), "consumer": str(item[1]),
             "idle_ms": int(item[2]), "delivery_count": int(item[3]),
@@ -300,6 +293,11 @@ class RedisClient:
         reply = self.execute("XINFO", "GROUPS", key)
         groups: List[Dict[str, Any]] = []
         for raw in reply or []:
+            # redis-py 已把 XINFO GROUPS 解析成 {name, consumers, pending, ...}；
+            # 裸 RESP 客户端给的是扁平 [k, v, k, v]。两种都归一化成 dict。
+            if isinstance(raw, dict):
+                groups.append({str(name): value for name, value in raw.items()})
+                continue
             record: Dict[str, Any] = {}
             for index in range(0, len(raw) - 1, 2):
                 record[str(raw[index])] = raw[index + 1]
@@ -318,6 +316,11 @@ class RedisClient:
             entry_id, raw_fields = entry
             if raw_fields is None:      # 已删除的 PEL 条目
                 normalized.append((str(entry_id), {}))
+                continue
+            # redis-py 的 stream 响应解析器返回 {field: value}；裸 RESP 客户端返回
+            # 扁平 [field, value, ...]。两种形态都要接住（升级客户端不影响上层）。
+            if isinstance(raw_fields, dict):
+                normalized.append((str(entry_id), {str(k): str(v) for k, v in raw_fields.items()}))
                 continue
             fields: Dict[str, str] = {}
             for index in range(0, len(raw_fields), 2):

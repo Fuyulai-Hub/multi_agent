@@ -56,6 +56,7 @@ class RewriteFunctionTests(unittest.TestCase):
         # 三个同名键原样（顶层 llm.vision / runtime.context_compression / runtime.ui_probe）
         self.assertEqual(out.count("    enabled: false"), 3)      # vision + context_compression + ui_probe
         self.assertIn("  ui_probe:\n    enabled: false\n", out)
+        self.assertIn("  context_compression:\n    enabled: false\n", out)
 
     def test_round_trip_on_real_config(self):
         """真实 system.yaml：切换后与原文**逐行**差异仅两处，且可往返还原。
