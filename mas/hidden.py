@@ -31,6 +31,17 @@ __all__ = [
 _CATEGORIES = ("functional", "exception", "boundary")
 _COMPONENT = re.compile(r"[A-Za-z0-9_]+\Z")
 
+#: 规则 6 按交付形态二选一：SSR/后端交付是 Python 包（同进程起服务）；
+#: 前后端分离交付的后端不是 Python 包，只能由框架 testkit 托管外部进程后打真实 HTTP
+#: （docs/52）。用错规则会让隐藏套件在门禁阶段整轮挂 ModuleNotFoundError。
+_SERVICE_RULE_IN_PROCESS = """6. 测试套件必须在沙箱超时内完成；不得启动常驻进程。若契约声明的是 HTTP 服务，在测试进程内
+   用端口 0 启动服务并在 finally 中关闭。"""
+
+_SERVICE_RULE_MANAGED = """6. 测试套件必须在沙箱超时内完成。交付物是前后端分离应用（后端不是 Python 包）：
+   禁止 import 交付包，改用 `from mas_testkit import start_service` 起服务（启动命令由框架注入），
+   对真实 HTTP 响应断言；端口由 testkit 从 `MAS_UI_PORT=` 回读，不得写死；
+   不得用 subprocess / os.system 自建服务进程。"""
+
 _SYSTEM_PROMPT = """你是一名独立隐藏测试工程师。你只能看到冻结的需求契约，看不到技术方案、\
 实现代码、代码清单或已有的可见测试。你的任务是仅依据契约推导可执行的功能/异常/边界用例，\
 用来在验收时独立检验交付物是否满足需求。"""
@@ -60,8 +71,7 @@ _PROTOCOL = """## 输出契约（必须只输出一个 JSON 对象）
    另写对应的 exception / boundary 用例（阈值按 t、t-ε、t+ε 三态设计）。
 5. 期望值只能来自契约的规则与样例，禁止读取或猜测实现细节；不得把实现代码里可能存在的
    缺陷当成期望行为。
-6. 测试套件必须在沙箱超时内完成；不得启动常驻进程。若契约声明的是 HTTP 服务，在测试进程内
-   用端口 0 启动服务并在 finally 中关闭。
+{service_rule}
 7. ``files`` 里的用例必须与 ``cases`` 完全对应：多定义或漏定义都会让验收失败。
 """
 
@@ -94,7 +104,9 @@ def build_generation_prompt(
         + "\n\n## 冻结需求规格\n"
         + json.dumps(contract_view, ensure_ascii=False, indent=2)
         + "\n\n"
-        + _PROTOCOL.replace("{package}", package or "交付包")
+        + _PROTOCOL.replace("{package}", package or "交付包").replace(
+            "{service_rule}", _SERVICE_RULE_MANAGED
+            if str(delivery_shape or "") == "full_stack_spa" else _SERVICE_RULE_IN_PROCESS)
     )
     return _SYSTEM_PROMPT, user
 

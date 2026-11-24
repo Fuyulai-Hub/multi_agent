@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>电商页面自测</title>
+<style>body{font:13px/1.6 monospace;padding:16px}pre{white-space:pre-wrap}.ok{color:#12805c}.bad{color:#e93b3d}</style>
+</head>
+<body>
+<pre id="report">running…</pre>
+<iframe id="app" src="index.html" style="width:1440px;height:1000px;border:1px solid #ddd"></iframe>
+<script>
+const results = [];
+function check(name, cond, extra) {
+  results.push((cond ? 'PASS ' : 'FAIL ') + name + (extra === undefined ? '' : '  → ' + extra));
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function waitFor(fn, timeout = 6000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try { if (fn()) return true; } catch (e) { /* iframe 尚未就绪 */ }
+    await sleep(50);
+  }
+  return false;
+}
+
+function fire(win, el, type) {
+  el.dispatchEvent(new win.Event(type, { bubbles: true }));
+}
+
+(async function run() {
+  const frame = document.getElementById('app');
+  const errors = [];
+  await new Promise(r => frame.addEventListener('load', r, { once: true }));
+  let win = frame.contentWindow;
+  let doc = frame.contentDocument;
+  win.addEventListener('error', e => errors.push(String(e.message)));
+
+  // 从干净状态开始
+  win.localStorage.clear();
+  frame.src = 'index.html';
+  await new Promise(r => frame.addEventListener('load', r, { once: true }));
+  win = frame.contentWindow; doc = frame.contentDocument;
+  win.addEventListener('error', e => errors.push(String(e.message)));
+
+  check('商品列表渲染', await waitFor(() => doc.querySelectorAll('#product-grid .card').length > 0),
+    doc.querySelectorAll('#product-grid .card').length + ' 张卡片');
+  check('分类栏渲染', doc.querySelectorAll('#category-list .cat-item').length === 6);
+
+  const q = (sel) => doc.querySelector(sel);
+  const qa = (sel) => Array.from(doc.querySelectorAll(sel));
+  const click = (sel) => { const el = q(sel); el.click(); return el; };
+  const clickIn = (root, sel) => { const el = root.querySelector(sel); el.click(); return el; };
+
+  // ---- 搜索
+  const search = q('#search-input');
+  search.value = '耳机';
+  fire(win, search, 'input');
+  await sleep(60);
+  check('搜索「耳机」只返回耳机', qa('#product-grid .card').length === 2, qa('#product-grid .card').map(c => c.querySelector('.card-name').textContent).join(' / '));
+
+  click('[data-action="clear-filters"]');
+  await sleep(60);
+  check('清空筛选后恢复全部商品', qa('#product-grid .card').length === 19, qa('#product-grid .card').length);
+
+  // ---- 分类
+  click('[data-action="pick-category"][data-value="食品饮料"]');
+  await sleep(60);
+  check('按分类「食品饮料」筛选', qa('#product-grid .card').length === 3, qa('#product-grid .card').length);
+  click('[data-action="pick-category"][data-value="全部"]');
+  await sleep(60);
+
+  // ---- 读取本地数据，选一件价格 ≥200 且有货的商品
+  const dump = () => JSON.parse(win.localStorage.getItem('starmart.v1'));
+  const before = dump();
+  const target = before.products.filter(p => p.active && p.stock > 1 && p.price >= 200)[0];
+  check('种子数据可用', Boolean(target), target && target.name + ' ¥' + target.price + ' 库存' + target.stock);
+
+  click(`[data-action="add-cart"][data-id="${target.id}"]`);
+  await sleep(60);
+  check('加入购物车后角标为 1', q('#cart-count').textContent === '1', q('#cart-count').textContent);
+
+  click('[data-action="open-cart"]');
+  await sleep(80);
+  check('购物车抽屉打开且有明细', q('#cart-drawer').classList.contains('open') && qa('#cart-items .cart-item').length === 1);
+  clickIn(q('#cart-items'), '[data-action="qty-inc"]');
+  await sleep(60);
+  check('数量 +1 生效', q('#cart-items .qty-num').textContent === '2', q('#cart-items .qty-num').textContent);
+
+  // ---- 结算
+  click('[data-action="go-checkout"]');
+  await sleep(80);
+  check('进入结算页', !q('#view-checkout').hidden);
+  q('#ship-name').value = '付小明';
+  q('#ship-phone').value = '13800138000';
+  q('#ship-addr').value = '湖南省长沙市岳麓区麓山南路 932 号';
+  q('#ship-note').value = '工作日送达';
+  q('#coupon-input').value = 'SAVE10';
+  click('[data-action="apply-coupon"]');
+  await sleep(60);
+
+  const subtotal = target.price * 2;
+  const expectTotal = subtotal - 20;            // 满 200 减 20；≥99 免运费
+  const shownTotal = Number(q('#sum-total').textContent.replace(/[^\d.]/g, ''));
+  check('优惠码与总额计算', Math.abs(shownTotal - expectTotal) < 0.01,
+    '小计 ' + q('#sum-subtotal').textContent + ' 优惠 ' + q('#sum-discount').textContent + ' 运费 ' + q('#sum-shipping').textContent + ' 合计 ' + q('#sum-total').textContent);
+
+  click('[data-action="place-order"]');
+  await sleep(120);
+  check('下单成功弹窗', !q('#success-modal').hidden);
+
+  const after = dump();
+  const order = after.orders[0];
+  const soldProduct = after.products.find(p => p.id === target.id);
+  check('订单已入库', after.orders.length === 1, order && order.id);
+  check('购物车已清空', after.cart.length === 0 && q('#cart-count').textContent === '0');
+  check('库存已扣减 2', soldProduct.stock === target.stock - 2, target.stock + ' → ' + soldProduct.stock);
+  check('订单金额与优惠落库', Math.abs(order.total - expectTotal) < 0.01, order.total);
+  check('订单状态为待发货', order.status === 'pending');
+
+  // ---- 我的订单
+  click('[data-action="go-orders"]');
+  await sleep(120);
+  check('订单列表出现 1 笔', qa('#order-list .order-card').length === 1);
+  check('订单状态标为待发货', q('#order-list .order-status').textContent === '待发货');
+
+  click('[data-action="cancel-order"]');
+  await sleep(120);
+  const canceled = dump();
+  check('取消订单后状态变更', canceled.orders[0].status === 'canceled', canceled.orders[0].status);
+  check('取消后库存返还', canceled.products.find(p => p.id === target.id).stock === target.stock);
+
+  // ---- 管理后台
+  click('[data-action="go-admin"]');
+  await sleep(120);
+  check('后台统计卡渲染 4 项', qa('#stat-row .stat-card').length === 4);
+  check('后台商品表渲染', qa('#admin-product-rows tr').length === 19, qa('#admin-product-rows tr').length);
+  check('后台订单表渲染', qa('#admin-order-rows tr').length === 1);
+
+  q('#np-name').value = '自测商品 · 桌面台灯';
+  q('#np-price').value = '259';
+  q('#np-stock').value = '7';
+  q('#np-emoji').value = '💡';
+  q('#np-tags').value = '新品,护眼';
+  q('#np-desc').value = '自测用商品';
+  click('[data-action="add-product"]');
+  await sleep(120);
+  check('新增商品写入', dump().products.length === 20 && qa('#admin-product-rows tr').length === 20,
+    dump().products.length);
+  click('[data-action="go-shop"]');
+  await sleep(120);
+  check('新商品出现在商城', qa('#product-grid .card').length === 20, qa('#product-grid .card').length);
+
+  // ---- 库存不足校验
+  click('[data-action="open-cart"]');
+  await sleep(60);
+  check('控制台无 JS 报错', errors.length === 0, errors.join(' | '));
+
+  const failed = results.filter(r => r.startsWith('FAIL'));
+  document.getElementById('report').innerHTML =
+    results.map(r => '<span class="' + (r.startsWith('PASS') ? 'ok' : 'bad') + '">' + r + '</span>').join('\n')
+    + '\n\n' + (failed.length ? '结果：' + failed.length + ' 项失败' : '结果：全部 ' + results.length + ' 项通过');
+  document.title = failed.length ? 'SELFTEST-FAIL' : 'SELFTEST-OK';
+})().catch(err => {
+  document.getElementById('report').textContent = 'HARNESS ERROR: ' + err.stack;
+  document.title = 'SELFTEST-ERROR';
+});
+</script>
+</body>
+</html>

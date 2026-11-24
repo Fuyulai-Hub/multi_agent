@@ -8,3 +8,9 @@ PyYAML>=6.0
 
 # Redis 协调层（运行注册表 / 缓存 / 分布式锁）为零依赖实现：
 # mas/store/redis_backend.py 用标准库 socket 直接讲 RESP2 协议，无需 redis-py。
+
+# ---- 可选依赖（docs/50 编排层，runtime.orchestrator=langgraph 时才需要）---------
+# 未安装时默认的 legacy 路径完全不受影响（mas.orchestration.runner 是惰性导入）。
+# 安装：pip install "langgraph>=1.2,<2.0" langgraph-checkpoint-sqlite
+# langgraph>=1.2,<2.0
+# langgraph-checkpoint-sqlite>=3.0

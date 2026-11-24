@@ -1069,6 +1069,58 @@ class Sandbox:
                      "不得删用例、不得放宽断言、不得把断言改成恒真"),
         )]
 
+    def spa_service_bypass_findings(
+        self, relative: str, severity: Any
+    ) -> List["Finding"]:
+        """检出 SPA 套件「自己 spawn 被测服务」的写法（full_stack_spa 形态专用）。
+
+        为什么必须拦：前后端分离交付物的后端不是 Python 包，测试只能对真实 HTTP 取证，
+        于是套件天然想 ``subprocess.Popen(["npm", "run", "start:dev"])``。这条路线上
+        每一环都是历史实测过的阻断（docs/46，task12-foodlink-spa-03）：
+        裸名 ``npm`` 在 Windows 下不查 PATHEXT；``stdout=PIPE`` 无人读会在 8656 字节
+        启动日志后阻塞；还有一个更隐蔽的后果——套件一旦冻结，
+        ``restore_if_changed()`` 每轮恢复同一份写法，修复窗口彻底关闭。
+
+        框架改成托管服务：``mas_testkit.start_service()`` 负责白名单解析、日志落盘、
+        端口回读与进程树回收。因此 SPA 套件里出现 ``subprocess`` / ``os.system`` /
+        ``os.popen`` 一律按「可修的套件缺陷」退回重写，而不是等它 33 条全挂再去猜根因。
+        只约束 ``tests/`` 下的文件，不影响交付代码的审查口径。
+        """
+        if not str(relative).startswith("tests/"):
+            return []
+        try:
+            tree = ast.parse(self.resolve(relative).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            return []                                  # 语法错误另有 syntax_error 规则负责
+        hits: List[Tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] in ("subprocess", "multiprocessing"):
+                        hits.append((getattr(node, "lineno", 0), alias.name))
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                if node.module.split(".")[0] in ("subprocess", "multiprocessing"):
+                    hits.append((getattr(node, "lineno", 0), node.module))
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if (getattr(node.func.value, "id", "") == "os"
+                        and node.func.attr in ("system", "popen", "spawnl", "spawnv", "execv")):
+                    hits.append((getattr(node, "lineno", 0), f"os.{node.func.attr}"))
+        if not hits:
+            return []
+        line, symbol = hits[0]
+        return [Finding(
+            rule="spa_service_self_managed",
+            severity=severity("spa_service_self_managed", "major"),
+            file=relative, line=line, symbol=symbol,
+            message=("前后端分离（full_stack_spa）套件不得自己起服务：命中 "
+                     f"`{symbol}`。请改用 `from mas_testkit import start_service`，"
+                     "在 setUpClass 里 `cls.service = start_service()`、tearDownClass 里 "
+                     "`cls.service.stop()`，再用 `cls.service.get('/api/...')` 断言真实响应。"
+                     "服务命令由框架通过 MAS_SERVICE_CMD 注入（契约的 ui_service_cmd），"
+                     "端口由 testkit 从 `MAS_UI_PORT=` 回读——不要写死端口、不要自建进程，"
+                     "否则会重演「裸名 npm 找不到 / 管道写满阻塞」两类必然阻断"),
+        )]
+
     def _workspace_has_package(self, package: str) -> bool:
         """工作区内是否存在名为 ``package`` 的 Python 包/模块（深度受限，跳过依赖与产物）。"""
         stack: List[Tuple[Path, int]] = [(self.root, 0)]

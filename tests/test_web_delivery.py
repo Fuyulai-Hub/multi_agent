@@ -672,17 +672,33 @@ class WebProtocolInjectionTests(_CtxMixin, unittest.TestCase):
         return agent.build_prompt(task, agent.perceive(task), RetrievalResult())
 
     def test_full_stack_injects_protocol(self):
-        for shape in ("full_stack_ssr", "full_stack_spa"):
-            self.setUp()
-            try:
-                bundle = self._bundle(shape)
-                self.assertIn("Web 交付执行协议", bundle.user)
-                self.assertIn("ThreadingHTTPServer", bundle.user)
-                self.assertIn("from todoweb import build_handler", bundle.user)
-                self.assertIn("沙箱超时", bundle.user)
-                self.assertIn("Web 交付执行协议", bundle.path.read_text(encoding="utf-8"))
-            finally:
-                self.tearDown()
+        """SSR 走进程内协议，SPA 走框架托管服务协议（docs/52 起两者必须分开）。
+
+        改造前两者都用 SSR 的模板（`from {package} import build_handler`），对 Node/TS
+        后端是不可兑现的 import——task12 实测 39 条用例全挂 ModuleNotFoundError，并把
+        归因引向「让 import 成立」，研发被迫把交付改写成 Python 包。
+        """
+        self.setUp()
+        try:
+            bundle = self._bundle("full_stack_ssr")
+            self.assertIn("Web 交付执行协议", bundle.user)
+            self.assertIn("ThreadingHTTPServer", bundle.user)
+            self.assertIn("from todoweb import build_handler", bundle.user)
+            self.assertIn("沙箱超时", bundle.user)
+            self.assertIn("Web 交付执行协议", bundle.path.read_text(encoding="utf-8"))
+        finally:
+            self.tearDown()
+        self.setUp()
+        try:
+            bundle = self._bundle("full_stack_spa")
+            self.assertIn("Web 交付执行协议", bundle.user)
+            self.assertIn("from mas_testkit import start_service", bundle.user)
+            self.assertIn("MAS_UI_PORT", bundle.user)
+            self.assertNotIn("import build_handler", bundle.user)   # 不再要求 import 交付包
+            self.assertIn("沙箱超时", bundle.user)
+            self.assertIn("mas_testkit", bundle.path.read_text(encoding="utf-8"))
+        finally:
+            self.tearDown()
 
     def test_browser_protocol_only_for_spa(self):
         """ui_service_cmd 的默认值 `python serve.py` 只应在 SPA 形态出现。

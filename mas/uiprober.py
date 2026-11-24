@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -86,6 +87,11 @@ class UiProber:
         try:
             proc = self._spawn_service(service_cmd)
             base_url = self._await_port(proc, startup_timeout)
+            # 就绪之后仍要持续排空：dev server 每个请求都写日志，接到 PIPE 却没人读时
+            # 写满缓冲（Windows 匿名管道数 KB）就会永久阻塞在 write()——与 docs/46 的
+            # spawn_unread_pipe 是同一类缺陷，只是发生在这里会表现为「UI 检查超时」。
+            threading.Thread(target=self._drain, args=(proc,), daemon=True,
+                             name="uiprobe-drain").start()
             evidence["base_url"] = base_url
             # 真实 HTTP 状态由框架进程直接取证（不依赖浏览器 MCP、不依赖 agent 自报）
             evidence["http_probe"] = self._http_probe(base_url)
@@ -197,6 +203,18 @@ class UiProber:
             if match:
                 return f"http://127.0.0.1:{match.group(1)}"
         raise RuntimeError(f"服务启动超时（{startup_timeout}s 内未打印 {PORT_MARKER}<port>）")
+
+    @staticmethod
+    def _drain(proc: subprocess.Popen) -> None:
+        """守护线程：只负责读走服务输出，避免管道写满；不解析内容。"""
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for _ in stream:
+                pass
+        except (OSError, ValueError):
+            pass
 
     def _connect_mcp(self):
         from .mcp import MCPClient, get_server

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>星选商城 StarMart · 全品类电商</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="logo" href="#" data-action="go-shop">
+      <span class="logo-mark">星</span>
+      <span class="logo-text">星选商城<em>StarMart</em></span>
+    </a>
+
+    <div class="search">
+      <input id="search-input" type="search" placeholder="搜索商品：耳机、咖啡、背包…" autocomplete="off" aria-label="搜索商品">
+      <button class="search-btn" data-action="go-shop" aria-label="搜索">搜索</button>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-link" data-action="go-shop">全部商品</button>
+      <button class="nav-link" data-action="go-orders">我的订单<span id="order-badge" class="dot-badge" hidden></span></button>
+      <button class="nav-link" data-action="go-admin">管理后台</button>
+      <button class="cart-btn" data-action="open-cart" aria-label="购物车">
+        购物车<span id="cart-count" class="count">0</span>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ===================== 商城 ===================== -->
+  <section id="view-shop" class="view">
+    <div class="hero">
+      <div class="hero-copy">
+        <span class="hero-tag">双十一返场 · 全场包邮</span>
+        <h1>精选好物，<br>一站买齐</h1>
+        <p>数码、家居、美妆、运动全品类，满 99 元包邮，48 小时内发货。</p>
+        <button class="btn btn-primary" data-action="scroll-products">立即选购</button>
+      </div>
+      <div class="hero-art" aria-hidden="true">
+        <span class="blob b1"></span><span class="blob b2"></span>
+        <div class="float-card">🎧<b>降噪耳机</b><small>¥899 起</small></div>
+        <div class="float-card alt">☕<b>精品咖啡</b><small>¥69 起</small></div>
+        <div class="float-card alt2">👟<b>轻跑鞋</b><small>¥459 起</small></div>
+      </div>
+    </div>
+
+    <div id="products" class="shop-body">
+      <aside class="filters">
+        <div class="filter-block">
+          <h3>商品分类</h3>
+          <div id="category-list" class="cat-list"></div>
+        </div>
+        <div class="filter-block">
+          <h3>价格区间</h3>
+          <div class="price-row">
+            <input id="price-min" type="number" min="0" placeholder="最低价" aria-label="最低价">
+            <span>—</span>
+            <input id="price-max" type="number" min="0" placeholder="最高价" aria-label="最高价">
+          </div>
+          <button class="btn btn-ghost btn-sm" data-action="clear-filters">重置筛选</button>
+        </div>
+        <div class="filter-block">
+          <label class="switch-row">
+            <input id="in-stock-only" type="checkbox">
+            <span>仅看有货</span>
+          </label>
+        </div>
+        <div class="filter-tip">下单即扣库存，取消订单自动返库。</div>
+      </aside>
+
+      <div class="list-area">
+        <div class="toolbar">
+          <div class="result-meta">共 <b id="result-count">0</b> 件商品<em id="result-query"></em></div>
+          <label class="sort">
+            排序
+            <select id="sort-select">
+              <option value="default">综合</option>
+              <option value="sales">销量优先</option>
+              <option value="price-asc">价格从低到高</option>
+              <option value="price-desc">价格从高到低</option>
+              <option value="rating">评分优先</option>
+            </select>
+          </label>
+        </div>
+        <div id="product-grid" class="product-grid"></div>
+        <div id="empty-state" class="empty" hidden>
+          <div class="empty-icon">🔍</div>
+          <p>没有符合条件的商品</p>
+          <button class="btn btn-ghost" data-action="clear-filters">清除筛选条件</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 结算 ===================== -->
+  <section id="view-checkout" class="view" hidden>
+    <div class="page-head">
+      <button class="link-back" data-action="go-shop">← 返回商城</button>
+      <h2>确认订单</h2>
+    </div>
+    <div class="checkout-grid">
+      <div class="panel">
+        <h3 class="panel-title">收货信息</h3>
+        <div class="form-grid">
+          <label class="field"><span>收货人 <i>*</i></span>
+            <input id="ship-name" type="text" placeholder="请输入姓名" autocomplete="name">
+          </label>
+          <label class="field"><span>手机号 <i>*</i></span>
+            <input id="ship-phone" type="tel" inputmode="numeric" maxlength="11" placeholder="11 位手机号" autocomplete="tel">
+          </label>
+          <label class="field field-wide"><span>详细地址 <i>*</i></span>
+            <input id="ship-addr" type="text" placeholder="省 / 市 / 区 + 街道门牌" autocomplete="street-address">
+          </label>
+          <label class="field field-wide"><span>订单备注</span>
+            <input id="ship-note" type="text" placeholder="选填，如：工作日送达">
+          </label>
+        </div>
+
+        <h3 class="panel-title">配送方式</h3>
+        <div class="ship-options">
+          <label class="ship-option">
+            <input type="radio" name="shipping" value="standard" checked>
+            <span><b>标准配送</b><small>2-3 天送达 · 满 99 元包邮</small></span>
+          </label>
+          <label class="ship-option">
+            <input type="radio" name="shipping" value="express">
+            <span><b>次日达</b><small>次日 18:00 前送达 · +¥15</small></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="panel panel-summary">
+        <h3 class="panel-title">商品清单</h3>
+        <div id="checkout-items" class="checkout-items"></div>
+        <div class="coupon-row">
+          <input id="coupon-input" type="text" placeholder="输入优惠码：SAVE10 / NEW30" aria-label="优惠码">
+          <button class="btn btn-ghost btn-sm" data-action="apply-coupon">使用</button>
+        </div>
+        <div id="coupon-hint" class="coupon-hint"></div>
+        <dl class="totals">
+          <div><dt>商品小计</dt><dd id="sum-subtotal">¥0.00</dd></div>
+          <div><dt>优惠</dt><dd id="sum-discount" class="minus">-¥0.00</dd></div>
+          <div><dt>运费</dt><dd id="sum-shipping">¥0.00</dd></div>
+          <div class="total"><dt>应付总额</dt><dd id="sum-total">¥0.00</dd></div>
+        </dl>
+        <button class="btn btn-primary btn-block" data-action="place-order">提交订单</button>
+        <p class="fineprint">提交即按当前库存锁定商品，库存不足会自动提示。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 我的订单 ===================== -->
+  <section id="view-orders" class="view" hidden>
+    <div class="page-head">
+      <button class="link-back" data-action="go-shop">← 返回商城</button>
+      <h2>我的订单</h2>
+    </div>
+    <div id="order-list" class="order-list"></div>
+    <div id="orders-empty" class="empty" hidden>
+      <div class="empty-icon">📦</div>
+      <p>还没有订单，去挑几件好物吧</p>
+      <button class="btn btn-primary" data-action="go-shop">去逛逛</button>
+    </div>
+  </section>
+
+  <!-- ===================== 管理后台 ===================== -->
+  <section id="view-admin" class="view" hidden>
+    <div class="page-head">
+      <button class="link-back" data-action="go-shop">← 返回商城</button>
+      <h2>管理后台</h2>
+      <button class="btn btn-ghost btn-sm" data-action="reset-demo">重置演示数据</button>
+    </div>
+
+    <div class="stat-row" id="stat-row"></div>
+
+    <div class="panel">
+      <h3 class="panel-title">新增商品</h3>
+      <div class="form-grid">
+        <label class="field"><span>名称</span><input id="np-name" type="text" placeholder="如：机械键盘"></label>
+        <label class="field"><span>分类</span>
+          <select id="np-category"></select>
+        </label>
+        <label class="field"><span>价格（元）</span><input id="np-price" type="number" min="0" step="0.01" placeholder="0.00"></label>
+        <label class="field"><span>库存</span><input id="np-stock" type="number" min="0" step="1" placeholder="0"></label>
+        <label class="field"><span>封面图标</span><input id="np-emoji" type="text" maxlength="4" placeholder="📦"></label>
+        <label class="field"><span>卖点标签</span><input id="np-tags" type="text" placeholder="包邮,新品"></label>
+        <label class="field field-wide"><span>商品描述</span><input id="np-desc" type="text" placeholder="一句话介绍"></label>
+      </div>
+      <button class="btn btn-primary" data-action="add-product">上架商品</button>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">商品管理 <small id="admin-product-count"></small></h3>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr><th>商品</th><th>分类</th><th>价格</th><th>库存</th><th>销量</th><th>状态</th><th class="ta-right">操作</th></tr>
+          </thead>
+          <tbody id="admin-product-rows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">订单流水 <small id="admin-order-count"></small></h3>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr><th>订单号</th><th>下单时间</th><th>收货人</th><th>件数</th><th>金额</th><th>状态</th><th class="ta-right">操作</th></tr>
+          </thead>
+          <tbody id="admin-order-rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <span>© 2026 星选商城 StarMart · 演示站点，数据保存在本机浏览器</span>
+    <span>满 99 包邮 · 7 天无理由 · 48h 发货</span>
+  </div>
+</footer>
+
+<!-- ===================== 购物车抽屉 ===================== -->
+<div id="cart-mask" class="mask" hidden></div>
+<aside id="cart-drawer" class="drawer" aria-hidden="true" aria-label="购物车">
+  <div class="drawer-head">
+    <h3>购物车 <small id="cart-summary-count"></small></h3>
+    <button class="icon-btn" data-action="close-cart" aria-label="关闭">✕</button>
+  </div>
+  <div id="cart-items" class="cart-items"></div>
+  <div id="cart-empty" class="cart-empty" hidden>
+    <div class="empty-icon">🛒</div>
+    <p>购物车还是空的</p>
+    <button class="btn btn-ghost" data-action="close-cart">去挑商品</button>
+  </div>
+  <div class="drawer-foot">
+    <div class="cart-total-row"><span>合计</span><b id="cart-total">¥0.00</b></div>
+    <button class="btn btn-primary btn-block" data-action="go-checkout">去结算</button>
+    <button class="btn btn-ghost btn-block btn-sm" data-action="clear-cart">清空购物车</button>
+  </div>
+</aside>
+
+<!-- ===================== 商品详情弹窗 ===================== -->
+<div id="modal-mask" class="mask" hidden></div>
+<div id="product-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="pm-name" hidden>
+  <button class="icon-btn modal-close" data-action="close-modal" aria-label="关闭">✕</button>
+  <div id="pm-body" class="modal-body"></div>
+</div>
+
+<!-- ===================== 下单成功弹窗 ===================== -->
+<div id="success-mask" class="mask" hidden></div>
+<div id="success-modal" class="modal modal-sm" role="dialog" aria-modal="true" hidden>
+  <div class="success-check">✓</div>
+  <h3>下单成功</h3>
+  <p id="success-text"></p>
+  <div class="success-actions">
+    <button class="btn btn-primary" data-action="go-orders">查看订单</button>
+    <button class="btn btn-ghost" data-action="close-success">继续购物</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

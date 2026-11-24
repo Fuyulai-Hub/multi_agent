@@ -42,6 +42,7 @@ from .events import EventLog
 from .experience import Experience, ExperienceLibrary
 from .expr import evaluate
 from .llm import LLMClient
+from .orchestration.decision import decide
 from .projectdocs import collect_project_docs, render_section
 from .prompts import PromptBuilder
 from .sandbox import Sandbox
@@ -679,139 +680,62 @@ class Leader:
             max_steps = min(int(flow.max_steps), int(self.config.runtime.get("max_steps", flow.max_steps)))
             max_total_rollbacks = int(collaboration.guards.get("max_total_rollbacks", 8))
 
-            while node_id and node_id not in flow.terminal and steps < max_steps:
-                # 协作式终止（面板「终止任务」）的节点边界检查点：取消在节点内已由
-                # LLM 层立即处理（docs/41），此处兜住的是节点不含 LLM 调用的中断场景
-                # （沙箱执行/MCP 工具调用期间置位 → 跑完当前节点后在此退出循环）。
-                # registry 非 None 时额外查跨进程取消键：CLI/其他进程发起的运行也可被终止。
-                if cancel_event is not None and cancel_event.is_set():
-                    canceled = True
-                    break
-                if registry is not None and registry.is_canceled(run_id):
-                    canceled = True
-                    break
-                steps += 1
-                node = flow.node(node_id)
-                iteration = iterations.get(node_id, 0) + 1
-                iterations[node_id] = iteration
-                ctx.run_state["node_executions"] = steps
-                if registry is not None:
-                    registry.heartbeat(run_id, status="running", node=node_id)
-                events.emit(
-                    "node_start", agent=node.role, node=node_id, iteration=iteration,
-                    payload={"title": node.title, "kind": node.kind},
+            # 编排层分流（docs/50）：节点执行与分支决策由两条路径共用（_execute_node /
+            # orchestration.decision.decide），这里只换「谁来驱动下一轮」——手写 while
+            # 循环，还是 LangGraph 的状态图。开关默认 legacy，行为逐字节不变。
+            if str(self.config.runtime.get("orchestrator") or "legacy") == "langgraph":
+                from .orchestration.runner import run_graph
+                final = run_graph(
+                    self, ctx=ctx, agents=agents, registry=registry, cancel_event=cancel_event,
+                    run_id=run_id, run_dir=run_dir, max_steps=max_steps,
+                    max_total_rollbacks=max_total_rollbacks, checkpoint_path=checkpoint_path,
+                    requirement_title=req_title, requirement_sha256=requirement_sha256,
+                    project_docs_text=prompts.project_docs_text,
+                    started_at=started.isoformat(timespec="seconds"), resume_state=resume_state,
                 )
-                task = NodeTask.from_node(
-                    node, iteration=iteration,
-                    directive=self._directive_for(ctx, node_id, iteration),
-                    rollback_reason=pending_reason if iteration > 1 else "",
-                )
-                pending_reason = ""
-
-                if node.kind == "gate":
-                    outcome = self._run_gate(ctx, task, agents)
-                    status = outcome["status"]
-                    result = AgentResult(status=status, summary=outcome.get("summary", ""))
-                else:
-                    if not node.role or node.role not in agents:
-                        raise ConfigError(f"节点 {node_id} 的角色 {node.role} 未注册")
-                    result, status = self._act_with_retry(ctx, task, agents, node)
-                    self._track_experience(ctx, result)
-
-                # 广播（按协作矩阵）
-                for topic in result.events or []:
-                    self._broadcast(ctx, node.role or "leader", topic,
-                                     result.broadcast_payload or {"summary": result.summary})
-                events.emit(
-                    "node_end", agent=node.role, node=node_id, iteration=iteration,
-                    payload={"status": status, "summary": result.summary[:300]},
-                    severity="info" if status == "pass" else "warning",
-                )
-                if node_id == "review" and status == "fail":
-                    ctx.run_state["review_rejections"] += 1
-
-                # L1 即时经验提炼（增量：只处理本步新增事件）
-                self._extract_inline(ctx)
-
-                # 分支与回退
-                branch = collaboration.branch_of(status)
-                target = node.target(branch)
-                if target is None:
-                    target = "halt"
-                # 环境/证据通道缺口（docs/15 B 档；task04 的 C++ 工具链缺失同属此类）：
-                # 退回研发改代码无法消除，继续回退只会空转并耗尽回退预算（本项目的
-                # web_todo_spa 实测：36/36 用例全过仍被判 fail，4 次回退预算全耗在通道缺口上）。
-                # 立即如实收尾（forced fail + 门禁 + 报告），不消耗回退次数。
-                unfixable = (self._unfixable_failure_reason(ctx, node_id, iteration)
-                             if branch == "fail" else "")
-                if unfixable:
-                    forced_fail = True
-                    events.emit(
-                        "escalation", agent="leader", node=node_id, severity="error",
-                        payload={"reason": unfixable,
-                                 "strategy": collaboration.escalation.get("on_exhausted", "fail_run_and_report"),
-                                 "notify": collaboration.escalation.get("notify", [])},
+                node_id = final["next_node"]
+                steps = final["steps"]
+                canceled = final["canceled"]
+                forced_fail = final["forced_fail"]
+                iterations = final["iterations"]
+                rollback_counts = final["rollback_counts"]
+                pending_reason = final["pending_reason"]
+            else:
+                while node_id and node_id not in flow.terminal and steps < max_steps:
+                    # 协作式终止（面板「终止任务」）的节点边界检查点：取消在节点内已由
+                    # LLM 层立即处理（docs/41），此处兜住的是节点不含 LLM 调用的中断场景
+                    # （沙箱执行/MCP 工具调用期间置位 → 跑完当前节点后在此退出循环）。
+                    # registry 非 None 时额外查跨进程取消键：CLI/其他进程发起的运行也可被终止。
+                    if self._cancel_requested(cancel_event, registry, run_id):
+                        canceled = True
+                        break
+                    steps += 1
+                    node = flow.node(node_id)
+                    iteration = iterations.get(node_id, 0) + 1
+                    iterations[node_id] = iteration
+                    result, status = self._execute_node(
+                        ctx, agents, node, iteration=iteration, steps=steps,
+                        rollback_reason=pending_reason if iteration > 1 else "",
+                        registry=registry,
                     )
-                    self._publish_forced_gate(blackboard, "环境/证据通道缺口", unfixable,
-                                              iteration, run_id=ctx.run_id)
-                    target = "report" if "report" in flow.nodes else "halt"
-                elif branch == "fail" and self._is_rollback(node_id, target, iterations, rollback_counts):
-                    # 权限落地：节点角色显式声明 can_rollback=false 时，拒绝回退并终止流程
-                    if not self._rollback_permitted(node_id, node, target, agents, events, iteration):
-                        target = "halt"
-                        pending_reason = f"角色 {node.role} 无回退权限（can_rollback=false），流程终止"
-                    else:
-                        policy = collaboration.rollback_policy(node_id, node)
-                        rollback_counts[node_id] = rollback_counts.get(node_id, 0) + 1
-                        ctx.run_state["rollbacks"] = sum(rollback_counts.values())
-                        attempt = rollback_counts[node_id]
-                        reason = policy.reason
-                        events.emit(
-                            "rollback", agent="leader", node=node_id, iteration=iteration,
-                            severity="warning",
-                            payload={
-                                "from": node_id, "to": target, "reason": reason,
-                                "attempt": attempt, "max_attempts": policy.max_attempts,
-                                "summary": result.summary[:200] or result.error[:200],
-                            },
-                        )
-                        self._broadcast(ctx, "leader", "rollback",
-                                        {"from": node_id, "to": target, "reason": reason, "attempt": attempt})
-                        # 经验反馈闭环：回退归因降权。只降权「声称能预防本次失败」的经验
-                        # （trigger 与失败节点本次执行的事件匹配），不误伤无关经验。
-                        self._reinforce_injected(
-                            ctx, outcome="negative", evidence=f"{node_id} 回退：{reason}",
-                            failure_triggers=self._failure_triggers_of(ctx, node_id, iteration),
-                        )
-                        pending_reason = f"{reason}（第 {attempt} 次回退）"
-                        if attempt > policy.max_attempts or ctx.run_state["rollbacks"] > max_total_rollbacks:
-                            forced_fail = True
-                            events.emit(
-                                "escalation", agent="leader", node=node_id, severity="error",
-                                payload={
-                                    "reason": f"回退次数耗尽（{node_id} 已回退 {attempt - 1} 次）",
-                                    "strategy": collaboration.escalation.get("on_exhausted", "fail_run_and_report"),
-                                    "notify": collaboration.escalation.get("notify", []),
-                                },
-                            )
-                            if str(collaboration.escalation.get("on_exhausted", "fail_run_and_report")) == "fail_run_and_report":
-                                self._publish_forced_gate(blackboard, "回退次数耗尽",
-                                                          pending_reason, iteration,
-                                                          run_id=ctx.run_id)
-                                target = "report"
-                            else:
-                                target = "halt"
-                node_id = target
-                # 检查点写在「节点完成 + 分支落定」之后：崩溃发生在节点内部时，
-                # next_node 仍是该节点，恢复会重跑它；已完成的节点不会重跑。
-                self._write_checkpoint(
-                    checkpoint_path, req_title=req_title,
-                    requirement_sha256=requirement_sha256, next_node=node_id,
-                    iterations=iterations, rollback_counts=rollback_counts,
-                    pending_reason=pending_reason, forced_fail=forced_fail, steps=steps,
-                    run_state=ctx.run_state, project_docs_text=prompts.project_docs_text,
-                    started_at=started.isoformat(timespec="seconds"),
-                )
+                    decision = decide(
+                        self, ctx, agents, node, result, status, iteration=iteration,
+                        iterations=iterations, rollback_counts=rollback_counts,
+                        forced_fail=forced_fail, max_total_rollbacks=max_total_rollbacks,
+                    )
+                    node_id = decision.target
+                    pending_reason = decision.pending_reason
+                    forced_fail = decision.forced_fail
+                    # 检查点写在「节点完成 + 分支落定」之后：崩溃发生在节点内部时，
+                    # next_node 仍是该节点，恢复会重跑它；已完成的节点不会重跑。
+                    self._write_checkpoint(
+                        checkpoint_path, req_title=req_title,
+                        requirement_sha256=requirement_sha256, next_node=node_id,
+                        iterations=iterations, rollback_counts=rollback_counts,
+                        pending_reason=pending_reason, forced_fail=forced_fail, steps=steps,
+                        run_state=ctx.run_state, project_docs_text=prompts.project_docs_text,
+                        started_at=started.isoformat(timespec="seconds"),
+                    )
 
         except RunCanceledError:
             # 立即终止（docs/41）：LLM 层在节点内（流式读取/退避等待/请求入口）发现
@@ -1195,6 +1119,23 @@ class Leader:
         # 则研发「处理 0 个缺陷」空转一轮，acceptance→optimize 预算白耗。回灌的
         # source=hidden 缺陷只由本门禁在隐藏套件复跑通过时闭环。
         self._merge_hidden_bugs(ctx, node, task.iteration, hidden, snapshot)
+        # 连续两轮门禁都失败的隐藏用例：只在证据里标出「疑用例本身有问题」，
+        # 不改变裁决（reconx-core-02 实测：3 条用例与冻结契约冲突，实现怎么改都过不了，
+        # 报告却只写「隐藏用例失败」，把责任全推给研发）。诊断信息进 criteria.reason，
+        # 报告侧直接可读。
+        suspect = self._suspect_hidden_cases(snapshot, hidden)
+        if suspect:
+            ctx.events.emit(
+                "hidden_cases_suspect", agent="leader", node=node.id, iteration=task.iteration,
+                severity="warning",
+                payload={"cases": suspect,
+                         "note": "同一隐藏用例连续 ≥2 轮门禁失败，疑与契约冲突：应先复核用例，"
+                                 "而不是继续改实现"},
+            )
+        hidden_reason = "；".join(str(item) for item in (hidden.get("reasons") or []))
+        if suspect:
+            hidden_reason += (f"（其中 {len(suspect)} 条用例连续 ≥2 轮失败，"
+                              f"疑与冻结契约冲突，需复核用例）")
         criteria_results: List[Dict[str, Any]] = [{
             "id": "隐藏用例通过（契约冻结后独立生成）",
             "expr": "execute_hidden(frozen_outside_workspace) + attest + verify_evidence + failed=0",
@@ -1204,9 +1145,9 @@ class Leader:
                 "summary": dict(hidden.get("summary") or {}),
                 "coverage": dict(hidden.get("coverage") or {}),
                 "manifest_digest": str(hidden.get("manifest_digest") or ""),
+                "suspect_cases": suspect,
             },
-            "reason": "" if hidden.get("passed") else
-                      "；".join(str(item) for item in (hidden.get("reasons") or []))[:500],
+            "reason": "" if hidden.get("passed") else hidden_reason[:500],
         }]
         for criterion in node.criteria:
             outcome = evaluate(criterion.expr, snapshot)
@@ -1514,6 +1455,24 @@ class Leader:
         return result
 
     @staticmethod
+    def _suspect_hidden_cases(snapshot: Dict[str, Any], hidden: Dict[str, Any]) -> List[str]:
+        """连续两轮门禁都失败的隐藏用例（诊断标注，不参与裁决）。
+
+        隐藏套件由模型依据契约生成后即冻结，可能夹带与契约冲突的用例（reconx-core-02：
+        60 秒差断言成 3600、主记录断言违反 FP-04 升序规则、反例用例表头缺必需列）。
+        这类失败换实现是修不好的，继续回退只会烧预算；这里把「同一用例连续两轮失败」
+        标出来，让报告能区分「实现缺陷」与「疑用例缺陷」。
+        """
+        def _ids(source: Any) -> set:
+            items = (source or {}).get("failures") if isinstance(source, dict) else None
+            return {str(item.get("test") or "") for item in (items or [])
+                    if isinstance(item, dict) and str(item.get("test") or "")}
+
+        previous = _ids(snapshot.get("hidden_test_report") if isinstance(snapshot, dict) else None)
+        current = _ids(hidden.get("report"))
+        return sorted(current & previous)
+
+    @staticmethod
     def _merge_hidden_bugs(
         ctx: AgentContext, node: Any, iteration: int,
         hidden: Dict[str, Any], snapshot: Dict[str, Any],
@@ -1665,8 +1624,13 @@ class Leader:
             return {"passed": False, "reasons": list(dict.fromkeys(reasons)),
                     "manifest_digest": str(manifest.get("digest") or "")}
 
+        # 服务契约与可见套件同源：SPA 的任何一套用例（可见/隐藏/浏览器）都必须验同一个
+        # 服务，命令取自 test_report.service.command（tester 写入），避免两边起法漂移。
+        report = snapshot.get("test_report") if isinstance(snapshot, dict) else None
+        service_cmd = list(((report or {}).get("service") or {}).get("command") or [])
         execution = execute_hidden_suite(
             sandbox, Path(run_dir), root, manifest, iteration=iteration, tag="hidden",
+            service_cmd=service_cmd or None,
         )
         parsed = execution.result or {}
         spec_fps = [
@@ -1970,6 +1934,71 @@ class Leader:
         if not targets:
             return
         ctx.bus.broadcast(sender, topic, payload, targets)
+
+    # ---------------------------------------------------------------- 节点执行
+    @staticmethod
+    def _cancel_requested(cancel_event: Optional[Any], registry: Optional[Any],
+                          run_id: str) -> bool:
+        """节点边界的取消判定：进程内事件 + （可选）跨进程运行注册表。"""
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        return bool(registry is not None and registry.is_canceled(run_id))
+
+    def _execute_node(
+        self,
+        ctx: AgentContext,
+        agents: Dict[str, Any],
+        node: Any,
+        *,
+        iteration: int,
+        steps: int,
+        rollback_reason: str,
+        registry: Optional[Any] = None,
+    ) -> Tuple[AgentResult, str]:
+        """执行一个节点：事件 + 执行 + 广播 + 即时经验提炼。
+
+        两条编排路径（legacy while / LangGraph 图节点）共用本方法——区别只在
+        「谁决定下一个节点」，本方法不碰分支，也不读 checkpoint。
+        """
+        node_id = node.id
+        ctx.run_state["node_executions"] = steps
+        if registry is not None:
+            registry.heartbeat(ctx.run_id, status="running", node=node_id)
+        ctx.events.emit(
+            "node_start", agent=node.role, node=node_id, iteration=iteration,
+            payload={"title": node.title, "kind": node.kind},
+        )
+        task = NodeTask.from_node(
+            node, iteration=iteration,
+            directive=self._directive_for(ctx, node_id, iteration),
+            rollback_reason=rollback_reason,
+        )
+
+        if node.kind == "gate":
+            outcome = self._run_gate(ctx, task, agents)
+            status = outcome["status"]
+            result = AgentResult(status=status, summary=outcome.get("summary", ""))
+        else:
+            if not node.role or node.role not in agents:
+                raise ConfigError(f"节点 {node_id} 的角色 {node.role} 未注册")
+            result, status = self._act_with_retry(ctx, task, agents, node)
+            self._track_experience(ctx, result)
+
+        # 广播（按协作矩阵）
+        for topic in result.events or []:
+            self._broadcast(ctx, node.role or "leader", topic,
+                            result.broadcast_payload or {"summary": result.summary})
+        ctx.events.emit(
+            "node_end", agent=node.role, node=node_id, iteration=iteration,
+            payload={"status": status, "summary": result.summary[:300]},
+            severity="info" if status == "pass" else "warning",
+        )
+        if node_id == "review" and status == "fail":
+            ctx.run_state["review_rejections"] += 1
+
+        # L1 即时经验提炼（增量：只处理本步新增事件）
+        self._extract_inline(ctx)
+        return result, status
 
     # ---------------------------------------------------------------- 重试与权限
     def _act_with_retry(

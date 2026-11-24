@@ -69,6 +69,53 @@ finally:
    覆盖率按单文件统计，其余功能点计为未覆盖，覆盖率门禁必然不达标。
 '''
 
+# SPA 执行协议（B 档，docs/52）：full_stack_spa 形态注入，替代 A 档的「同进程起 Python 服务」。
+# 为什么必须分开：SPA 的后端是 Node/TS，工作区里没有任何能被 `import` 的 Python 包；
+# A 档协议（from {package} import build_handler）在 task12 上让 39 条用例全挂
+# ModuleNotFoundError，并进一步把归因引向「让 import 成立」——研发只能改写成 Python 包。
+# 这里改成：套件仍用 Python 写（执行/冻结/签名/逐用例证据链全部复用），但对交付物的证据
+# 一律来自真实 HTTP，服务由框架 testkit 托管（日志落文件、端口回读、进程树回收）。
+# 同样**不经过 .format()**。
+_SPA_PROTOCOL = '''## Web 交付执行协议（delivery_shape=full_stack_spa，框架按需求规格注入）
+
+被测交付物是前后端分离应用，后端不是 Python 包，**禁止在测试进程内 import 它**
+（`from xxx import ...` 会让整套用例挂 ModuleNotFoundError）。验证方式改为对真实 HTTP 取证，
+服务生命周期由框架托管：
+
+```python
+import unittest
+from mas_testkit import start_service
+
+class TestApi(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.service = start_service()        # 命令由框架注入（契约的 ui_service_cmd）
+    @classmethod
+    def tearDownClass(cls):
+        cls.service.stop()
+
+    def test_functional_products_list(self):
+        resp = self.service.get("/api/products")
+        self.assertEqual(resp.status, 200)
+        self.assertIsInstance(resp.json["items"], list)
+```
+
+规则（与 execution_protocol 的既有要求叠加，冲突时以本段为准）：
+1. `start_service()` 不传参时使用框架注入的 `MAS_SERVICE_CMD`；端口由 testkit 从服务
+   stdout 的 `MAS_UI_PORT=<port>` 行回读，测试**不得写死端口**，也不得自己探测端口。
+2. **禁止** `subprocess` / `os.system` / `os.popen` / `multiprocessing` 自建服务进程：
+   框架会在冻结前静态检出并退回重写（裸名 `npm` 在 Windows 下必然 FileNotFoundError，
+   `stdout=PIPE` 无人读会在启动日志写满管道后让服务永久阻塞）。
+3. 服务实例按测试类共享（`setUpClass`/`tearDownClass`），不要每个用例起停一次：
+   冷启动时间计入沙箱超时（默认 180 秒）。断言失败时把 `self.service.logs()` 写进
+   message，排障靠日志而不是猜。
+4. 断言只针对 HTTP 响应：状态码 + JSON 字段值；页面类功能点用 GET 拿响应体做片段断言。
+   禁止读交付源码反推期望值，禁止把「接口不存在」写成 pass。
+5. 用例命名 `test_{category}_{op}_{name}`、单文件、三类覆盖、无 `main()`、不写结果文件——
+   与 A 档完全一致；证据由框架 runner 汇总。
+'''
+
+
 # 浏览器级检查（B 档）：仅 full_stack_spa 形态注入。
 # 不能无条件下发——ui_service_cmd 的默认值是 `python serve.py`，会诱导模型在 files 里
 # 输出 `serve.py`，而 tester 的 can_write_code=false，写入即抛 SandboxError 让整个节点崩溃
@@ -76,8 +123,7 @@ finally:
 # 本串由 `section += _BROWSER_PROTOCOL` 直接拼接，**不经过 .format()**：花括号按字面下发，
 # 因此 {{base_url}} 必须保持两个花括号（uiprober._subst 的替换契约），写成四个会让模型
 # 照抄出非法 URL，浏览器导航必然失败。
-_BROWSER_PROTOCOL = '''
-浏览器级检查（full_stack_spa 形态必需，否则节点按"缺浏览器级证据"判失败）：
+_BROWSER_PROTOCOL = '''浏览器级检查（full_stack_spa 形态必需，否则节点按"缺浏览器级证据"判失败）：
 6. ui_service_cmd：单条命令启动被测服务（默认 ["python", "serve.py"]）。服务绑定端口 0，
    监听成功后必须在 stdout 打印一行 `MAS_UI_PORT=<实际端口>`，随后持续服务直至被外部终止。
    注意：本角色没有写实现代码的权限，不要试图新建这个文件——它应由研发交付；
@@ -158,18 +204,23 @@ class TesterAgent(BaseAgent):
 
         与 reviewer 的源码增强同一模式：契约是静态类属性，按需求规格的 delivery_shape
         动态追加协议段并同步落盘留痕；backend_only 任务 Prompt 不变。
+
+        SPA 与 SSR 的执行协议不同（docs/52）：SSR 的交付物是 Python 包，测试同进程
+        ``import`` 起服务；SPA 的后端是 Node/TS，测试**无法** import，只能由框架托管
+        外部进程后打真实 HTTP。用错协议会让 SPA 套件 39 条全挂在 ModuleNotFoundError。
         """
         bundle = super().build_prompt(task, perception, experience)
         shape, _, _ = resolve_delivery_shape(perception.spec)
         if shape_family(shape) != "full_stack":
             return bundle
-        manifest = perception.found.get("code_manifest") or {}
-        section = _WEB_PROTOCOL.format(
-            shape=shape,
-            package_hint=str(manifest.get("package") or "被测包"),
-        )
         if shape == "full_stack_spa":
-            section += _BROWSER_PROTOCOL
+            section = _SPA_PROTOCOL + _BROWSER_PROTOCOL
+        else:
+            manifest = perception.found.get("code_manifest") or {}
+            section = _WEB_PROTOCOL.format(
+                shape=shape,
+                package_hint=str(manifest.get("package") or "被测包"),
+            )
         bundle.user += "\n\n" + section
         if bundle.path:
             try:
@@ -303,6 +354,9 @@ class TesterAgent(BaseAgent):
         spec = perception.spec
         fps = spec.get("function_points", [])
         fp_total = len(fps)
+        # 交付形态先定：冻结前体检要按形态决定「套件能不能自己起服务」，执行时又要用它
+        # 决定服务命令怎么注入。探测只允许收紧，不由模型自报（见 _resolve_shape）。
+        shape, shape_source, shape_probe = self._resolve_shape(spec)
 
         # 1) 测试冻结（docs/37 P0-2）：一旦冻结，生成方提交的 tests/ 文件不再生效，
         # 执行前从 run_dir/frozen_tests/ 恢复权威副本。首次执行前冻结当前套件。
@@ -366,7 +420,7 @@ class TesterAgent(BaseAgent):
                 # ——本轮 33/39 用例两轮零增益、3.35 小时白烧。冻结前给一次带精确修复指令的
                 # 重生成；仍不合格就不冻结任何套件，如实判失败。
                 test_file, data, generation = self._ensure_spawnable_suite(
-                    task, test_file, data, generation, result)
+                    task, test_file, data, generation, result, shape=shape)
                 if result.status == "fail":
                     return
             if test_file:
@@ -392,7 +446,7 @@ class TesterAgent(BaseAgent):
         # 实测 task04（C++ 需求）：19 条用例全部败于 FileNotFoundError，报告里看不出根因。
         # 事件在拿到逐用例结果后按根因分类发出（见 4.1）：「本机缺工具链」「测试文件绕过
         # 白名单」「测试套件自身缺陷」的处置原则不同，执行前无法区分。
-        preexec_findings = self._preexec_diagnosis(test_file)
+        preexec_findings = self._preexec_diagnosis(test_file, shape)
 
         # 2) 需求歧义协商（Agent 间请求-应答通信）
         if data.get("skipped_generation"):
@@ -412,18 +466,16 @@ class TesterAgent(BaseAgent):
         # 交付形态以**沙箱真实文件探测**为准收紧（不由模型自报）：探测只升不降——
         # 文件里有 package.json/index.html/框架配置等 SPA 特征时，即使 spec 申报
         # backend_only 也按 full_stack_spa 走浏览器证据通道（fail-closed 方向）。
-        shape, shape_source, _ = resolve_delivery_shape(spec)
-        shape_probe = probe_delivery_shape(self.ctx.sandbox.root, self.ctx.sandbox.list_files())
-        if (shape_probe.get("shape")
-                and SHAPE_STRICTNESS.get(shape_probe["shape"], 0) > SHAPE_STRICTNESS.get(shape, 0)):
+        # 取值在 apply 开头已算好（冻结前体检要按同一形态判断套件写法）。
+        if shape_source == "file_probe":
             self.ctx.events.emit(
                 "intent_probed_from_files", agent=self.role_id, node=task.node_id,
                 iteration=task.iteration, severity="warning",
-                payload={"declared_shape": shape, "probed_shape": shape_probe["shape"],
+                payload={"declared_shape": resolve_delivery_shape(spec)[0],
+                         "probed_shape": shape_probe["shape"],
                          "evidence": shape_probe["evidence"][:8],
                          "note": "沙箱交付文件探测到更强的前端形态，覆盖模型/规格自报的交付形态"},
             )
-            shape, shape_source = shape_probe["shape"], "file_probe"
         env_probe = self._env_probe(perception)
         verification = self._verification_gap(
             perception.found.get("solution_design") or {}, env_probe, spec, shape=shape)
@@ -438,9 +490,24 @@ class TesterAgent(BaseAgent):
 
         # 3) 沙箱真实执行：执行权交给框架 runner（只跑冻结清单 test_ids），
         #    结果从工作区外的 runner_result.json 读取；stdout 只留作诊断日志。
+        #    SPA 形态把契约里的 ui_service_cmd 注入为 MAS_SERVICE_CMD：套件不自己拼
+        #    启动命令，功能用例、隐藏用例与浏览器检查验的是同一个服务（docs/52）。
+        #    冻结轮次的新生成是空的（test_generation_ignored），命令沿用上一轮报告里记下的
+        #    那份，否则冻结副本会在 ServiceError 上整轮失败。
+        service_cmd = [str(part) for part in (data.get("ui_service_cmd") or [])] or [
+            str(part) for part in
+            ((self._previous_test_report(perception).get("service") or {}).get("command") or [])]
+        service_cmd = service_cmd or None
+        if shape == "full_stack_spa" and not service_cmd:
+            self.ctx.events.emit(
+                "test_service_command_missing", agent=self.role_id, node=task.node_id,
+                iteration=task.iteration, severity="error",
+                payload={"note": "SPA 形态未声明 ui_service_cmd：套件无法启动被测服务，"
+                                 "全部用例都会以 ServiceError 失败（契约要求一条命令起整套服务）"},
+            )
         execution = execute_frozen_suite(
             self.ctx.sandbox, self.ctx.run_dir, suite_manifest,
-            iteration=task.iteration, tag="tester",
+            iteration=task.iteration, tag="tester", service_cmd=service_cmd,
         )
         exec_result = execution.exec
         run_dir = self.ctx.run_dir / "test_runs" / f"iter{task.iteration:02d}"
@@ -599,6 +666,10 @@ class TesterAgent(BaseAgent):
             "verification": verification,
             "delivery_shape": shape,
             "delivery_shape_source": shape_source,
+            # 服务契约：门禁阶段执行隐藏套件时复用同一条启动命令（leader._verify_hidden_suite）
+            "service": ({"command": service_cmd, "marker": "MAS_UI_PORT=",
+                         "managed_by": "mas_testkit"}
+                        if service_cmd else {}),
             "shape_probe": {"probed": shape_probe.get("shape") or "",
                             "evidence": shape_probe.get("evidence") or []},
             "root_cause": root_cause,
@@ -729,25 +800,32 @@ class TesterAgent(BaseAgent):
             return str(manifest["package"]).strip()
         return ""
 
-    def _preexec_diagnosis(self, test_file: str) -> List[Dict[str, Any]]:
+    def _preexec_diagnosis(self, test_file: str, shape: str = "") -> List[Dict[str, Any]]:
         """执行前对测试文件做 AST 体检，只挑"绕过/依赖沙箱命令白名单外的外部程序"这一类高危项。
 
         复用 reviewer 的审查策略（severity_map 可调），分析失败不影响主流程。
+        ``full_stack_spa`` 额外检查「套件自己 spawn 服务」：该形态的服务只能由框架
+        testkit 托管（docs/52），自建进程会重演裸名 npm / 管道写满两类必然阻断。
         """
         try:
             policies = dict(self.ctx.config.role("reviewer").policies)
             analysis = self.ctx.sandbox.analyze([test_file], policies)
             findings = list(analysis.findings)
+            severity_map: Dict[str, str] = dict(policies.get("severity_map") or {})
+
+            def severity(rule: str, default: str = "minor") -> str:
+                return severity_map.get(rule, default)
+
             # 「import 的被测包不存在」是套件自身缺陷（见 Sandbox.suite_import_target_findings）：
             # 2026-11-04 实测它会让归因落到空串→默认按交付缺陷退回研发，三轮预算白烧，
             # 第三轮直接把交付物改写成 Python 包来迁就这条 import。
             try:
-                severity_map: Dict[str, str] = dict(policies.get("severity_map") or {})
                 findings.extend(self.ctx.sandbox.suite_import_target_findings(
-                    test_file, self._target_package(),
-                    lambda rule, default="minor": severity_map.get(rule, default)))
+                    test_file, self._target_package(), severity))
             except Exception:                   # noqa: BLE001 - 同一原则：诊断不拖垮节点
                 pass
+            if shape == "full_stack_spa":
+                findings.extend(self.ctx.sandbox.spa_service_bypass_findings(test_file, severity))
         except Exception:                       # noqa: BLE001 - 体检是诊断，不能拖垮测试节点
             return []
         return [item.to_dict() for item in findings
@@ -755,7 +833,8 @@ class TesterAgent(BaseAgent):
                                                  "sandbox_command_unresolved",
                                                  "windows_spawn_extension",
                                                  "spawn_unread_pipe",
-                                                 "suite_import_target_missing")
+                                                 "suite_import_target_missing",
+                                                 "spa_service_self_managed")
                 or str(getattr(item, "rule", "")).endswith("_not_imported")]
 
     @classmethod
@@ -785,7 +864,7 @@ class TesterAgent(BaseAgent):
     # 冻结前准入拦截 → 带精确修复指令重生成 → 仍不达标就 test_spawn_unrepairable，
     # leader 侧不再按「回退也改不掉」直接 forced fail（见 leader._REPAIRABLE_FAILURE_EVENTS）。
     _SUITE_DEFECT_RULES = ("windows_spawn_extension", "spawn_unread_pipe",
-                           "suite_import_target_missing")
+                           "suite_import_target_missing", "spa_service_self_managed")
     # 测试文件内联启动外部程序的发现规则（见 Sandbox._command_bypass_findings）
     _BYPASS_RULES = ("sandbox_command_bypass", "sandbox_command_unresolved")
 
@@ -870,6 +949,18 @@ class TesterAgent(BaseAgent):
         一律判失败，两种结果都不可靠。
         """
         return [token.lower() for token in re.split(r"[^0-9A-Za-z]+", str(language or "")) if token]
+
+    def _resolve_shape(self, spec: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+        """交付形态 = 规格声明 与 沙箱文件探测 中更严格的那个（探测只升不降）。
+
+        返回 ``(shape, source, probe)``；``source == "file_probe"`` 表示被文件探测收紧。
+        """
+        shape, source, _ = resolve_delivery_shape(spec)
+        probe = probe_delivery_shape(self.ctx.sandbox.root, self.ctx.sandbox.list_files())
+        if (probe.get("shape")
+                and SHAPE_STRICTNESS.get(probe["shape"], 0) > SHAPE_STRICTNESS.get(shape, 0)):
+            return str(probe["shape"]), "file_probe", probe
+        return shape, source, probe
 
     def _verification_gap(self, solution_design: Dict[str, Any],
                           env_probe: Optional[Dict[str, Any]] = None,
@@ -1246,6 +1337,8 @@ class TesterAgent(BaseAgent):
         data: Dict[str, Any],
         generation: Generation,
         result: AgentResult,
+        *,
+        shape: str = "",
     ) -> Tuple[str, Dict[str, Any], Generation]:
         """冻结前拦截「静态可判定必然阻断」的套件，并给一次带精确修复指令的重生成。
 
@@ -1257,7 +1350,7 @@ class TesterAgent(BaseAgent):
         fail。结果是 33/39 用例在 iter01/iter02 两轮根因完全不变、缺陷闭环 0、review 与
         fix 段无任何产物、3.35 小时白烧。准入体检把修复窗口开在冻结之前。
         """
-        blocking = [item for item in self._preexec_diagnosis(test_file)
+        blocking = [item for item in self._preexec_diagnosis(test_file, shape)
                     if str(item.get("rule", "")) in self._SUITE_DEFECT_RULES]
         if not blocking:
             return test_file, data, generation
@@ -1304,6 +1397,13 @@ class TesterAgent(BaseAgent):
             "不要 import 工作区里不存在的被测包——先确认交付里真的有这个 Python 包，"
             "没有就改成对交付自带的公开接口发真实请求（标准库 http.client / 读文件 / 命令行），"
             "cases 原样回填上一轮元数据，不要留空。"
+            + ("\n\n本需求是前后端分离（full_stack_spa）：**禁止**任何自建服务进程的写法"
+               "（subprocess / os.system / os.popen / multiprocessing）。改用框架托管："
+               "`from mas_testkit import start_service`，setUpClass 里 `cls.service = start_service()`、"
+               "tearDownClass 里 `cls.service.stop()`，断言用 `cls.service.get('/api/...')` 的"
+               "status/text/json；启动命令与端口由框架注入与回读，测试里不要出现端口字面量。"
+               if any(str(item.get("rule")) == "spa_service_self_managed" for item in blocking)
+               else "")
         )
         bundle = PromptBundle(
             role=self.role_id, node=task.node_id, task_kind="test_suite_repair",
@@ -1334,7 +1434,7 @@ class TesterAgent(BaseAgent):
         if result.status == "fail":
             return test_file, data, generation
         test_file = new_file or test_file
-        remaining = [item for item in self._preexec_diagnosis(test_file)
+        remaining = [item for item in self._preexec_diagnosis(test_file, shape)
                      if str(item.get("rule", "")) in self._SUITE_DEFECT_RULES]
         if remaining:
             result.status = "fail"

@@ -764,6 +764,11 @@ def _validate(config: SystemConfig) -> None:
     if config.llm.get("provider") not in {"offline", "openai_compatible"}:
         problems.append(f"llm.provider 非法: {config.llm.get('provider')}（offline | openai_compatible）")
 
+    # 编排层开关（docs/50）：拼错不能静默退回 legacy，否则 A/B 对照会得到假结论
+    orchestrator = str(config.runtime.get("orchestrator") or "legacy")
+    if orchestrator not in {"legacy", "langgraph"}:
+        problems.append(f"runtime.orchestrator 非法: {orchestrator}（legacy | langgraph）")
+
     if problems:
         raise ConfigError("配置校验失败:\n  - " + "\n  - ".join(problems))
 
